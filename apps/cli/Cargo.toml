@@ -1,0 +1,20 @@
+[package]
+name = "filewatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FileWatch 命令行入口（M0~M3 阶段的主力验证工具）"
+
+[[bin]]
+name = "filewatch"
+path = "src/main.rs"
+
+[dependencies]
+core-io = { path = "../../crates/core-io" }
+core-ntfs = { path = "../../crates/core-ntfs" }
+core-usn = { path = "../../crates/core-usn" }
+core-index = { path = "../../crates/core-index" }
+core-viz = { path = "../../crates/core-viz" }
+core-monitor = { path = "../../crates/core-monitor" }
+core-scan = { path = "../../crates/core-scan" }

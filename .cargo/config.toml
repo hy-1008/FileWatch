@@ -1,0 +1,7 @@
+# 由 setup-rust.ps1 生成。
+#
+# 为什么固定 GNU 目标：本机没有 Windows SDK 10（缺 kernel32.lib），
+# MSVC 工具链链接会失败。x86_64-pc-windows-gnu 由 rustup 自带 MinGW-w64，
+# 无需任何 Visual Studio 组件。
+[build]
+target = "x86_64-pc-windows-gnu"

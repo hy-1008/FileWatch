@@ -1,0 +1,13 @@
+[package]
+name = "core-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "卷句柄、大块预读缓冲、DeviceIoControl 安全封装（零外部依赖）"
+
+[dependencies]
+
+[lib]
+name = "core_io"
+path = "src/lib.rs"

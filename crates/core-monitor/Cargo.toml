@@ -1,0 +1,16 @@
+[package]
+name = "core-monitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "监控引擎、有界事件队列、debounce 合并、阈值规则引擎、预警抑制、变更流水"
+
+[dependencies]
+core-io = { path = "../core-io" }
+core-usn = { path = "../core-usn" }
+core-index = { path = "../core-index" }
+
+[lib]
+name = "core_monitor"
+path = "src/lib.rs"

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-io",
+    "crates/core-ntfs",
+    "crates/core-usn",
+    "crates/core-index",
+    "crates/core-viz",
+    "crates/core-monitor",
+    "crates/core-scan",
+    "apps/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["FileWatch contributors"]
+repository = ""
+
+[workspace.dependencies]
+# ─────────────────────────────────────────────────────────────────────────────
+# 设计决策：本 workspace **零第三方依赖**（pure std）。
+#
+# 原因（2026-10-13 实测）：
+#   1. 目标机器网络受限（crates.io 不可达，实测 0~5 KB/s），任何 Cargo
+#      依赖都会让 `cargo build` 卡死；
+#   2. 引擎层需要的东西（Win32 FFI、线程、通道、JSON）用 std 就够，
+#      手写 Win32 声明反而把链接面积降到最小（只需 libkernel32.a）。
+#
+# 如果后续网络恢复、需要引入依赖，按文档 §6 依赖清单在下面放开即可：
+#   crossbeam-channel / rayon     → 高性能通道与并行
+#   rkyv / bincode                → 快照序列化
+#   rusqlite                      → 变更流水（当前用 JSONL 替代）
+#   tracing                       → 日志
+# windows-sys                   → Win32 绑定（当前为手写 FFI）
+# ─────────────────────────────────────────────────────────────────────────────
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+panic = "unwind"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"

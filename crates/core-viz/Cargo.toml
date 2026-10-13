@@ -1,0 +1,14 @@
+[package]
+name = "core-viz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Squarified Treemap 布局、屏幕空间递归、LOD 剪枝（纯函数，可单测）"
+
+[dependencies]
+core-index = { path = "../core-index" }
+
+[lib]
+name = "core_viz"
+path = "src/lib.rs"

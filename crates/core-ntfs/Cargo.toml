@@ -1,0 +1,14 @@
+[package]
+name = "core-ntfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NTFS 引导扇区 / MFT 记录 / 属性链 / Data Runs 解析"
+
+[dependencies]
+core-io = { path = "../core-io" }
+
+[lib]
+name = "core_ntfs"
+path = "src/lib.rs"

@@ -1,0 +1,18 @@
+[package]
+name = "core-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "扫描调度：MFT 全量扫描、非 NTFS 目录遍历降级、USN 增量会话"
+
+[dependencies]
+core-io = { path = "../core-io" }
+core-ntfs = { path = "../core-ntfs" }
+core-usn = { path = "../core-usn" }
+core-index = { path = "../core-index" }
+core-monitor = { path = "../core-monitor" }
+
+[lib]
+name = "core_scan"
+path = "src/lib.rs"

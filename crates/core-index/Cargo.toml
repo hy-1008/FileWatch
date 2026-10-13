@@ -1,0 +1,15 @@
+[package]
+name = "core-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "紧凑目录树、FRN 索引、大小增量聚合、硬链接去重、扩展名统计"
+
+[dependencies]
+core-io = { path = "../core-io" }
+core-ntfs = { path = "../core-ntfs" }
+
+[lib]
+name = "core_index"
+path = "src/lib.rs"

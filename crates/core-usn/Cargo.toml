@@ -1,0 +1,14 @@
+[package]
+name = "core-usn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "USN Journal 查询 / 读取 / 游标持久化 / 断层检测 / 事件归一化"
+
+[dependencies]
+core-io = { path = "../core-io" }
+
+[lib]
+name = "core_usn"
+path = "src/lib.rs"
