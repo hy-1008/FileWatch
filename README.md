@@ -1,24 +1,37 @@
 # FileWatch —— Windows 文件增量监控工具
 
 基于 NTFS `$MFT` 直读 + USN Journal 的高性能文件监控引擎，配 Squarified Treemap
-面积图可视化。当前阶段交付 **引擎 + CLI**（M0~M3 完成），GUI 预留在这套引擎之上。
+面积图可视化。
+
+* **引擎 + CLI**（M0~M3）：验收全绿，见第 5 节。
+* **GUI**（M4~M5，Tauri 2 + Canvas）：已落地，见 [`apps/gui/README.md`](apps/gui/README.md)。
 
 ---
 
 ## 1. 快速开始
 
 ```powershell
-# 一键装工具链 + 构建 + 自检
+# 一键装工具链 + 构建 + 自检（引擎 + CLI）
 powershell -ExecutionPolicy Bypass -File .\setup-rust.ps1
 
 # 检查引擎是否完好（不需要管理员权限）
 .\target\x86_64-pc-windows-gnu\release\filewatch.exe selftest --verbose
 ```
 
+GUI 单独构建（它是自己的 workspace，见 `apps/gui/README.md`）：
+
+```bash
+python apps/gui/tools/make-icon.py        # 生成图标，只需一次
+cd apps/gui/src-tauri && cargo build --release
+./target/x86_64-pc-windows-gnu/release/filewatch-gui.exe   # 注意是三元组子目录
+```
+
 > **为什么要用 GNU 工具链**：开发机没有 Windows SDK 10（缺 `kernel32.lib`），
 > Rust 默认的 MSVC 工具链会链接失败。`x86_64-pc-windows-gnu` 由 rustup 自带
 > MinGW-w64（含 gcc 与导入库），**不需要任何 Visual Studio 组件**。
 > `setup-rust.ps1` 会自动装好并把目标三元组固定进 `.cargo/config.toml`。
+> 实测 Tauri 2 在同一套 GNU 工具链下也能正常编译、链接、启动（见
+> `apps/gui/README.md` 的「两个必须知道的坑」）。
 
 ---
 
@@ -345,5 +358,13 @@ filewatch/
 │  ├─ src/render.rs            时间/表格/字符网格面积图
 │  ├─ src/selftest.rs          28 项内置自检
 │  └─ tests/e2e.rs             端到端测试（跑真实 exe）
+├─ apps/gui/                   GUI（Tauri 2 + Canvas）
+│  ├─ src-tauri/               Rust 侧；**它自己是 workspace 根**，
+│  │                           被上面的 exclude 挡在外面，所以引擎的依赖图仍是空的
+│  └─ src/                     前端（纯静态，无 npm / 无打包器）
 └─ crates/                     7 个引擎 crate，详见第 4 节
 ```
+
+分层上只有一个方向：`apps/* → core-scan → core-*`。GUI 与 CLI 是**并列**的两个
+调用方，都用 `core_scan::Session` 这一条装配路径 —— 所以同一个目录在两边显示的
+大小必须一致，不一致就是 bug 而不是「口径不同」。

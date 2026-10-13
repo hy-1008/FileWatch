@@ -3,3 +3,10 @@
 *.pdb
 /crates/*/target
 /apps/*/target
+# GUI 的 src-tauri 是它自己的 workspace 根（见 apps/gui/README.md），
+# 所以它的 target 不在上面那条 `/apps/*/target` 的覆盖范围内。
+/apps/gui/src-tauri/target
+# 前端没有打包器，这些是构建/调试时留下的临时输出
+/apps/gui/src-tauri/*-log.txt
+# tauri-build 生成的权限 schema，每次构建会重写，不进版本控制
+/apps/gui/src-tauri/gen/schemas

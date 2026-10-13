@@ -1,0 +1,36 @@
+[package]
+name = "filewatch-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+description = "FileWatch 图形界面：盘符选择 / 全量扫描 / Treemap 面积图 / 增量监控"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 独立的 workspace（它自己就是根）
+#
+# 引擎层（`crates/**`）坚持「零第三方依赖」，而 GUI 这一层必然要用 Tauri。
+# 两者用 path 依赖相连：引擎不知道 GUI 的存在，GUI 只是引擎的一个调用方。
+# 换句话说 —— **只有这一层被允许引入第三方库**，加依赖时请确认这一点。
+# ─────────────────────────────────────────────────────────────────────────────
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+core-io = { path = "../../../crates/core-io" }
+core-index = { path = "../../../crates/core-index" }
+core-monitor = { path = "../../../crates/core-monitor" }
+core-scan = { path = "../../../crates/core-scan" }
+core-viz = { path = "../../../crates/core-viz" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

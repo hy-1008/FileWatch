@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FileWatch — 文件增量监控</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <div class="brand">FileWatch</div>
+
+    <!-- 口径与着色：全局开关，改动后只重画面积图，不重新扫描 -->
+    <label class="field">
+      <span>口径</span>
+      <select id="mode">
+        <option value="logical">逻辑大小</option>
+        <option value="allocated">占用大小</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>着色</span>
+      <select id="shading">
+        <option value="ext">按文件类型</option>
+        <option value="depth">按目录深度</option>
+        <option value="age">按文件年龄</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>细节</span>
+      <input id="detail" type="range" min="0" max="3" step="1" value="1">
+    </label>
+
+    <div class="spacer"></div>
+    <div id="backend-badge" class="badge">未扫描</div>
+  </header>
+
+  <main>
+    <!-- ── 左栏：盘符 / 扫描 / 文件夹树 ─────────────────────────────── -->
+    <aside class="panel left">
+      <section class="block">
+        <h2>盘符 <button id="refresh-vols" class="mini">刷新</button></h2>
+        <div id="volumes" class="volumes"></div>
+        <div class="row">
+          <input id="custom-root" type="text" placeholder="或粘贴一个目录，如 D:\projects">
+          <button id="scan-root" class="primary">扫描</button>
+        </div>
+        <label class="check">
+          <input id="watch" type="checkbox">
+          <span>同时建立实时监视（F6，大目录会多占内存）</span>
+        </label>
+      </section>
+
+      <section class="block grow">
+        <h2>文件夹树 <span id="tree-hint" class="hint"></span></h2>
+        <div id="tree" class="tree"></div>
+      </section>
+    </aside>
+
+    <!-- ── 中间：面积图 ─────────────────────────────────────────────── -->
+    <section class="panel center">
+      <div class="breadcrumb" id="breadcrumb"></div>
+      <div class="canvas-wrap">
+        <canvas id="canvas"></canvas>
+        <div id="tip" class="tip hidden"></div>
+        <div id="empty-hint" class="empty-hint">
+          <p>左侧选择盘符或目录开始扫描</p>
+          <p class="dim">非管理员会走「目录遍历」降级模式：功能完整，只是慢 1~2 个数量级</p>
+        </div>
+      </div>
+      <div class="canvas-status" id="canvas-status"></div>
+    </section>
+
+    <!-- ── 右栏：类型 / 大文件 / 详情 ───────────────────────────────── -->
+    <aside class="panel right">
+      <section class="block">
+        <h2>文件类型 <button id="clear-highlight" class="mini hidden">取消高亮</button></h2>
+        <div id="exts" class="exts"></div>
+      </section>
+      <section class="block">
+        <h2>最大的文件</h2>
+        <div id="topfiles" class="files"></div>
+      </section>
+      <section class="block">
+        <h2>详情</h2>
+        <div id="detail-panel" class="detail dim">点选任意方块查看</div>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="statusbar">
+    <span id="st-backend">—</span>
+    <span id="st-counts">—</span>
+    <span id="st-size">—</span>
+    <span id="st-memory">—</span>
+    <span id="st-time">—</span>
+    <span id="st-layout">—</span>
+    <span class="spacer"></span>
+    <span id="st-paths">—</span>
+  </footer>
+
+  <!-- 扫描进度遮罩 -->
+  <div id="scan-overlay" class="overlay hidden">
+    <div class="card">
+      <h3>正在扫描</h3>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <div id="progress-text" class="dim">准备中…</div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+</div>
+
+<script src="wire.js"></script>
+<script src="treemap.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -10,6 +10,11 @@ members = [
     "crates/core-scan",
     "apps/cli",
 ]
+# GUI（Tauri 2）需要第三方依赖，而引擎层要保住「零第三方依赖」这条硬约束。
+# 所以 `apps/gui/src-tauri` 自己的 workspace 是它自己（它通过 path 依赖引用
+# 下面的 crates），这里显式排除，保证在引擎根目录 `cargo build` 时既不会
+# 去编译 Tauri，也不会因为「目录在 workspace 内却不是成员」而报错。
+exclude = ["apps/gui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
