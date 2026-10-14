@@ -29,14 +29,13 @@ use args::{parse_ms, parse_rule, rule_label, Args};
 use core_index::aggregate::{top_files, SizeMode};
 use core_index::hardlink::build_report;
 use core_index::tree::ChildIndex;
-use core_index::{ExtensionTable, Tree};
+use core_index::{ExtensionTable, Tree, RECNO_MASK};
 use core_io::util::human_size;
 use core_monitor::debounce::PendingEvent;
 use core_monitor::rules::Alert;
 use core_monitor::{PathRemap, Rule, RuleKind, TickOutcome};
 use core_scan::{ScanBackend, ScanPhase, Session, SessionConfig};
 use core_usn::journal;
-use core_usn::normalize::EventKind;
 use core_viz::{compute_layout, LayoutOptions, LodPolicy, Rect, ShadingMode};
 use render::{
     fmt_offset_ms, fmt_unix_utc, pad_left, pad_right, render_ascii, render_legend, rule_line,
@@ -47,7 +46,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// FRN 低位掩码 → 节点下标（与引擎内部约定一致）。
-const RECNO_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 入口
@@ -1131,31 +1129,15 @@ fn render_tick(out: &TickOutcome, tree: &Tree, elapsed_ms: u64, remap: Option<&P
 }
 
 fn render_event(ev: &PendingEvent, tree: &Tree, remap: Option<&PathRemap>) -> String {
-    let parent = tree.path_of((ev.parent_frn & RECNO_MASK) as u32);
-    let raw = join_path(&parent, &ev.name);
-    let path = match remap {
-        Some(r) => r.apply(&raw),
-        None => raw,
+    // 路径构造走 core_scan::paths、体积说法走 core_monitor —— 界面用的是同一份。
+    // 「显示哪个数」不是排版问题：同一条变更在终端与界面上数字不一致的话，
+    // 用户没法判断该信哪个。
+    let path = core_scan::paths::event_path(tree, ev, remap);
+    let size = core_monitor::event_size_text(ev);
+    let suffix = match core_monitor::event_suffix(ev) {
+        Some(s) => format!("（{}）", s),
+        None => String::new(),
     };
-    // 目录的体积是聚合值，逐条事件里的 new_size 对它没有意义，不显示
-    let size = if ev.is_dir {
-        String::new()
-    } else if ev.kind == EventKind::Deleted {
-        format!("-{}", human_size((-ev.size_delta).max(0) as u64))
-    } else if ev.size_delta > 0 {
-        format!("+{}", human_size(ev.size_delta as u64))
-    } else if ev.size_delta < 0 {
-        format!("-{}", human_size((-ev.size_delta) as u64))
-    } else {
-        human_size(ev.new_size)
-    };
-    let mut suffix = String::new();
-    if ev.merged > 1 {
-        suffix.push_str(&format!("（合并 {} 条）", ev.merged));
-    }
-    if let (Some(old), EventKind::Renamed) = (&ev.old_name, ev.kind) {
-        suffix.push_str(&format!(" ← {}", old));
-    }
     format!(
         "{} {}  {}{}",
         pad_right(ev.kind.label_cn(), 10),
@@ -1204,17 +1186,6 @@ fn drive_of(p: &str) -> String {
 }
 
 /// `C:\docs` + `a.txt` → `C:\docs\a.txt`（`path_of` 对根返回 `C:\`，不能再补一个杠）。
-fn join_path(dir: &str, name: &str) -> String {
-    if dir.is_empty() {
-        return name.to_string();
-    }
-    if dir.ends_with('\\') {
-        format!("{}{}", dir, name)
-    } else {
-        format!("{}\\{}", dir, name)
-    }
-}
-
 fn base_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1250,13 +1221,6 @@ mod tests {
         assert_eq!(drive_of(r"\\?\C:\x"), "C:");
         assert_eq!(drive_of("no-drive-here"), "C:");
         assert_eq!(drive_of("e:\\"), "E:");
-    }
-
-    #[test]
-    fn join_path_handles_root_and_subdir() {
-        assert_eq!(join_path(r"C:\", "a.txt"), r"C:\a.txt");
-        assert_eq!(join_path(r"C:\docs", "a.txt"), r"C:\docs\a.txt");
-        assert_eq!(join_path("", "a.txt"), "a.txt");
     }
 
     #[test]

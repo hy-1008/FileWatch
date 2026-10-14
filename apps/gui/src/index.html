@@ -93,6 +93,79 @@
     </aside>
   </main>
 
+  <!-- ── F6/F7/F8 实时监控：底部抽屉 ────────────────────────────────────
+       放在整个窗口下方而不是塞进某一栏：变更流水是表格，路径又长，
+       全宽才放得下。收起时只占一行。 -->
+  <section id="monitor" class="monitor">
+    <div class="mon-head">
+      <button id="mon-toggle" class="mini" type="button" title="展开 / 收起监控面板">▸ 实时监控</button>
+      <span id="mon-state" class="badge">未启动</span>
+      <span id="mon-targets" class="mon-meta">—</span>
+      <span id="mon-source" class="mon-meta">—</span>
+      <span id="mon-counts" class="mon-meta">—</span>
+      <span class="spacer"></span>
+      <span id="mon-error" class="mon-err hidden"></span>
+      <button id="mon-start" class="mini primary" type="button">开始监控</button>
+      <button id="mon-stop" class="mini hidden" type="button">停止监控</button>
+    </div>
+
+    <div id="mon-body" class="mon-body hidden">
+      <div class="mon-setup">
+        <label class="f">
+          <span>监控目标</span>
+          <textarea id="mon-paths" rows="3" placeholder="每行一个目录；留空 = 用下面的按钮填当前视图根"></textarea>
+        </label>
+        <div class="row">
+          <button id="mon-use-focus" class="mini" type="button">用当前视图根</button>
+          <button id="mon-use-vol" class="mini" type="button">用当前盘符</button>
+        </div>
+
+        <label class="f">
+          <span>阈值规则</span>
+          <textarea id="mon-rules" rows="2" placeholder="abs=1G / grow=500M / rate=10M/60s　每行一条"></textarea>
+        </label>
+
+        <label class="f"><span>轮询间隔</span>
+          <span><input id="mon-interval" type="text" value="500" size="5"> ms</span>
+        </label>
+
+        <label class="check">
+          <input id="mon-journal" type="checkbox">
+          <span>允许启用 USN Journal（系统级变更，见文档 R3）</span>
+        </label>
+
+        <label class="f"><span>变更落盘</span>
+          <input id="mon-changelog" type="text" placeholder="留空 = 只留在内存">
+        </label>
+
+        <label class="f"><span>导出 CSV</span>
+          <input id="mon-csv" type="text" placeholder="留空 = 用桌面默认名">
+        </label>
+        <div class="row">
+          <button id="mon-export" class="mini" type="button">导出 CSV</button>
+          <span id="mon-export-hint" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="mon-lists">
+        <div class="mon-tabs">
+          <button id="mon-tab-changes" class="tab on" type="button" data-tab="changes">变更流水</button>
+          <button id="mon-tab-alerts" class="tab" type="button" data-tab="alerts">阈值预警</button>
+          <span class="spacer"></span>
+          <select id="mon-filter" title="按变更类型筛选">
+            <option value="">全部类型</option>
+            <option value="created">新增</option>
+            <option value="deleted">删除</option>
+            <option value="renamed">重命名</option>
+            <option value="modified">修改</option>
+          </select>
+          <span id="mon-list-hint" class="hint"></span>
+        </div>
+        <div id="mon-list" class="mon-list"></div>
+      </div>
+    </div>
+  </section>
+
   <footer class="statusbar">
     <span id="st-backend">—</span>
     <span id="st-counts">—</span>

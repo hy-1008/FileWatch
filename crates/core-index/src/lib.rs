@@ -24,7 +24,7 @@ pub mod tree;
 pub use aggregate::{
     aggregate, propagate_delta, propagate_from_parent, sorted_children, top_files, SizeMode,
 };
-pub use arena::{Arena, Node};
+pub use arena::{recno_of, Arena, Node, INVALID_PARENT, RECNO_MASK};
 pub use ext_stats::{ExtensionTable, ExtStat};
 pub use hardlink::{build_report, DedupReport};
 pub use string_pool::StringPool;

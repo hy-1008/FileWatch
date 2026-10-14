@@ -213,10 +213,16 @@ pub fn list_volumes() -> Vec<VolumeCard> {
 pub fn scan_start(
     app: AppHandle,
     state: State<'_, Shared>,
+    hub: State<'_, std::sync::Arc<crate::monitor::MonitorHub>>,
     drive: String,
     root: Option<String>,
     watch: Option<bool>,
 ) -> Result<(), String> {
+    // 扫描会换掉整棵索引树，而监控正挂在树上 —— 两者不能同时进行。
+    // 与其让监控线程悄悄改一棵已经被丢弃的树，不如明确拒绝。
+    if hub.is_running() {
+        return Err("正在监控：请先停止监控再重新扫描（监控需要这棵索引树）".into());
+    }
     {
         let mut st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
         if st.scanning {
@@ -298,7 +304,10 @@ pub fn scan_start(
     Ok(())
 }
 
-fn summarize(s: &Session, wall_ms: u64) -> ScanSummary {
+/// 扫描收尾摘要。**公开**给 `monitor` 用：监控为建立增量来源重扫时，
+/// 走的是同一条摘要逻辑 —— 否则界面在"重扫"之后看到的状态栏数字会与
+/// 正常扫描不一致。
+pub fn summarize(s: &Session, wall_ms: u64) -> ScanSummary {
     let (errors, skipped, all_ok) = match s.traverse_stats.as_ref() {
         Some(t) => (t.errors, t.skipped_reparse, true),
         None => (0, 0, true),
@@ -346,12 +355,14 @@ pub fn tree_rows(
     limit: Option<usize>,
     mode: Option<String>,
 ) -> Result<Vec<TreeRow>, String> {
-    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
-    let l = st.loaded()?;
+    let mut st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    let l = st.loaded_mut()?;
+    // 监控会改树；派生索引先与当前代数对齐，否则表格里是过期数据
+    l.refresh_derived();
     let tree = l.tree();
     let m = size_mode(mode.as_deref());
 
-    let kids = l.children.children(parent);
+    let kids = l.children().children(parent);
     let ordered = sorted_children(tree, kids, m);
     let off = offset.unwrap_or(0).min(ordered.len());
     let lim = limit.unwrap_or(500).min(4096);
@@ -366,7 +377,7 @@ pub fn tree_rows(
                 is_dir: node.map(|x| x.is_dir()).unwrap_or(false),
                 size: node.map(|x| x.size).unwrap_or(0),
                 alloc: node.map(|x| x.alloc).unwrap_or(0),
-                children: l.children.child_count(n),
+                children: l.children().child_count(n),
                 files: tree
                     .dir_file_counts
                     .get(n as usize)
@@ -448,7 +459,7 @@ pub fn layout(state: State<'_, Shared>, args: LayoutArgs) -> Result<Response, St
     let viewport = Rect::new(0.0, 0.0, args.width, args.height);
     let result = compute_layout(
         &l.session.tree,
-        &l.children,
+        l.children(),
         l.ext_table(),
         args.root,
         viewport,
@@ -485,7 +496,7 @@ pub fn layout_info(state: State<'_, Shared>, args: LayoutArgs) -> Result<LayoutI
     let viewport = Rect::new(0.0, 0.0, args.width.max(1.0), args.height.max(1.0));
     let r = compute_layout(
         &l.session.tree,
-        &l.children,
+        l.children(),
         l.ext_table(),
         args.root,
         viewport,
@@ -585,7 +596,7 @@ pub fn node_detail(state: State<'_, Shared>, node: u32) -> Result<NodeInfo, Stri
         is_dir: n.is_dir(),
         size: n.size,
         alloc: n.alloc,
-        children: l.children.child_count(node),
+        children: l.children().child_count(node),
         files: tree
             .dir_file_counts
             .get(node as usize)
@@ -817,6 +828,14 @@ pub fn print_elevation_report() {
     let _ = std::io::stdout().flush();
 }
 
+/// 当前时间（epoch 毫秒）。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -908,7 +927,7 @@ mod tests {
         };
         let r = compute_layout(
             loaded.tree(),
-            &loaded.children,
+            loaded.children(),
             loaded.ext_table(),
             root,
             vp,
@@ -965,18 +984,19 @@ mod tests {
         cfg.engine.write_changelog = false;
         let s = Session::open(cfg, |_, _, _| {}).unwrap();
         let root = s.tree.root;
-        let loaded = Loaded::new(s);
+        let mut loaded = Loaded::new(s);
+        loaded.refresh_derived();
 
         // 找到 deep 目录
         let deep = loaded
-            .children
+            .children()
             .children(root)
             .iter()
             .copied()
             .find(|&n| super::name_of(loaded.tree(), n) == "sub")
             .expect("应有 sub 目录");
         let deep = loaded
-            .children
+            .children()
             .children(deep)
             .iter()
             .copied()

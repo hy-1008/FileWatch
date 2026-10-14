@@ -234,6 +234,7 @@ FRN 低 48 位，**不用 HashMap** 做定位；文件名进字符串池、节�
 | M3 | 阈值预警：滞回 / 冷却 / 合并 | `monitor --rule=...` | 规则引擎单测 + 自检覆盖 |
 | M4 | 面积图布局 | `scan --layout=WxH` | 布局算法完成，字符网格预览可用 |
 | M5 | GUI（Tauri 2 + Canvas） | `filewatch-gui.exe` | **已落地**（盘符/扫描/树/面积图/类型/Top-N/详情 + 权限申请） |
+| F6/F7/F8 | 实时监控 / 阈值预警 / 变更流水 | `filewatch-gui.exe` 底部抽屉；CLI 侧是 `monitor` | **已落地**（同一棵索引树，CLI 与界面共用一套事件口径） |
 | M6 | 打包分发 | — | 未开始（桌面端的 UAC 提权已提前做掉，见下） |
 
 ### 真实目录实测（不是只在临时小目录里跑）
@@ -294,7 +295,7 @@ node apps/gui/tools/check-admin.js    # 权限弹窗规则真值表 + DOM 接线
 | `core-scan` | 36 / 36 |
 | `filewatch`（bin + e2e） | 29 + 12 |
 | `filewatch selftest` | 通过 28 / 失败 0 / 跳过 0 |
-| `tools/muttest.py` | 通过 20 / 失败 0 |
+| `tools/muttest.py` | 通过 23 / 失败 0 |
 | `tools/check_api.py` | ERROR 0 / WARN 0 |
 
 ### 无编译器时的静态预检（`tools/`）
@@ -318,9 +319,14 @@ python tools/check_api.py .         # 也可以显式指定工程根目录
 python tools/muttest.py             # 变异测试：验证上面这套检查器真的抓得到错
 ```
 
-`muttest.py` 是这件事的关键：它会往**副本**里故意注入 14 类错误（另有 6 个
+`muttest.py` 是这件事的关键：它会往**副本**里故意注入 17 类错误（另有 6 个
 「看着可疑但完全合法」的回归守卫，如 `fn f() -> Rect {`、`..Default::default()`、
-`extern` 块内的 `pub fn`），确认每一类都被检出、且合法写法零误报。
+`impl` 块里的同名方法），确认每一类都被检出、且合法写法零误报。
+
+其中 **I 类**（本次新增）专门盯「同一件事被写了两遍」：`parse_size` / `parse_rule` /
+`event_size_text` / `join_path` / `RECNO_MASK` 这些共用语法与口径，全工程
+**只允许有一处顶层定义**，谁要在别处再写一份，检查器直接报错。这类分叉不会让
+编译失败，只会让同一个动作在 CLI 与界面上表现不一致 —— 本项目已经因此吃过两次亏。
 一个只报「0 错误」而没有通过变异测试的检查器，其「0 错误」是没有意义的。
 
 副本放在**系统临时目录**（`%TEMP%\filewatch_muttest\{prime,work}`）而不是工程里：
@@ -375,7 +381,7 @@ filewatch/
 ├─ setup-rust.ps1              一键搭环境 + 构建 + 自检（含国内镜像）
 ├─ tools/
 │  ├─ check_api.py             无编译器时的静态预检（A~H 七类检查）
-│  └─ muttest.py               对 check_api.py 的变异测试（20 项）
+│  └─ muttest.py               对 check_api.py 的变异测试（23 项）
 ├─ .cargo/config.toml          固定 x86_64-pc-windows-gnu 目标（脚本生成）
 ├─ apps/cli/
 │  ├─ src/main.rs              命令分发 + 各命令实现
@@ -386,6 +392,8 @@ filewatch/
 ├─ apps/gui/                   GUI（Tauri 2 + Canvas）
 │  ├─ src-tauri/               Rust 侧；**它自己是 workspace 根**，
 │  │                           被上面的 exclude 挡在外面，所以引擎的依赖图仍是空的
+│  │                           （commands 命令层 / state 共享状态 / wire 二进制协议 /
+│  │                            elevate 权限 / prefs 偏好 / monitor 监控线程）
 │  └─ src/                     前端（纯静态，无 npm / 无打包器）
 └─ crates/                     7 个引擎 crate，详见第 4 节
 ```

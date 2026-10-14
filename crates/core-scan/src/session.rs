@@ -394,6 +394,27 @@ impl Session {
         Ok(self.engine.tick(&mut self.tree, now_ms, |_| None))
     }
 
+    /// 中途落一次盘：保存 USN 游标。
+    ///
+    /// 与 [`Session::shutdown`] 的区别是**不拆会话** —— 监视还在继续。
+    ///
+    /// 为什么需要它：游标只在 `shutdown` 时保存，所以「监控三小时 → 进程被
+    /// 强制结束/崩溃」会丢掉这三小时的进度。丢了不等于丢事件（下次 `open`
+    /// 会从旧位置重放，而事件里带的是回读出来的**绝对**大小，重放是幂等的），
+    /// 但重放要重新走一遍日志，代价实打实。界面按一个较慢的节奏（数十秒）
+    /// 调一次这里，就能把最坏情况从"几小时"压到"几十秒"。
+    ///
+    /// 纯 tick 模式（没有增量会话）下是空操作。
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        if let Some(inc) = self.incremental.as_ref() {
+            inc.save_cursor()?;
+        }
+        if let Some(log) = self.engine.changelog.as_mut() {
+            log.flush()?;
+        }
+        Ok(())
+    }
+
     /// 收尾：吐出剩余事件、保存游标、刷盘。
     pub fn shutdown(&mut self, now_ms: u64) -> io::Result<TickOutcome> {
         match self.incremental.as_mut() {

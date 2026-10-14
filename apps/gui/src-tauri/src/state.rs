@@ -9,43 +9,106 @@
 //! 它们都是 `O(节点数)` 的构建结果，而界面上每一次「展开文件夹」「切换排序」
 //! 「重画面积图」都要用。丢掉就变成「每帧重建一次索引」—— 200 万节点下
 //! 界面会卡到不能用。所以扫描结束时建一次，之后只读共享。
+//!
+//! # 监控会改树，所以缓存要认「代数」
+//!
+//! 实时监控（F6）会在原地改索引树：新增/删除/改名/体积变化。派生索引一旦
+//! 落后于树，界面就会显示**过期但看起来正常**的数据 —— 这正是本项目最讨厌的
+//! 那类错误。
+//!
+//! 处理办法是给树挂一个**代数计数器**：监控线程每应用一批事件就 +1，
+//! 每份派生索引记住自己是从哪一代建出来的。谁要用派生索引，先
+//! [`Loaded::refresh_derived`]，只在代数不匹配时才重建。
+//!
+//! 这样做的好处是**两边都不吃亏**：
+//! * 用户不动界面时，一次重建都不发生（不监控也一样是零开销）；
+//! * 用户一旦要看，拿到的必然是与当前树一致的索引，不存在"过期"这个状态。
 
 use core_index::{ChildIndex, ExtensionTable, Tree};
 use core_scan::Session;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// 一次已完成的扫描。
 pub struct Loaded {
     pub session: Session,
-    /// `小写路径 → 节点` 之外的**子节点索引**：`Expand` 一次就能拿到某个目录
-    /// 的所有孩子，不用全表扫。
-    pub children: ChildIndex,
+    /// 直接子节点索引：`Expand` 一次就能拿到某个目录的所有孩子，不用全表扫。
+    /// **私有**：它可能落后于树，必须经 [`Loaded::refresh_derived`] 之后再取。
+    children: ChildIndex,
+    /// `children` 是从哪一代建出来的
+    children_gen: u64,
     /// 扩展名聚合表。**按需构建**：它要为每个文件分配一次扩展名字符串，
     /// 200 万文件下是一笔实打实的开销（文档 §5.5 的内存预算），
     /// 而只看看面积图的用户根本用不到它 —— 所以拖到第一次真正需要时再建。
-    pub exts: Option<ExtensionTable>,
+    exts: Option<ExtensionTable>,
+    exts_gen: u64,
+    /// 树的变更代数。监控线程持有它的一份 `Arc`，每应用一批事件就 +1。
+    generation: Arc<AtomicU64>,
 }
 
 impl Loaded {
     pub fn new(session: Session) -> Loaded {
         let children = ChildIndex::build(&session.tree);
-        Loaded { session, children, exts: None }
-    }
-
-    /// 确保扩展名表已构建（幂等）。
-    pub fn ensure_exts(&mut self) {
-        if self.exts.is_none() {
-            self.exts = Some(ExtensionTable::build(&self.session.tree));
+        Loaded {
+            session,
+            children,
+            children_gen: 0,
+            exts: None,
+            exts_gen: 0,
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// 取扩展名表。**调用前必须先 `ensure_exts()`**。
+    /// 当前代数。前端拿它决定「要不要重画面积图」。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// 把代数计数器交给监控线程（它每应用一批事件就 +1）。
+    pub fn generation_arc(&self) -> Arc<AtomicU64> {
+        self.generation.clone()
+    }
+
+    /// 让派生索引与当前的树对齐。**只在代数变了时重建**。
+    ///
+    /// 每个要读派生索引的命令都必须先调它 —— 这是「不会显示过期数据」的
+    /// 唯一保证点，所以宁可多写一行，也不要让字段可以被直接读到。
+    pub fn refresh_derived(&mut self) {
+        let g = self.generation();
+        if self.children_gen != g {
+            self.children = ChildIndex::build(&self.session.tree);
+            self.children_gen = g;
+        }
+        // 扩展名表**已经建过**才跟着重建：没建过说明用户还没用到它，
+        // 替它买单就违背了"按需构建"的初衷。
+        if self.exts.is_some() && self.exts_gen != g {
+            self.exts = Some(ExtensionTable::build(&self.session.tree));
+            self.exts_gen = g;
+        }
+    }
+
+    /// 确保扩展名表已构建（幂等），并顺带对齐两份派生索引。
+    pub fn ensure_exts(&mut self) {
+        if self.exts.is_none() {
+            self.exts = Some(ExtensionTable::build(&self.session.tree));
+            self.exts_gen = self.generation();
+        }
+        self.refresh_derived();
+    }
+
+    pub fn children(&self) -> &ChildIndex {
+        &self.children
+    }
+
+    /// 取扩展名表。**调用前必须先 `ensure_exts()` 或 `refresh_derived()`**。
     ///
     /// 方法名不叫 `exts`：字段也叫 `exts`，`l.exts()` 与 `l.exts` 只差一个括号，
     /// 读代码的人会以为在读字段。
     pub fn ext_table(&self) -> &ExtensionTable {
-        self.exts.as_ref().expect("调用前必须 ensure_exts()")
+        self.exts
+            .as_ref()
+            .expect("调用前必须 ensure_exts() 或 refresh_derived()")
     }
 
     pub fn tree(&self) -> &Tree {

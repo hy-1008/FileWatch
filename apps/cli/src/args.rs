@@ -129,87 +129,20 @@ impl Args {
     }
 }
 
-/// `1G` / `512MB` / `1024` → 字节数。使用 1024 进制（与资源管理器口径一致）。
-pub fn parse_size(s: &str) -> Option<u64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let digits_end = t
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(t.len());
-    let (num, unit) = t.split_at(digits_end);
-    let base: f64 = num.parse().ok()?;
-    let mul: f64 = match unit.trim().to_ascii_uppercase().as_str() {
-        "" | "B" => 1.0,
-        "K" | "KB" | "KIB" => 1024.0,
-        "M" | "MB" | "MIB" => 1024.0 * 1024.0,
-        "G" | "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
-        "T" | "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
-    Some((base * mul) as u64)
-}
-
-/// `500ms` / `30s` / `5m` / `1h` → 毫秒。无单位按**秒**处理。
-pub fn parse_ms(s: &str) -> Option<u64> {
-    let t = s.trim().to_ascii_lowercase();
-    if t.is_empty() {
-        return None;
-    }
-    let digits_end = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
-    let (num, unit) = t.split_at(digits_end);
-    let n: u64 = num.parse().ok()?;
-    let mul: u64 = match unit {
-        "" | "s" | "sec" | "secs" => 1000,
-        "ms" => 1,
-        "m" | "min" | "mins" => 60_000,
-        "h" | "hr" => 3_600_000,
-        _ => return None,
-    };
-    Some(n.saturating_mul(mul))
-}
-
-/// `abs=1G` / `grow=500M` / `rate=10M/60s` → [`Rule`]。
-pub fn parse_rule(s: &str) -> Result<Rule, String> {
-    let (kind, body) = s
-        .split_once('=')
-        .or_else(|| s.split_once(':'))
-        .ok_or_else(|| format!("规则「{}」缺少 `=`，应为 abs=1G / grow=500M / rate=10M/60s", s))?;
-    let kind = kind.trim().to_ascii_lowercase();
-    let body = body.trim();
-
-    match kind.as_str() {
-        "abs" | "absolute" | "绝对" => {
-            let b = parse_size(body)
-                .ok_or_else(|| format!("无法解析体积「{}」，示例：1G / 500MB / 2147483648", body))?;
-            Ok(Rule::absolute(b))
-        }
-        "grow" | "growth" | "增长" => {
-            let b = parse_size(body)
-                .ok_or_else(|| format!("无法解析体积「{}」，示例：500M / 2G", body))?;
-            Ok(Rule::growth(b))
-        }
-        "rate" | "速率" => {
-            let (sz, win) = body
-                .split_once('/')
-                .ok_or_else(|| format!("速率规则需要写成 `rate=10M/60s`，收到「{}」", body))?;
-            let bytes = parse_size(sz).ok_or_else(|| format!("无法解析速率「{}」", sz))?;
-            let window = parse_ms(win).ok_or_else(|| format!("无法解析时间窗「{}」", win))?;
-            if window == 0 {
-                return Err("速率规则的时间窗不能为 0".to_string());
-            }
-            let per_sec = (bytes as u128 * 1000 / window as u128) as u64;
-            Ok(Rule::rate(per_sec, window))
-        }
-        other => Err(format!(
-            "未知规则类型「{}」，可选：abs（绝对阈值）/ grow（增长量）/ rate（速率）",
-            other
-        )),
-    }
-}
+/// `1G` / `512MB` / `1024` → 字节数；`500ms` / `30s` / `5m` → 毫秒；
+/// `abs=1G` / `rate=10M/60s` → [`Rule`]。
+///
+/// **这三个函数住在 `core_monitor::spec` 里**，这里只是转出去给 CLI 用。
+/// 它们原来长在这个文件里，后来 GUI 的阈值输入框要用同一套语法 ——
+/// 一份语法两处实现，迟早会出现「CLI 认 `abs=1G`、界面不认」这种别扭事。
+/// 规则的解析属于规则域，所以搬到了规则所在的 crate。
+pub use core_monitor::spec::{parse_ms, parse_rule, parse_size};
 
 /// 规则的中文描述（回显用）。
+///
+/// 留在这里而不是跟着解析一起搬走：它要做**列对齐**和体积格式化，那是
+/// 终端的事。规则的名字（绝对/增量/速率）仍取自 `RuleKind::label_cn()`，
+/// 所以措辞只有一处来源。
 pub fn rule_label(r: &Rule) -> String {
     match r.kind {
         RuleKind::Absolute => format!("绝对阈值 {}", human(r.threshold)),
@@ -299,54 +232,6 @@ mod tests {
         // 子命令与位置参数不能被可重复选项挤掉
         assert_eq!(a.cmd, "monitor");
         assert_eq!(a.positional, vec!["C:\\data".to_string()]);
-    }
-
-    #[test]
-    fn parses_size_units() {
-        assert_eq!(parse_size("1024"), Some(1024));
-        assert_eq!(parse_size("1K"), Some(1024));
-        assert_eq!(parse_size("1KB"), Some(1024));
-        assert_eq!(parse_size("1M"), Some(1024 * 1024));
-        assert_eq!(parse_size("1.5M"), Some(1024 * 1024 * 3 / 2));
-        assert_eq!(parse_size("2G"), Some(2 * 1024 * 1024 * 1024));
-        assert_eq!(parse_size("1T"), Some(1024u64.pow(4)));
-        assert_eq!(parse_size("abc"), None);
-        assert_eq!(parse_size(""), None);
-        assert_eq!(parse_size("1X"), None);
-    }
-
-    #[test]
-    fn parses_durations() {
-        assert_eq!(parse_ms("500ms"), Some(500));
-        assert_eq!(parse_ms("30s"), Some(30_000));
-        assert_eq!(parse_ms("30"), Some(30_000));
-        assert_eq!(parse_ms("5m"), Some(300_000));
-        assert_eq!(parse_ms("1h"), Some(3_600_000));
-        assert_eq!(parse_ms("xx"), None);
-    }
-
-    #[test]
-    fn parses_rules() {
-        let r = parse_rule("abs=1G").unwrap();
-        assert_eq!(r.kind, RuleKind::Absolute);
-        assert_eq!(r.threshold, 1024 * 1024 * 1024);
-
-        let g = parse_rule("grow=500M").unwrap();
-        assert_eq!(g.kind, RuleKind::Growth);
-        assert_eq!(g.threshold, 500 * 1024 * 1024);
-
-        let t = parse_rule("rate=10M/60s").unwrap();
-        assert_eq!(t.kind, RuleKind::Rate);
-        assert_eq!(t.window_ms, 60_000);
-        // 10 MiB / 60 s
-        assert_eq!(t.threshold, 10 * 1024 * 1024 * 1000 / 60_000);
-
-        // 冒号写法也认
-        assert!(parse_rule("abs:2M").is_ok());
-        assert!(parse_rule("bogus=1G").is_err());
-        assert!(parse_rule("abs").is_err());
-        assert!(parse_rule("rate=10M").is_err());
-        assert!(parse_rule("rate=10M/0s").is_err());
     }
 
     #[test]

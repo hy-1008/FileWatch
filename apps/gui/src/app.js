@@ -551,6 +551,347 @@ function onRelaunchOutcome(r) {
     .catch(() => {});
 }
 
+/* ── F6/F7/F8 实时监控 ─────────────────────────────────────────────────
+ *
+ * 后端的监控线程每应用一批事件就推一条 `monitor:tick`，里面带着渲染好的行
+ * （体积说法与 CLI 同源）。这里只做三件事：攒行、画行、按代数重画面积图。
+ *
+ * **代数（generation）是这里的关键**：监控会就地改索引树，前端手上的布局
+ * 随时可能过期。后端每改一次树就 +1，前端发现代数和上次不同就重画 ——
+ * 这样"面积图永远滞后"这种问题不会出现，也不需要前端自己猜什么时候该刷。
+ */
+
+const mon = {
+  open: false,
+  running: false,
+  info: null,
+  snap: null,
+  tab: 'changes',
+  filter: '',
+  /** 变更行，最新的在前 */
+  rows: [],
+  alerts: [],
+  /** 已见过的最大序号，用来在做增量拼接时去重 */
+  maxSeq: 0,
+  lastGen: 0,
+  /** 上次因代数变化重画的时间（节流用） */
+  lastRedraw: 0,
+  redrawTimer: null,
+  statsTick: 0,
+};
+
+/** 界面上最多保留多少行。环形缓冲是 4000，但 DOM 不可能全画。 */
+const MON_ROW_CAP = 800;
+
+/** 保尾截断：路径最有价值的部分在末尾（文件名），从中间截等于没说。 */
+function monKeepTail(s, n) {
+  const str = String(s);
+  if (str.length <= n) return str;
+  return '…' + str.slice(str.length - n + 1);
+}
+
+/** 相对起点的 `mm:ss.mmm`。 */
+function monOffset(ms) {
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const msec = Math.floor(ms % 1000);
+  const p = (v, w) => String(v).padStart(w, '0');
+  return `${p(m, 2)}:${p(s, 2)}.${p(msec, 3)}`;
+}
+
+function monShow(open) {
+  mon.open = open;
+  document.getElementById('mon-body').classList.toggle('hidden', !open);
+  document.getElementById('mon-toggle').textContent = (open ? '▾' : '▸') + ' 实时监控';
+  if (open) {
+    backfillMonitor().catch(() => {});
+  }
+}
+
+function renderMonHead() {
+  const s = mon.snap;
+  const i = mon.info;
+  const set = (id, v) => { document.getElementById(id).textContent = v; };
+
+  const b = document.getElementById('mon-state');
+  b.textContent = mon.running ? '监控中' : (i ? '已停止' : '未启动');
+  b.className = 'badge' + (mon.running ? ' mft' : (i ? '' : ''));
+
+  set('mon-targets', i && i.paths.length ? i.paths.join('　') : '—');
+  set('mon-source', i ? `${i.incremental}　${i.scope}` : '—');
+  set('mon-counts', s
+    ? `已运行 ${monOffset(s.elapsed_ms || 0)}　变更 ${(s.total_events || 0).toLocaleString()} 条`
+      + `　预警 ${(s.total_alerts || 0).toLocaleString()} 次`
+      + (s.still_pending ? `　待定 ${s.still_pending}` : '')
+      + (s.backpressure ? `　⚠ 背压 ${s.backpressure}` : '')
+    : '—');
+
+  const err = document.getElementById('mon-error');
+  const msg = (s && s.error) || '';
+  err.textContent = msg;
+  err.classList.toggle('hidden', !msg);
+  err.title = msg;
+
+  document.getElementById('mon-start').classList.toggle('hidden', mon.running);
+  document.getElementById('mon-stop').classList.toggle('hidden', !mon.running);
+  // 监控期间不能扫描（会换掉整棵树），按钮直接禁掉比让后端报错友好
+  document.getElementById('scan-root').disabled = mon.running || state.scanning;
+}
+
+function renderMonList() {
+  const box = document.getElementById('mon-list');
+  const hint = document.getElementById('mon-list-hint');
+  box.innerHTML = '';
+
+  if (mon.tab === 'alerts') {
+    hint.textContent = `${mon.alerts.length} 条`;
+    if (!mon.alerts.length) {
+      box.innerHTML = '<div class="mon-empty">还没有触发过预警。'
+        + '在上面的「阈值规则」里写一条，例如 <code>grow=500M</code>。</div>';
+      return;
+    }
+    for (const a of mon.alerts.slice(0, 300)) {
+      const el = document.createElement('div');
+      el.className = 'arow';
+      el.title = a.message;
+      el.innerHTML =
+        `<span class="t">${monOffset(a.at_ms)}</span>` +
+        `<span class="k ${a.kind}">${esc(a.kind_cn)}</span>` +
+        `<span class="p">${esc(monKeepTail(a.path, 90))}</span>` +
+        `<span class="s">${humanSize(a.current)} / 阈值 ${humanSize(a.threshold)}</span>`;
+      box.appendChild(el);
+    }
+    return;
+  }
+
+  const shown = mon.rows.slice(0, 300);
+  hint.textContent = shown.length < mon.rows.length
+    ? `${shown.length} / ${mon.rows.length} 条（导出 CSV 可看全部）`
+    : `${mon.rows.length} 条`;
+  if (!mon.rows.length) {
+    box.innerHTML = mon.running
+      ? '<div class="mon-empty">监控已开始，正在等待变更…（在上面那个目录里新建/改动一个文件试试）</div>'
+      : '<div class="mon-empty">还没有变更记录。点「开始监控」后，这里会实时刷出新增 / 删除 / 改名 / 修改。</div>';
+    return;
+  }
+  for (const r of shown) {
+    const el = document.createElement('div');
+    el.className = 'mrow';
+    el.title = r.path;
+    el.innerHTML =
+      `<span class="t">${monOffset(r.at_ms)}</span>` +
+      `<span class="k ${r.kind}">${esc(r.kind_cn)}</span>` +
+      `<span class="s">${esc(r.size_text)}</span>` +
+      `<span class="p${r.is_dir ? ' dir' : ''}">${esc(monKeepTail(r.path, 120))}</span>` +
+      `<span class="x">${r.suffix ? esc(r.suffix) : ''}</span>`;
+    box.appendChild(el);
+  }
+}
+
+/** 从后端环形缓冲回填（打开面板、切筛选、切页签时用）。 */
+async function backfillMonitor() {
+  mon.snap = await call('monitor_snapshot');
+  mon.info = mon.snap.info || mon.info;
+  mon.running = !!mon.snap.running;
+  if (!mon.running && mon.info) {
+    document.getElementById('mon-state').textContent = '已停止';
+  }
+  const page = await call('monitor_changes', {
+    limit: 800,
+    kind: mon.filter || null,
+  });
+  mon.rows = page.rows || [];
+  mon.maxSeq = mon.rows.reduce((m, r) => Math.max(m, r.seq), 0);
+  mon.alerts = await call('monitor_alerts', { limit: 300 });
+  renderMonHead();
+  renderMonList();
+}
+
+/** 一轮 tick：攒行 + 需要时重画面积图。 */
+function onMonitorTick(t) {
+  if (t.rows && t.rows.length) {
+    // 增量拼接：只收比已见过更新的行（事件可能乱序/重复到达）
+    const fresh = mon.filter ? t.rows.filter((r) => r.kind === mon.filter) : t.rows;
+    const add = fresh.filter((r) => r.seq > mon.maxSeq);
+    if (add.length) {
+      mon.maxSeq = Math.max(mon.maxSeq, ...add.map((r) => r.seq));
+      mon.rows = add.concat(mon.rows).slice(0, MON_ROW_CAP);
+    }
+  }
+  if (t.alerts && t.alerts.length) {
+    mon.alerts = t.alerts.concat(mon.alerts).slice(0, 300);
+  }
+  mon.snap = Object.assign({}, mon.snap || {}, {
+    running: true,
+    total_events: t.total_events,
+    total_alerts: t.total_alerts,
+    elapsed_ms: t.elapsed_ms,
+    still_pending: t.still_pending,
+    backpressure: (mon.snap && mon.snap.backpressure) || 0,
+    error: (mon.snap && mon.snap.error) || null,
+  });
+  mon.running = true;
+
+  // 状态栏跟着实时数字走（扫描摘要里的总量在监控期间会过期）
+  if (t.totals) applyLiveTotals(t.totals);
+
+  renderMonHead();
+  if (mon.open) renderMonList();
+
+  if (t.notification) toast(t.notification, true);
+  if (t.truncated) toast(`一轮变更太多，列表只显示了最近 ${t.rows.length} 条`, true);
+  if (t.backpressure) toast('事件过多：队列溢出，部分事件已丢弃（建议缩小监视范围）', true);
+
+  // 代数变了 = 树被改过 → 面积图/文件夹树都过期了，重画（节流）
+  if (t.generation && t.generation !== mon.lastGen) {
+    mon.lastGen = t.generation;
+    scheduleRedraw();
+  }
+}
+
+/** 节流的重画：监控每 500ms 就可能改树，而一次布局是 O(节点数)。 */
+function scheduleRedraw() {
+  const now = Date.now();
+  const gap = 1500;
+  const wait = Math.max(0, gap - (now - mon.lastRedraw));
+  if (mon.redrawTimer) return;
+  mon.redrawTimer = setTimeout(async () => {
+    mon.redrawTimer = null;
+    mon.lastRedraw = Date.now();
+    if (state.focus === null) return;
+    try {
+      await refreshLayout();
+      await renderTree();
+      // 类型聚合与 Top-N 都是 O(n) 重建，降一个数量级的频率
+      mon.statsTick += 1;
+      if (mon.statsTick % 4 === 0) {
+        renderExts();
+        renderTopFiles();
+      }
+    } catch (e) {
+      /* 重画失败不该打断监控：下一次 tick 还会再来一次 */
+    }
+  }, wait);
+}
+
+/** 用树里的实时总量刷新状态栏（其余字段仍来自扫描摘要）。 */
+function applyLiveTotals(t) {
+  if (!state.summary) return;
+  state.summary.dirs = t.dirs;
+  state.summary.files = t.files;
+  state.summary.logical = t.logical;
+  state.summary.alloc = t.alloc;
+  renderStatus();
+}
+
+async function startMonitor() {
+  const paths = document.getElementById('mon-paths').value
+    .split('\n').map((s) => s.trim()).filter(Boolean);
+  if (!paths.length) {
+    toast('先填监控目标：点「用当前视图根」或「用当前盘符」，也可以手填一个目录');
+    monShow(true);
+    return;
+  }
+  const rules = document.getElementById('mon-rules').value
+    .split('\n').map((s) => s.trim()).filter(Boolean);
+
+  const iv = Number(document.getElementById('mon-interval').value.trim());
+  if (!Number.isFinite(iv) || iv < 100) {
+    toast('轮询间隔要是一个 ≥ 100 的数字（毫秒）');
+    return;
+  }
+
+  const changelog = document.getElementById('mon-changelog').value.trim();
+  try {
+    await call('monitor_start', {
+      paths,
+      rules,
+      intervalMs: Math.round(iv),
+      changelog: changelog || null,
+      createJournal: document.getElementById('mon-journal').checked,
+    });
+    mon.running = true;
+    mon.tab = 'changes';
+    syncTabs();
+    renderMonHead();
+  } catch (e) {
+    /* call() 已经提示过 */
+  }
+}
+
+async function stopMonitor() {
+  try {
+    await call('monitor_stop');
+  } catch (e) { /* 已提示 */ }
+}
+
+async function exportCsv() {
+  let p = document.getElementById('mon-csv').value.trim();
+  if (!p) {
+    const dir = await call('monitor_default_export_dir');
+    const d = new Date();
+    const z = (n) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}`
+      + `-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
+    p = `${dir}\\filewatch-changes-${stamp}.csv`;
+    document.getElementById('mon-csv').value = p;
+  }
+  try {
+    const n = await call('monitor_export_csv', { path: p, kind: mon.filter || null });
+    document.getElementById('mon-export-hint').textContent = `已导出 ${n} 条`;
+    toast(`已导出 ${n} 条到 ${p}`);
+  } catch (e) { /* 已提示 */ }
+}
+
+function syncTabs() {
+  document.getElementById('mon-tab-changes').classList.toggle('on', mon.tab === 'changes');
+  document.getElementById('mon-tab-alerts').classList.toggle('on', mon.tab === 'alerts');
+  // 预警没有类型筛选，切过去时把筛选器藏掉，免得让人以为筛选没生效
+  document.getElementById('mon-filter').style.visibility =
+    mon.tab === 'changes' ? 'visible' : 'hidden';
+}
+
+/** 把当前视图根的真实路径填进监控目标。 */
+async function fillPaths(kind) {
+  const t = document.getElementById('mon-paths');
+  try {
+    if (kind === 'focus') {
+      if (state.focus === null) { toast('还没有扫描结果'); return; }
+      const info = await call('node_detail', { node: state.focus });
+      t.value = info.path;
+    } else {
+      const s = state.summary;
+      if (!s) { toast('还没有扫描结果'); return; }
+      // 扫描根是盘符（`C:` 或 `C:\`）时补上尾反斜杠：`C:` 在 Windows 上
+      // 是「C 盘的当前目录」，与 `C:\` 不是一回事
+      const r = s.root || '';
+      t.value = /^[A-Za-z]:\\?$/.test(r) ? r[0].toUpperCase() + ':\\' : r;
+    }
+  } catch (e) { /* 已提示 */ }
+}
+
+function wireMonitor() {
+  document.getElementById('mon-toggle').onclick = () => monShow(!mon.open);
+  document.getElementById('mon-start').onclick = startMonitor;
+  document.getElementById('mon-stop').onclick = stopMonitor;
+  document.getElementById('mon-export').onclick = exportCsv;
+  document.getElementById('mon-use-focus').onclick = () => fillPaths('focus');
+  document.getElementById('mon-use-vol').onclick = () => fillPaths('volume');
+
+  document.getElementById('mon-tab-changes').onclick = () => {
+    mon.tab = 'changes'; syncTabs(); renderMonList();
+  };
+  document.getElementById('mon-tab-alerts').onclick = () => {
+    mon.tab = 'alerts'; syncTabs(); renderMonList();
+  };
+  document.getElementById('mon-filter').onchange = (e) => {
+    mon.filter = e.target.value;
+    backfillMonitor().catch(() => {});
+  };
+  syncTabs();
+  renderMonHead();
+}
+
 /* ── 启动 ──────────────────────────────────────────────────────────────── */
 
 async function boot() {
@@ -577,6 +918,8 @@ async function boot() {
   await loadVolumes();
   await loadElevation();
   wireAdminModal();
+  wireMonitor();
+  backfillMonitor().catch(() => {});
 
   document.getElementById('refresh-vols').onclick = loadVolumes;
   document.getElementById('scan-root').onclick = () => {
@@ -609,6 +952,37 @@ async function boot() {
   await listen('scan:done', (ev) => afterScan(ev.payload, null));
   await listen('scan:error', (ev) => afterScan(null, String(ev.payload)));
   await listen('admin:relaunch', (ev) => onRelaunchOutcome(ev.payload || {}));
+
+  // 监控
+  await listen('monitor:started', (ev) => {
+    mon.info = ev.payload;
+    mon.running = true;
+    monShow(true);
+    if (ev.payload && ev.payload.reopened) {
+      toast('为建立增量来源，已重新扫描一次（监控需要一个事件源）');
+    }
+    for (const w of (ev.payload && ev.payload.warnings) || []) toast(w);
+    renderMonHead();
+  });
+  await listen('monitor:tick', (ev) => onMonitorTick(ev.payload || {}));
+  await listen('monitor:stopped', (ev) => {
+    mon.running = false;
+    mon.snap = ev.payload || mon.snap;
+    // 收尾后索引稳定了，一次性把面板刷到最新
+    renderMonHead();
+    backfillMonitor().catch(() => {});
+    refreshLayout().catch(() => {});
+    renderTree().catch(() => {});
+    renderExts().catch(() => {});
+    renderTopFiles().catch(() => {});
+  });
+  await listen('monitor:error', (ev) => {
+    mon.running = false;
+    mon.snap = Object.assign({}, mon.snap || {}, { error: String(ev.payload) });
+    renderMonHead();
+    renderMonList();
+    toast('监控出错：' + String(ev.payload), true);
+  });
 
   // 进入软件时申请一次管理员权限。
   // 判断本身在 admin-rule.js 里（那是个能被 tools/check-admin.js 跑真值表的

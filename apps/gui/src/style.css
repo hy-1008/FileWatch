@@ -250,6 +250,86 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
 .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
 #admin-wait { margin-top: 8px; text-align: right; }
 
+/* ── F6/F7/F8 实时监控抽屉 ─────────────────────────────────────────── */
+
+.monitor {
+  flex: 0 0 auto; background: var(--bg-panel); border-top: 1px solid var(--border);
+}
+.mon-head { display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 12px; }
+.mon-meta {
+  color: var(--text-dim); font-size: 11px; max-width: 300px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mon-err { color: var(--crit); font-size: 11px; max-width: 40vw;
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.mon-body {
+  display: grid; grid-template-columns: 340px 1fr;
+  height: 250px; border-top: 1px solid var(--border);
+}
+.mon-setup {
+  padding: 8px 10px; border-right: 1px solid var(--border);
+  overflow: auto; display: flex; flex-direction: column; gap: 6px;
+}
+.mon-setup .f {
+  display: grid; grid-template-columns: 66px 1fr; gap: 6px;
+  align-items: center; color: var(--text-dim); font-size: 11px;
+}
+.mon-setup .f > span:first-child { white-space: nowrap; }
+.mon-setup textarea, .mon-setup input[type=text] {
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 3px 6px; font: inherit; width: 100%; min-width: 0;
+  resize: vertical;
+}
+.mon-setup textarea:focus, .mon-setup input:focus { outline: 1px solid var(--accent); }
+
+.mon-lists { display: flex; flex-direction: column; min-width: 0; }
+.mon-tabs {
+  display: flex; align-items: center; gap: 6px; height: 28px;
+  padding: 0 8px; border-bottom: 1px solid var(--border); flex: 0 0 auto;
+}
+.tab {
+  background: transparent; border: 1px solid transparent; border-radius: 4px;
+  padding: 1px 8px; font-size: 11px; color: var(--text-dim);
+}
+.tab:hover { background: var(--bg-hover); }
+.tab.on { background: var(--bg-raised); border-color: var(--border-strong); color: var(--text); }
+.mon-list { overflow: auto; flex: 1 1 auto; min-height: 0; }
+
+/* 变更行：时间 / 类型 / 体积 / 路径 / 附注 */
+.mrow {
+  display: grid; grid-template-columns: 64px 56px 84px minmax(0, 1fr) auto;
+  gap: 8px; align-items: center; height: var(--row); padding: 0 8px;
+  white-space: nowrap; border-radius: 3px;
+}
+.mrow:hover { background: var(--bg-hover); }
+.mrow .t { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.mrow .k { color: var(--text-dim); }
+.mrow .k.created { color: var(--ok); }
+.mrow .k.deleted { color: var(--crit); }
+.mrow .k.renamed { color: var(--accent); }
+.mrow .k.modified { color: var(--warn); }
+.mrow .p { overflow: hidden; text-overflow: ellipsis; }
+.mrow .p.dir { color: #9dc4ff; }
+.mrow .s { color: var(--text-dim); font-variant-numeric: tabular-nums; text-align: right; }
+.mrow .x { color: var(--text-faint); font-size: 10px; }
+
+/* 预警行 */
+.arow {
+  display: grid; grid-template-columns: 64px 84px minmax(0, 1fr) auto;
+  gap: 8px; align-items: center; height: var(--row); padding: 0 8px;
+  white-space: nowrap; border-radius: 3px;
+}
+.arow:hover { background: var(--bg-hover); }
+.arow .t { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.arow .k { color: var(--warn); }
+.arow .k.rate { color: var(--crit); }
+.arow .p { overflow: hidden; text-overflow: ellipsis; }
+.arow .s { color: var(--text-dim); font-variant-numeric: tabular-nums; text-align: right; }
+
+.mon-empty { padding: 10px; color: var(--text-dim); }
+
 /* ── 遮罩 / 提示 ────────────────────────────────────────────────────── */
 
 .overlay {

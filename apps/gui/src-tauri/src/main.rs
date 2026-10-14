@@ -30,12 +30,14 @@
 
 mod commands;
 mod elevate;
+mod monitor;
 mod prefs;
 mod state;
 mod wire;
 
+use monitor::MonitorHub;
 use state::AppState;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 fn main() {
     // 诊断入口：不开窗口、不进 GUI，直接把权限现状打到 stdout。
@@ -46,8 +48,13 @@ fn main() {
         return;
     }
 
-    tauri::Builder::default()
+    let hub = MonitorHub::new();
+    let app = tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
+        // 监控状态独立于扫描状态：它的环形缓冲由监控线程写、命令读，
+        // 与扫描结果（`Mutex<AppState>`）不是一回事，混在一起只会让锁的
+        // 持有时间变长。
+        .manage(hub.clone())
         .invoke_handler(tauri::generate_handler![
             // F1 盘符
             commands::list_volumes,
@@ -66,12 +73,33 @@ fn main() {
             // 详情与定位
             commands::node_detail,
             commands::find_by_path,
-            // 管理员权限（F0：进入软件时申请）
+            // F0 管理员权限（进入软件时申请）
             commands::elevation_info,
             commands::relaunch_elevated,
             commands::gui_prefs,
             commands::set_gui_prefs,
+            // F6/F7/F8 实时监控 / 阈值预警 / 变更流水
+            monitor::monitor_start,
+            monitor::monitor_stop,
+            monitor::monitor_snapshot,
+            monitor::monitor_changes,
+            monitor::monitor_alerts,
+            monitor::monitor_export_csv,
+            monitor::monitor_default_export_dir,
         ])
-        .run(tauri::generate_context!())
-        .expect("FileWatch GUI 启动失败");
+        .build(tauri::generate_context!())
+        .expect("FileWatch GUI 初始化失败");
+
+    // 退出前给监控线程一点时间收尾：`Session::shutdown` 会吐出 debounce 池里
+    // 剩下的变更并保存 USN 游标。不这么做的话，关窗口 = 丢掉最后几秒的变更，
+    // 下次启动还要从旧游标重放一遍。
+    // `run` 的回调要求 `'static + Send`，所以把 Arc 复制一份进闭包
+    // （`arc.clone()` 只是引用计数 +1，不是复制缓冲）。
+    let hub_exit = Arc::clone(&hub);
+    app.run(move |_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            hub_exit.request_stop();
+            hub_exit.wait_idle(std::time::Duration::from_millis(1200));
+        }
+    });
 }

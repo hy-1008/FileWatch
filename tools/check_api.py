@@ -444,6 +444,56 @@ for cname, info in crate_data.items():
                 P("ERROR", "H", "%s/%s.rs:%d  `%s { ... }` 缺少字段（且无 ..rest）-> %s"
                   % (cname, f, ln, real, ", ".join(sorted(missing))))
 
+# ────────────────────────────────────────────── I. 单一定义约定
+# 有些函数/常量必须**全工程只有一处定义**：它们是两个前端共用的「语法」或
+# 「口径」，各写一份就会慢慢分叉 —— 而这类分叉不会报错，只会让同一个动作在
+# CLI 与界面上表现不一致（历史上已经出现过「路径双重替换」「落盘用合成路径」
+# 两次事故，都是同一件事写了两遍）。
+#
+# 判据是**顶层定义**（行首无缩进）：`impl` 块里的同名方法不算重复，
+# 因为那是"给会话再加一个便捷入口"，不是另写一套。
+SINGLE_DEF = {
+    # 人读写法 → 规则：GUI 的阈值输入框与 CLI 的 --rule 必须同一套语法
+    "fn parse_size": "crates/core-monitor/src/spec.rs",
+    "fn parse_ms": "crates/core-monitor/src/spec.rs",
+    "fn parse_rule": "crates/core-monitor/src/spec.rs",
+    # 「体积怎么说」：同一条变更在终端与界面上的数字必须一样
+    "fn event_size_text": "crates/core-monitor/src/changelog.rs",
+    # 合成路径拼接 / 事件 → 显示路径
+    "fn join_path": "crates/core-scan/src/paths.rs",
+    "fn event_path": "crates/core-scan/src/paths.rs",
+    # FRN → 记录号的掩码（曾经在三个 crate 里各抄一份）
+    "const RECNO_MASK": "crates/core-index/src/arena.rs",
+}
+
+_def_files = collections.defaultdict(list)
+for cname, rel in list(CRATES.items()) + list(BIN_CRATES.items()):
+    info = crate_data.get(cname)
+    if not info:
+        continue
+    for f in info["files"]:
+        relsrc = os.path.join(rel, "src", f + ".rs").replace(os.sep, "/")
+        clean_f = strip_noise(rd(os.path.join(info["dir"], f + ".rs")))
+        for what in SINGLE_DEF:
+            kind, name = what.split(" ", 1)
+            # 行首（可能有 pub / pub(crate)）即顶层定义；缩进的是方法或嵌套项
+            pat = r'(?m)^(?:pub(?:\([^)]*\))?[ \t]+)?(?:const[ \t]+)?%s\b' % re.escape(name)
+            if kind == "fn":
+                pat = r'(?m)^(?:pub(?:\([^)]*\))?[ \t]+)?(?:async[ \t]+)?fn[ \t]+%s[ \t]*[<(]' % re.escape(name)
+            if re.search(pat, clean_f):
+                _def_files[what].append(relsrc)
+
+for what, want in sorted(SINGLE_DEF.items()):
+    got = _def_files.get(what, [])
+    name = what.split(" ", 1)[1]
+    if len(got) == 0:
+        P("ERROR", "I", "`%s` 找不到定义（应在 %s）—— 检查器可能已过时" % (name, want))
+    elif len(got) > 1:
+        P("ERROR", "I", "`%s` 有 %d 处顶层定义 -> %s；这类共用口径只能有一处（另一处请改成 use 转出）"
+          % (name, len(got), ", ".join(got)))
+    elif got[0] != want:
+        P("WARN", "I", "`%s` 定义在 %s，预期 %s" % (name, got[0], want))
+
 # ────────────────────────────────────────────── 输出
 order = {"ERROR": 0, "WARN": 1}
 problems.sort(key=lambda x: (order[x[0]], x[1]))

@@ -7,6 +7,7 @@
 //! | [`queue`] | 有界环形队列 + 背压计数（风险 R5） |
 //! | [`debounce`] | 事件归一化与合并（编辑器保存风暴 / 回收站 / 临时文件） |
 //! | [`rules`] | 三种阈值规则 + 滞回 + 冷却（M3 核心） |
+//! | [`spec`] | 人读写法 → 规则（`abs=1G` / `rate=10M/60s`），CLI 与界面共用 |
 //! | [`alert`] | 内容去重 + 同批合并 + 严重级别 |
 //! | [`changelog`] | 变更流水 JSONL 落库与轮转（功能 F8） |
 //! | [`pathremap`] | 合成路径（盘符前缀）→ 真实扫描根，显示与落盘共用 |
@@ -22,9 +23,10 @@ pub mod engine;
 pub mod pathremap;
 pub mod queue;
 pub mod rules;
+pub mod spec;
 
 pub use alert::{AlertSink, Notification, Severity};
-pub use changelog::ChangeLog;
+pub use changelog::{event_size_text, event_suffix, ChangeLog};
 pub use debounce::{DebounceConfig, Debouncer, PendingEvent, RawEvent};
 pub use engine::{
     EngineConfig, EngineStats, MonitorEngine, TickOutcome, DEFAULT_ALERT_DEDUP_MS,
@@ -33,3 +35,4 @@ pub use engine::{
 pub use pathremap::PathRemap;
 pub use queue::RingQueue;
 pub use rules::{Alert, Rule, RuleConfig, RuleEngine, RuleKind, Target};
+pub use spec::{parse_ms, parse_rule, parse_rules, parse_size, rule_shape};

@@ -12,6 +12,7 @@
 //! | [`traverse`] | 无管理员 / 非 NTFS 时的目录遍历降级 | 风险 R2 |
 //! | [`dirwatch`] | `ReadDirectoryChangesW` 封装（降级模式的实时事件源） | 风险 R2 |
 //! | [`watcher`] | 路径事件 → FRN 事件的翻译层（含路径索引与对账） | 风险 R2 |
+//! | [`paths`] | 合成路径拼接 / 事件 → 可显示路径（CLI 与界面共用） | 显示与落盘一致性 |
 //! | [`incremental`] | USN 增量会话：拉页 → 归一化 → 回读大小 | M2 |
 //! | [`session`] | **统一入口**：选后端 → 全量 → 建增量 → 注册监控 | M1~M3 |
 //!
@@ -40,6 +41,7 @@
 pub mod dirwatch;
 pub mod full_scan;
 pub mod incremental;
+pub mod paths;
 pub mod session;
 pub mod traverse;
 pub mod watcher;
@@ -50,6 +52,7 @@ pub use full_scan::{
     ScanStats, AVG_NAME_BYTES,
 };
 pub use incremental::IncrementalSession;
+pub use paths::{event_path, join_path, raw_event_path};
 pub use session::{ScanBackend, ScanPhase, Session, SessionConfig};
 pub use traverse::{
     full_scan_traverse, full_scan_traverse_indexed, TraverseOptions, TraverseStats,

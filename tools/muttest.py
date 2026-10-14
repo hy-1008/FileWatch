@@ -67,6 +67,27 @@ def _extras(src, dst):
     return out
 
 
+def _refresh_prime():
+    """把源码树里新增/改过的文件同步进干净副本。
+
+    不做这一步的后果很隐蔽：往源码里加了新文件之后，变异测试会一直在测
+    **旧副本** —— 而报出来的错会指向一个"找不到的文件"，看不出是副本陈旧。
+    （踩过一次：新增 `core-scan/src/paths.rs` 后，副本里根本没有这个文件。）
+
+    只同步 `crates/` 与 `apps/`：`check_api.py` 是平铺拷进副本根的，
+    跟着通用同步走会被当成"源码里没有的文件"删掉。
+    """
+    for d in ('crates', 'apps'):
+        base_d = os.path.join(BASE, d)
+        prime_d = os.path.join(PRIME, d)
+        _sync(base_d, prime_d)
+        # 源码里删掉的，副本里也要删，否则会一直报"孤儿源文件"
+        for r in _extras(base_d, prime_d):
+            os.remove(os.path.join(prime_d, r))
+    shutil.copyfile(os.path.join(BASE, 'Cargo.toml'), os.path.join(PRIME, 'Cargo.toml'))
+    shutil.copyfile(os.path.join(BASE, 'tools', 'check_api.py'), os.path.join(PRIME, 'check_api.py'))
+
+
 def prepare():
     """建好 `PRIME`（若不存在）并把 `WORK` 对齐到 `PRIME`。只在开跑前调用一次。"""
     os.makedirs(ROOT, exist_ok=True)
@@ -79,6 +100,8 @@ def prepare():
             shutil.copytree(os.path.join(BASE, d), os.path.join(PRIME, d))
         shutil.copy(os.path.join(BASE, 'Cargo.toml'), PRIME)
         shutil.copy(os.path.join(BASE, 'tools', 'check_api.py'), PRIME)
+    # 副本必须跟着源码走（见 _refresh_prime 的注释）
+    _refresh_prime()
     os.makedirs(WORK, exist_ok=True)
     # 上次异常退出可能在 WORK 里留下变异产物 → 清掉（通常 0~1 个文件）
     for r in _extras(PRIME, WORK):
@@ -244,6 +267,26 @@ def m_regress_self():
     p = os.path.join(TMP, 'crates/core-viz/src/rect.rs')
     write(p, read(p) + '\nfn _probe_self() -> Rect { Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 } }\n')
 mut("回归：`Self { ... }` / 普通字面量不误报", None, m_regress_self)
+
+# ── I（单一定义约定）
+def m_dup_parse_size():
+    """把共用语法在另一个 crate 里再写一遍 —— 这正是要拦的那件事"""
+    p = os.path.join(TMP, 'crates/core-scan/src/paths.rs')
+    write(p, read(p) + '\nfn parse_size(s: &str) -> Option<u64> { let _ = s; None }\n')
+mut("重复定义共用语法 `fn parse_size`", "I", m_dup_parse_size)
+
+def m_dup_recno_mask():
+    p = os.path.join(TMP, 'crates/core-scan/src/watcher.rs')
+    write(p, read(p) + '\nconst RECNO_MASK: u64 = 0xFFFF_FFFF_FFFF;\n')
+mut("重复定义 `const RECNO_MASK`", "I", m_dup_recno_mask)
+
+def m_regress_method_not_a_dup():
+    """`impl` 里的同名方法不算重复：那是给会话加个便捷入口，不是另写一套"""
+    q = os.path.join(TMP, 'crates/core-scan/src/paths.rs')
+    write(q, read(q).replace(
+        'impl Session {',
+        'impl Session {\n    pub fn join_path(&self) -> String { String::new() }'))
+mut("回归：impl 内的同名方法不算重复", None, m_regress_method_not_a_dup)
 
 
 print("=" * 78)

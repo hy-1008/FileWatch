@@ -48,12 +48,10 @@ use core_usn::normalize::{
     USN_REASON_DATA_EXTEND, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
     USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
 };
+use core_index::RECNO_MASK;
 use std::collections::HashMap;
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
-
-/// FRN 低位掩码（与 `core-monitor` 内部约定一致）。
-const RECNO_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 /// 占位目录「多久之后回查磁盘」。取 2 倍默认 debounce 窗口（400 ms），
 /// 保证窗口内的「创建 + 删除」已经互相抵消完。

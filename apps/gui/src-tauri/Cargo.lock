@@ -817,6 +817,7 @@ dependencies = [
  "core-io",
  "core-monitor",
  "core-scan",
+ "core-usn",
  "core-viz",
  "serde",
  "serde_json",

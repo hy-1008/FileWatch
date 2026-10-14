@@ -14,6 +14,20 @@
 /// 无效父节点（未使用节点用）。
 pub const INVALID_PARENT: u32 = u32::MAX;
 
+/// **FRN → MFT 记录号**的掩码：FRN 的低 48 位是记录号，高 16 位是序列号。
+///
+/// 这条常量原来在三个 crate 里各抄了一份（`core-monitor` 的 debounce、
+/// `core-scan` 的 watcher、CLI），三处注释还都写着「与另一处保持一致」——
+/// 典型的"靠人记住"的约定。它描述的是索引的寻址方式（见文件头的
+/// `nodes[frn & …]`），所以归 `core-index`，谁要用谁取。
+pub const RECNO_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// 从 FRN 取出记录号（数组下标）。
+#[inline]
+pub const fn recno_of(frn: u64) -> u32 {
+    (frn & RECNO_MASK) as u32
+}
+
 // ── flags 位 ────────────────────────────────────────────────────────────────
 pub const NODE_IN_USE: u16 = 0x0001;
 pub const NODE_DIR: u16 = 0x0002;

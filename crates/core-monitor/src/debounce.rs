@@ -20,15 +20,10 @@
 //! * 重命名为 `$R` 前缀 → **转化为删除事件**（Windows 回收站规则）；
 //! * `.tmp` / `~$` 等临时文件模式可过滤。
 
+use core_index::arena::INVALID_PARENT as INVALID_RECNO;
+use core_index::RECNO_MASK as FRN_RECNO_MASK;
 use core_usn::normalize::{self, EventKind};
 use std::collections::HashMap;
-
-/// FRN 的低 48 位就是 MFT 记录号（高 16 位是序列号）。
-const FRN_RECNO_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-
-/// 「无父」哨兵记录号，对应 `core-index::arena::INVALID_PARENT`。
-/// core-monitor 不依赖 core-index（保持分层），所以这里按值重述一次。
-const INVALID_RECNO: u32 = u32::MAX;
 
 /// 从 USN 记录直接转换来的「原始事件」。
 #[derive(Debug, Clone)]

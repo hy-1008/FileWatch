@@ -27,6 +27,8 @@ core-io = { path = "../../../crates/core-io" }
 core-index = { path = "../../../crates/core-index" }
 core-monitor = { path = "../../../crates/core-monitor" }
 core-scan = { path = "../../../crates/core-scan" }
+# 只为测试里构造引擎事件（PendingEvent 带 EventKind 字段）
+core-usn = { path = "../../../crates/core-usn" }
 core-viz = { path = "../../../crates/core-viz" }
 
 [profile.release]

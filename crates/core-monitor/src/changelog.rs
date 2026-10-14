@@ -9,6 +9,7 @@
 
 use crate::debounce::PendingEvent;
 use core_io::jsonlite;
+use core_usn::normalize::EventKind;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -134,10 +135,67 @@ pub fn format_event_csv(ev: &PendingEvent, full_path: &str) -> String {
     )
 }
 
+/// 这条变更的「体积」该怎么说。
+///
+/// 说「说法」而不是「数据」：数字本身在 `PendingEvent` 里都有
+/// （`size_delta` / `new_size`），这里定的是**怎么念给人听**。四条规则各有理由：
+///
+/// * **目录不念体积** —— 目录大小是子孙聚合值，逐条事件里的 `new_size`
+///   对它没有意义，念出来只会误导；
+/// * **删除念成负的原大小** —— 此时 `size_delta` 通常是 0（文件已经没了、回读
+///   不到），唯一能反映"少了多少"的是事件里带上来的 `new_size`；
+/// * **修改念增量**（带 `+`/`-`）—— 用户关心"变了多少"，不是"现在多大"；
+/// * **其余念新大小**。
+///
+/// 放在引擎里而不是各前端各写一遍：CLI 要对齐成列、界面要拼 HTML，但
+/// **「该显示哪个数」必须只有一个答案** —— 否则同一条变更在终端和界面上
+/// 显示的数字不一样，用户没法判断该信哪个。
+pub fn event_size_text(ev: &PendingEvent) -> String {
+    if ev.is_dir {
+        return String::new();
+    }
+    if ev.kind == EventKind::Deleted {
+        let gone = if ev.size_delta < 0 {
+            (-ev.size_delta) as u64
+        } else {
+            ev.new_size
+        };
+        return format!("-{}", core_io::util::human_size(gone));
+    }
+    if ev.size_delta > 0 {
+        format!("+{}", core_io::util::human_size(ev.size_delta as u64))
+    } else if ev.size_delta < 0 {
+        format!("-{}", core_io::util::human_size((-ev.size_delta) as u64))
+    } else {
+        core_io::util::human_size(ev.new_size)
+    }
+}
+
+/// 变更行右侧的补充说明：合并条数、重命名前的旧名。
+///
+/// 与 [`event_size_text`] 同属「说法」，所以也放这里 —— 两个前端各自排版，
+/// 但内容一致。
+pub fn event_suffix(ev: &PendingEvent) -> Option<String> {
+    let mut s = String::new();
+    if ev.merged > 1 {
+        s.push_str(&format!("合并 {} 条", ev.merged));
+    }
+    if let (Some(old), EventKind::Renamed) = (ev.old_name.as_ref(), ev.kind) {
+        if !s.is_empty() {
+            s.push_str("　");
+        }
+        s.push_str(&format!("原名 {old}"));
+    }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_usn::normalize::EventKind;
 
     fn ev(kind: EventKind) -> PendingEvent {
         PendingEvent {
@@ -271,5 +329,61 @@ mod tests {
         log.flush().unwrap();
         assert!(path.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 体积说法四条规则。这些数字会**同时**出现在 CLI 的变更行和界面的
+    /// 流水表里，所以它不该是"各自实现一遍"的东西。
+    #[test]
+    fn size_text_follows_the_four_rules() {
+        // ① 目录不念体积
+        let mut d = ev(EventKind::Created);
+        d.is_dir = true;
+        d.new_size = 12345;
+        assert_eq!(event_size_text(&d), "");
+
+        // ② 删除念负的原大小（此时 size_delta 是 0）
+        let mut del = ev(EventKind::Deleted);
+        del.new_size = 4096;
+        del.size_delta = 0;
+        assert_eq!(event_size_text(&del), "-4.00 KB");
+
+        // 删除时若回读到了负的 delta，就用它（两个来源取得到的那个）
+        let mut del2 = ev(EventKind::Deleted);
+        del2.size_delta = -8192;
+        assert_eq!(event_size_text(&del2), "-8.00 KB");
+
+        // ③ 修改念增量（带符号）
+        let mut grow = ev(EventKind::Modified);
+        grow.size_delta = 2048;
+        assert_eq!(event_size_text(&grow), "+2.00 KB");
+        let mut shrink = ev(EventKind::Modified);
+        shrink.size_delta = -1024;
+        assert_eq!(event_size_text(&shrink), "-1.00 KB");
+
+        // ④ 其余念新大小
+        let mut fresh = ev(EventKind::Created);
+        fresh.size_delta = 0;
+        fresh.new_size = 1024 * 1024;
+        assert_eq!(event_size_text(&fresh), "1.00 MB");
+    }
+
+    #[test]
+    fn suffix_reports_merge_count_and_old_name() {
+        // 默认夹具是 merged=2
+        assert_eq!(event_suffix(&ev(EventKind::Created)), Some("合并 2 条".into()));
+
+        let mut one = ev(EventKind::Created);
+        one.merged = 1;
+        assert_eq!(event_suffix(&one), None);
+
+        let mut ren = ev(EventKind::Renamed);
+        ren.merged = 1;
+        ren.old_name = Some("old.txt".into());
+        assert_eq!(event_suffix(&ren), Some("原名 old.txt".into()));
+
+        // 两者都有时要并列，不能只显示一个
+        ren.merged = 3;
+        let s = event_suffix(&ren).unwrap();
+        assert!(s.contains("合并 3 条") && s.contains("old.txt"), "实际 {s}");
     }
 }
