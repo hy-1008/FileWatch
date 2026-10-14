@@ -59,6 +59,26 @@ filewatch scan  C: --force-traverse   # 强制走降级路径（用于验证）
 filewatch probe C:                # 需要管理员；失败会打印出该怎么办
 ```
 
+### 管理员权限怎么拿（桌面端）
+
+CLI 里由你决定在什么终端里跑；**桌面端是进入软件时问一次**（文档 R2）：
+
+* 清单保持 `asInvoker` —— 不嵌 `requireAdministrator`。那样虽然"一劳永逸"，
+  但每次双击都要过 UAC（包括只想看一眼面积图的时候），而且提权进程与资源管理器
+  不在同一个完整性级别，拖放会静默失效。
+* 没权限就弹窗说明两条路的差别，点「以管理员身份重启」后走 `runas` 重启自己；
+  点「以降级模式继续」照常进界面，状态栏的橙色「权限」按钮随时能重新申请。
+* 判定是**令牌 ∨ `\\.\C:` 能否打开**，不是只看令牌 —— 系统关掉 UAC 时令牌报
+  "未提权"，但卷其实读得到，只看令牌会每次启动都追问一遍。
+* 重启会给新进程塞 `--elevation-attempted`：见到它就不再自动弹窗，
+  防止在"提权无效"的机器上「弹窗 → 重启 → 又弹窗」转圈。
+
+想自查当前是什么状态（不开窗口、直接打 stdout）：
+
+```powershell
+.\apps\gui\src-tauri\target\x86_64-pc-windows-gnu\release\filewatch-gui.exe --check-elevation
+```
+
 ---
 
 ## 3. 命令参考
@@ -213,8 +233,8 @@ FRN 低 48 位，**不用 HashMap** 做定位；文件名进字符串池、节�
 | M2 | 增量事件不丢、不漏、不重 | `monitor`（两条路径） | 降级路径已端到端实测 |
 | M3 | 阈值预警：滞回 / 冷却 / 合并 | `monitor --rule=...` | 规则引擎单测 + 自检覆盖 |
 | M4 | 面积图布局 | `scan --layout=WxH` | 布局算法完成，字符网格预览可用 |
-| M5 | GUI（Tauri 2 + Canvas/WebGL2） | — | **未开始**（按约定「先引擎 + CLI，再套 GUI」） |
-| M6 | 打包分发 | — | 未开始 |
+| M5 | GUI（Tauri 2 + Canvas） | `filewatch-gui.exe` | **已落地**（盘符/扫描/树/面积图/类型/Top-N/详情 + 权限申请） |
+| M6 | 打包分发 | — | 未开始（桌面端的 UAC 提权已提前做掉，见下） |
 
 ### 真实目录实测（不是只在临时小目录里跑）
 
@@ -250,6 +270,11 @@ System32 那 23 个目录的差值是**计数口径**不同，不是漏算：fil
 ```powershell
 cargo test --release      # 单元测试 + 集成测试（e2e 直接跑真实 exe）
 filewatch selftest        # 28 项内置自检，逐项打印「通过/失败/跳过」
+
+# GUI 侧
+cd apps/gui/src-tauri; cargo test --release
+node apps/gui/tools/check-wire.js     # 线格式：按文档偏移对拍（801 条断言）
+node apps/gui/tools/check-admin.js    # 权限弹窗规则真值表 + DOM 接线（41 条断言）
 ```
 
 自检把**失败**和**跳过**分开报：跳过只发生在环境本身不支持时（例如容器里

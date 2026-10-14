@@ -70,6 +70,7 @@
         <div id="empty-hint" class="empty-hint">
           <p>左侧选择盘符或目录开始扫描</p>
           <p class="dim">非管理员会走「目录遍历」降级模式：功能完整，只是慢 1~2 个数量级</p>
+          <p class="dim">点右下角「权限」可以申请管理员权限（直读 MFT，快很多）</p>
         </div>
       </div>
       <div class="canvas-status" id="canvas-status"></div>
@@ -101,7 +102,57 @@
     <span id="st-layout">—</span>
     <span class="spacer"></span>
     <span id="st-paths">—</span>
+    <!-- F0：权限现状 / 随时重新申请。降级模式下是橙色的，提醒"你正在慢速通道" -->
+    <button id="admin-btn" class="mini perm" type="button">权限：—</button>
   </footer>
+
+  <!-- F0 权限申请：进入软件时弹一次（可在窗内勾选"不再自动询问"） -->
+  <div id="admin-modal" class="overlay hidden">
+    <div class="card wide">
+      <h3 id="admin-title">以管理员身份运行？</h3>
+      <p class="lead">
+        两种读取方式<b>功能完全一样</b>，只差速度。选哪一种都不会丢功能，
+        区别只是「秒级」还是「等一会儿」—— 随时可以改主意。
+      </p>
+
+      <div class="compare">
+        <div class="opt good">
+          <div class="opt-h">管理员权限</div>
+          <ul>
+            <li>直读 NTFS 的 <code>$MFT</code>，整卷顺序读出文件清单</li>
+            <li>读 <code>USN Journal</code>，做真正的实时增量监控</li>
+            <li>通常 1~3 秒扫完一块百万文件的盘</li>
+          </ul>
+        </div>
+        <div class="opt">
+          <div class="opt-h">普通权限（降级模式）</div>
+          <ul>
+            <li>逐个目录遍历 + 文件系统变更监听</li>
+            <li>功能不缺，但慢 1~2 个数量级</li>
+            <li>读不到 USN，增量靠轮询，精度差一档</li>
+          </ul>
+        </div>
+      </div>
+
+      <p class="safe">
+        <b>只读声明</b>：本程序只读取目录项与文件元数据，不修改、不删除任何文件；
+        也不会擅自创建 USN Journal（那是系统级变更，需另外明确确认）。
+      </p>
+
+      <div id="admin-facts" class="facts"></div>
+
+      <label class="check">
+        <input id="admin-remember" type="checkbox">
+        <span>下次进入时不再自动询问（仍可在右下角「权限」里随时重新申请）</span>
+      </label>
+
+      <div class="actions">
+        <button id="admin-yes" class="primary" type="button">以管理员身份重启</button>
+        <button id="admin-no" type="button">以降级模式继续</button>
+      </div>
+      <div id="admin-wait" class="dim hidden"></div>
+    </div>
+  </div>
 
   <!-- 扫描进度遮罩 -->
   <div id="scan-overlay" class="overlay hidden">
@@ -116,6 +167,7 @@
 </div>
 
 <script src="wire.js"></script>
+<script src="admin-rule.js"></script>
 <script src="treemap.js"></script>
 <script src="app.js"></script>
 </body>

@@ -209,6 +209,47 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
   color: var(--text-dim); font-size: 11px;
 }
 
+/* 权限按钮：降级时橙色（提醒"你在慢速通道"），已是管理员时绿色 */
+button.perm { flex: 0 0 auto; padding: 1px 8px; font-size: 11px; color: var(--text-dim); }
+button.perm.warn { color: var(--warn); border-color: var(--warn); background: transparent; }
+button.perm.warn:hover { background: rgba(242,153,74,.12); }
+button.perm.ok { color: var(--ok); border-color: var(--ok); background: transparent; }
+button.perm.ok:hover { background: rgba(87,201,138,.12); }
+
+/* ── 权限弹窗 ──────────────────────────────────────────────────────── */
+
+.overlay .card.wide { width: 640px; max-width: calc(100vw - 40px); }
+.overlay p { margin: 0 0 10px; }
+.lead { color: var(--text-dim); }
+
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0; }
+.opt {
+  background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px;
+}
+.opt.good { border-color: var(--ok); }
+.opt-h { font-weight: 600; }
+.opt ul { margin: 6px 0 0; padding-left: 18px; }
+.opt li { color: var(--text-dim); margin: 3px 0; }
+.opt code {
+  background: #0e1013; color: #9dc4ff;
+  padding: 0 4px; border-radius: 3px;
+}
+
+.safe {
+  color: var(--text-dim); border-left: 2px solid var(--accent-dim);
+  padding-left: 8px; margin: 4px 0 12px;
+}
+.safe b { color: var(--text); }
+
+.facts { border-top: 1px solid var(--border); padding-top: 8px; }
+.kv { display: grid; grid-template-columns: 92px 1fr; gap: 8px; margin: 3px 0; }
+.kv > span:first-child { color: var(--text-dim); }
+.kv > span:last-child { word-break: break-all; }
+
+.actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+#admin-wait { margin-top: 8px; text-align: right; }
+
 /* ── 遮罩 / 提示 ────────────────────────────────────────────────────── */
 
 .overlay {

@@ -6,18 +6,24 @@
 ```
 apps/gui/
 ├─ src-tauri/          Rust 侧（Tauri 应用）
-│  ├─ src/main.rs      入口 + 命令注册
-│  ├─ src/commands.rs  前端能调的命令（对应文档 F1~F12）
+│  ├─ src/main.rs      入口 + 命令注册 + `--check-elevation` 诊断
+│  ├─ src/commands.rs  前端能调的命令（对应文档 F1~F12，另有 F0 权限）
 │  ├─ src/state.rs     扫描结果的共享状态
 │  ├─ src/wire.rs      Rust → 前端的二进制布局协议（含对拍测试）
+│  ├─ src/elevate.rs   管理员权限：检测 + runas 重启（手写 FFI）
+│  ├─ src/prefs.rs     GUI 偏好落盘（%APPDATA%\FileWatch\gui-prefs.json）
 │  └─ icons/icon.ico   必需（见下）
 ├─ src/                前端（纯静态，无打包器、无 npm）
 │  ├─ index.html
 │  ├─ style.css
 │  ├─ wire.js          二进制协议的解码端
+│  ├─ admin-rule.js    权限弹窗的触发规则（纯函数，可单独跑真值表）
 │  ├─ treemap.js       Canvas 渲染 + 命中测试 + 交互
 │  └─ app.js           状态与各面板
-└─ tools/make-icon.py  生成 icons/icon.ico
+└─ tools/
+   ├─ make-icon.py     生成 icons/icon.ico
+   ├─ check-wire.js    线格式校验（按文档偏移造字节流 ←→ wire.js 解码）
+   └─ check-admin.js   权限触发规则真值表 + 与 Rust 侧字段对账
 ```
 
 ## 构建与运行
@@ -46,16 +52,64 @@ cargo 的配置是**从当前目录逐级向上**读取的，`src-tauri` 会继�
 ### 自检
 
 ```bash
-# Rust 侧：引擎 → 布局 → 二进制 的端到端，以及参数映射
+# Rust 侧：引擎 → 布局 → 二进制 的端到端，以及参数映射、权限检测、偏好落盘
 cd apps/gui/src-tauri && cargo test --release
 
 # 前端侧：解码端与线格式文档是否一致（801 条断言）
 node apps/gui/tools/check-wire.js
+
+# 前端侧：权限弹窗的触发规则真值表（20 条断言）
+node apps/gui/tools/check-admin.js
+
+# 权限现状（不进界面、不开窗口，直接打 stdout）—— 排查 UAC 问题用
+./target/x86_64-pc-windows-gnu/release/filewatch-gui.exe --check-elevation
 ```
 
 界面点击没法自动化，所以「Rust 编码 / JS 解码」这条跨语言契约单独用
 `check-wire.js` 钉住：它按**文档里的偏移**手工造字节流，再用 `wire.js` 解回来
 逐字段对拍。加上 `wire.rs` 自己的往返测试，两侧都各自钉在同一份文档上。
+
+`check-admin.js` 是同一思路用在权限弹窗上：那条触发规则只有三条分支，但其中
+两条（"本次启动已尝试过提权"、"令牌未提权却仍算有权限"）**只在关了 UAC 的机器上
+才走得到** —— 在这台开发机上永远点不出来。所以它把 3×2 的组合全跑一遍，
+并顺带从 `commands.rs` 里抠出 `ElevationInfo` 的字段名做对账。
+
+## 管理员权限（F0：进入软件时申请）
+
+文档 R2 的原方案是嵌 `requireAdministrator` 清单自动提权。那个方案的问题不是
+"做不到"，而是**代价**：每次双击都要过一遍 UAC（包括只想看一眼面积图的时候），
+而且提权进程与资源管理器不在同一个完整性级别，拖放交互会静默失效。
+
+这里改成**进入软件时问一次**：
+
+| 情形 | 行为 |
+|---|---|
+| 已有管理员权限 | 直接进界面，状态栏显示绿色「权限：管理员」 |
+| 在管理员组、被 UAC 过滤 | 弹窗 → 点「以管理员身份重启」→ Windows 弹确认框，**点「是」即可，不用输密码** |
+| 不在管理员组 | 弹窗，但文案说明需要输入管理员账户的密码 |
+| 用户点「以降级模式继续」 | 照常进界面，橙色「权限：降级模式」；点它可随时重新申请 |
+
+实现要点（都在 `src-tauri/src/elevate.rs`）：清单保持 `asInvoker`，用户同意后用
+`ShellExecuteW(verb="runas")` 重启自己；`ShellExecuteW` 会阻塞到用户在 UAC 框上
+做出选择，所以整个动作放在**独立线程**里跑，结果用 `admin:relaunch` 事件回传，
+界面在此期间不冻结。
+
+三个容易写错、已经钉住的地方：
+
+1. **不能只看令牌。** 系统关掉 UAC 时 `TokenElevationType` 是 `Default`、
+   `TokenIsElevated` 为 0，但进程其实拿着完整令牌、卷照样打得开。所以判据是
+   **令牌 ∨ `\\.\C:` 能不能打开**。只信令牌会在这类机器上每次启动都追问一遍。
+2. **必须防死循环。** 重启时给新进程塞 `--elevation-attempted`；新进程见到它就
+   不再自动弹窗（只提示一次"提权未生效"）。否则在"提权无效"的机器上会
+   「弹窗 → 重启 → 又弹窗」转圈。
+3. **命令行参数要正确加引号。** `--root=C:\Program Files\x` 直接拼会被拆成两个
+   参数，新进程拿到错路径 —— 而且错得很安静。`elevate::quote_arg` 按
+   `CommandLineToArgvW` 的规则处理（含"结尾连续反斜杠要翻倍"这条），单测覆盖。
+
+「不再自动询问」落在 `%APPDATA%\FileWatch\gui-prefs.json`。读取一律容错
+（文件缺失/截断/被手改成非法 JSON 都退回默认值）—— 一个偏好文件不该有能力让
+程序起不来。**"不再自动问"不等于"没地方问"**：状态栏的按钮任何时候都能把窗调
+回来，所以用户不会被自己的选择锁死。
 
 ### 依赖从哪来（本机的网络情况）
 
@@ -161,7 +215,7 @@ Rust → 前端**不走 JSON**（文档 §5.6）：200 万节点的 JSON 会卡�
 | F7 | 阈值预警面板 | ⬜ 引擎已具备，界面未接 |
 | F8 | 变更流水表 + 导出 CSV | ⬜ 引擎已具备，界面未接 |
 | F9 | 非 NTFS 降级 | ✅ 自动（`supports_mft` + 无管理员都走遍历，界面明确标注） |
-| — | UAC 提权清单（文档 R2） | ⬜ 未做：现在非管理员会安静地降级 |
+| F0 | 管理员权限申请（文档 R2） | ✅ 进入软件时弹窗申请 + `runas` 重启；可勾「不再自动询问」，状态栏随时重新申请 |
 
 **F2 的「流式渐进渲染」**目前只做到「进度条 + 实时计数，不白屏」，面积图是在扫描
 结束后一次画出的。真正的「扫到多少画多少」需要引擎在扫描过程中暴露部分树快照，

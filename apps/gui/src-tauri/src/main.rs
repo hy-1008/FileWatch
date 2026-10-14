@@ -29,6 +29,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod elevate;
+mod prefs;
 mod state;
 mod wire;
 
@@ -36,6 +38,14 @@ use state::AppState;
 use std::sync::Mutex;
 
 fn main() {
+    // 诊断入口：不开窗口、不进 GUI，直接把权限现状打到 stdout。
+    // 存在的理由见 `commands::elevation_report` —— 权限检测这段没法用点击
+    // 覆盖，必须留一个能在命令行里断言的口子。
+    if std::env::args().any(|a| a == "--check-elevation") {
+        commands::print_elevation_report();
+        return;
+    }
+
     tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
         .invoke_handler(tauri::generate_handler![
@@ -56,6 +66,11 @@ fn main() {
             // 详情与定位
             commands::node_detail,
             commands::find_by_path,
+            // 管理员权限（F0：进入软件时申请）
+            commands::elevation_info,
+            commands::relaunch_elevated,
+            commands::gui_prefs,
+            commands::set_gui_prefs,
         ])
         .run(tauri::generate_context!())
         .expect("FileWatch GUI 启动失败");

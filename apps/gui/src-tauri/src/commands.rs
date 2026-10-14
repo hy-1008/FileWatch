@@ -604,6 +604,219 @@ pub fn find_by_path(state: State<'_, Shared>, path: String) -> Result<Option<u32
     Ok(l.session.find_node_by_path(&path))
 }
 
+// ── F0 管理员权限（进入软件时申请）─────────────────────────────────────────
+//
+// 文档 R2 的对策原来是「嵌 UAC 清单自动提权」，代价是每次启动都过一遍 UAC。
+// 这里改成进软件时问一次：清单保持 `asInvoker`，用户同意后用 `runas` 重启自己。
+// 细节与防死循环的措施见 [`crate::elevate`]。
+
+/// 权限现状。前端拿它决定**要不要弹权限窗**，以及窗里的文案。
+#[derive(Debug, Clone, Serialize)]
+pub struct ElevationInfo {
+    /// 已经能走 MFT 直读 —— 唯一决定"弹不弹"的字段。
+    pub privileged: bool,
+    /// 令牌本身是提权的（`TokenIsElevated`）
+    pub token_elevated: bool,
+    /// `\\.\C:` 真的能打开。与上一项**可能不一致**：系统关掉 UAC 时令牌报
+    /// 未提权，而卷其实读得到。所以两个都摆出来，别只看一个。
+    pub volume_readable: bool,
+    /// 值不值得去申请（不在管理员组时仍然给机会：`runas` 会转而要密码）
+    pub can_request: bool,
+    /// `"admin"` / `"filtered"` / `"standard"` / `"unknown"` —— 给界面挂样式用
+    pub kind: String,
+    /// 短标签（状态栏徽章）
+    pub label: String,
+    /// 一句话说明**现在**是什么状态
+    pub hint: String,
+    /// 点「以管理员身份重启」之后会发生什么（不同账户类型文案不同）
+    pub action_hint: String,
+    /// `域名\用户名`
+    pub account: String,
+    pub exe: String,
+    /// 重启时实际会传给新进程的完整命令行 —— 摆出来给用户看，证明不加私货
+    pub command_line: String,
+    /// 本次启动已经尝试过提权（是则**不再自动弹窗**，见 `elevate` 的防死循环）
+    pub attempted: bool,
+}
+
+#[tauri::command]
+pub fn elevation_info() -> ElevationInfo {
+    build_elevation_info()
+}
+
+/// 抽成普通函数，方便单测（`#[tauri::command]` 的包装函数没法直接调）。
+fn build_elevation_info() -> ElevationInfo {
+    use crate::elevate::{status, ElevationKind};
+
+    let s = status();
+    let (kind, label, hint, action_hint) = match s.kind {
+        ElevationKind::Admin => (
+            "admin",
+            "管理员",
+            "已具备管理员权限：MFT 直读与 USN 增量监控都可用。".to_string(),
+            String::new(),
+        ),
+        ElevationKind::Filtered => (
+            "filtered",
+            "降级模式",
+            "当前是普通权限：账户在管理员组里，但被 UAC 过滤掉了，读不了卷设备。".to_string(),
+            "重启时 Windows 会弹一个权限确认框，点「是」就行 —— 不需要输入密码。".to_string(),
+        ),
+        ElevationKind::Standard => (
+            "standard",
+            "降级模式",
+            "当前是普通权限：这个账户不在管理员组里。".to_string(),
+            "重启时 Windows 会要求输入一个管理员账户的密码（UAC 的凭据提示）。".to_string(),
+        ),
+        ElevationKind::Unknown => (
+            "unknown",
+            "未知",
+            "没能读到权限令牌信息，无法判断当前权限。".to_string(),
+            "可以试一次；失败的话当前窗口会保持原样，不会有副作用。".to_string(),
+        ),
+    };
+
+    // 令牌说未提权、但卷真的打得开（典型是系统关了 UAC）→ 按有权限处理，
+    // 否则会出现「明明是管理员却一直让你提权」的荒谬提示。
+    let mut hint = hint;
+    if !s.token_elevated && s.volume_readable {
+        hint = format!("{hint}（实测卷设备可以直接打开，按有权限处理）");
+    }
+
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // 展示的命令行 = 现在的程序 + 重启时会带的参数（含防死循环标记）
+    let mut args = crate::elevate::original_args();
+    args.push(crate::elevate::ATTEMPTED_FLAG.to_string());
+    let command_line = if exe.is_empty() {
+        crate::elevate::build_command_line(&args)
+    } else {
+        format!("{} {}", crate::elevate::quote_arg(&exe), crate::elevate::build_command_line(&args))
+    };
+
+    let account = match std::env::var("USERDOMAIN") {
+        Ok(d) if !d.is_empty() => match std::env::var("USERNAME") {
+            Ok(u) => format!("{d}\\{u}"),
+            Err(_) => d,
+        },
+        _ => std::env::var("USERNAME").unwrap_or_else(|_| "（未知账户）".to_string()),
+    };
+
+    ElevationInfo {
+        privileged: s.privileged(),
+        token_elevated: s.token_elevated,
+        volume_readable: s.volume_readable,
+        can_request: s.can_request(),
+        kind: kind.to_string(),
+        label: label.to_string(),
+        hint,
+        action_hint,
+        account,
+        exe,
+        command_line,
+        attempted: s.attempted,
+    }
+}
+
+/// 用 `runas` 动词重启自己（此时才弹 UAC）。
+///
+/// **立刻返回**，真实结果通过 `admin:relaunch` 事件回传。原因是
+/// `ShellExecuteW("runas")` 会一直阻塞到用户在 UAC 框上做出选择 ——
+/// 直接在这个命令里等，界面线程会被冻住好几秒（用户会以为程序卡死了）。
+/// 所以这里只做三件快事：判能不能申请、判有没有在扫描、开线程。
+#[tauri::command]
+pub fn relaunch_elevated(app: AppHandle, state: State<'_, Shared>) -> Result<(), String> {
+    if build_elevation_info().privileged {
+        return Err("当前已经是管理员权限，不用重启".into());
+    }
+    {
+        // 重启会把扫描一起丢掉，所以正在扫的时候不接这个请求。
+        // 这不是"功能限制"，只是避免用户把一次几分钟的扫描误杀掉。
+        let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+        if st.scanning {
+            return Err("正在扫描，等它结束后再切换权限（重启会中断扫描）".into());
+        }
+    }
+
+    std::thread::spawn(move || {
+        let outcome = crate::elevate::relaunch_elevated();
+        let _ = app.emit("admin:relaunch", outcome.clone());
+        if outcome.started {
+            // 留一点时间让前端把「正在重启」画出来，然后退出本进程：
+            // 两个窗口并存只会让人困惑（旧的是降级实例，新的是管理员实例）。
+            std::thread::sleep(Duration::from_millis(400));
+            std::process::exit(0);
+        }
+    });
+    Ok(())
+}
+
+/// 读偏好。文件损坏/缺失一律退回默认值（见 [`crate::prefs`]）。
+#[tauri::command]
+pub fn gui_prefs() -> crate::prefs::GuiPrefs {
+    crate::prefs::load()
+}
+
+/// 写偏好。
+///
+/// 参数名不叫 `prefs`：那会和 `crate::prefs` 模块同名，`prefs::save` 就没法写了。
+#[tauri::command]
+pub fn set_gui_prefs(value: crate::prefs::GuiPrefs) -> Result<crate::prefs::GuiPrefs, String> {
+    crate::prefs::save(&value)?;
+    Ok(value)
+}
+
+/// 权限现状的纯文本报告（`filewatch-gui.exe --check-elevation`）。
+///
+/// 存在的理由有两个，都不是"顺手加个调试开关"：
+///
+/// 1. **这一段在正常使用中无法自动验证。** 界面点击没法自动化，而权限检测
+///    整条链（手写 FFI → 令牌类型 → 是否可读卷 → 判定）恰恰是最容易静默写错的
+///    部分：判错了不会崩，只会让用户一直看到错的那句说明。有了它，就能在
+///    命令行里对着真实机器断言；
+/// 2. 用户报"为什么一直提示我没有管理员权限"时，让它跑一下比来回问快得多。
+///
+/// 输出走 `write_all` 而不是 `println!`：这个程序是 `windows_subsystem="windows"`
+/// 的，双击启动时没有 stdout，`println!` 会 panic —— 一个诊断命令不该以
+/// 崩溃收场。
+pub fn elevation_report() -> String {
+    let i = build_elevation_info();
+    let p = crate::prefs::load();
+    let yes = |b: bool| if b { "是" } else { "否" };
+    let mut s = String::new();
+    s.push_str("FileWatch 权限检测\n");
+    s.push_str(&format!("  账户            : {}\n", i.account));
+    s.push_str(&format!("  令牌已提权      : {}\n", yes(i.token_elevated)));
+    s.push_str(&format!("  卷设备可直读    : {}\n", yes(i.volume_readable)));
+    s.push_str(&format!("  判定            : {}（{}）\n", i.label, i.kind));
+    s.push_str(&format!("  可以去申请提权  : {}\n", yes(i.can_request)));
+    s.push_str(&format!("  本次启动带标记  : {}\n", yes(i.attempted)));
+    s.push_str(&format!("  状态说明        : {}\n", i.hint));
+    if !i.action_hint.is_empty() {
+        s.push_str(&format!("  点「重启」后    : {}\n", i.action_hint));
+    }
+    s.push_str(&format!("  将要执行的命令  : {}\n", i.command_line));
+    s.push_str(&format!(
+        "  偏好文件        : {}\n",
+        crate::prefs::prefs_path().display()
+    ));
+    s.push_str(&format!(
+        "  当前偏好        : 进入软件时自动询问 = {}\n",
+        yes(p.ask_admin_on_start)
+    ));
+    s
+}
+
+/// 把 [`elevation_report`] 打到 stdout。返回给 [`crate::main`] 用。
+pub fn print_elevation_report() {
+    use std::io::Write;
+    let text = elevation_report();
+    let _ = std::io::stdout().write_all(text.as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -790,5 +1003,121 @@ mod tests {
         assert_eq!(chain.len(), 3, "root → sub → deep");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 权限信息的自洽性。
+    ///
+    /// 弹不弹权限窗**只看 `privileged`**，而这个字段是两个判据的并集
+    /// （令牌 + 卷能不能打开）。判据一多就容易自相矛盾 —— 比如
+    /// 「已提权」却还标着「可以申请」，界面就会一边显示管理员一边弹窗追问。
+    /// 这些互相咬合的约束全部钉在这里。
+    #[test]
+    fn elevation_info_is_self_consistent() {
+        let i = build_elevation_info();
+
+        assert!(
+            ["admin", "filtered", "standard", "unknown"].contains(&i.kind.as_str()),
+            "kind 只允许这四个取值，实际 {}",
+            i.kind
+        );
+        assert!(!i.hint.is_empty(), "hint 是给用户看的说明，不能为空");
+        assert!(!i.account.is_empty(), "账户名不能为空");
+        assert!(
+            i.exe.ends_with("filewatch-gui.exe") || i.exe.to_lowercase().ends_with(".exe"),
+            "exe 应当是当前程序，实际 {}",
+            i.exe
+        );
+        // 展示的完整命令行必须带上防死循环标记，否则用户看到一个"没有私货"
+        // 的命令行会以为我们藏着参数
+        assert!(
+            i.command_line.contains(crate::elevate::ATTEMPTED_FLAG),
+            "命令行应含 {}：{}",
+            crate::elevate::ATTEMPTED_FLAG,
+            i.command_line
+        );
+        assert!(
+            i.command_line.contains("--elevation-attempted")
+                && !i.command_line.contains("--elevation-attempted --elevation-attempted"),
+            "标记只该出现一次：{}",
+            i.command_line
+        );
+
+        if i.privileged {
+            assert!(!i.can_request, "已经有权限就不该再让人申请");
+            assert_eq!(i.kind, "admin", "有权限时 kind 必须是 admin，实际 {}", i.kind);
+            assert!(i.action_hint.is_empty(), "有权限时不该有『点了会怎样』的说明");
+        } else {
+            assert_eq!(i.label, "降级模式");
+            assert!(
+                i.kind == "filtered" || i.kind == "standard",
+                "没权限时只该是 filtered/standard，实际 {}",
+                i.kind
+            );
+            assert!(
+                !i.action_hint.is_empty(),
+                "没权限时要说清楚点『重启』会发生什么"
+            );
+        }
+
+        // 跑测试时命令行不带标记
+        assert!(!i.attempted, "cargo test 不该带 {}", crate::elevate::ATTEMPTED_FLAG);
+    }
+
+    /// 本机实测：账户在管理员组但被 UAC 过滤 → 必须判成 `filtered`，
+    /// 也即「能弹窗申请、不用输密码」。这条断言把机器的实际情况钉住，
+    /// 万一哪天变成了 `standard`，弹窗文案会立刻露馅 —— 而那种错
+    /// 只有用户看得见，测试是唯一的拦网。
+    #[test]
+    fn this_machine_can_request_elevation() {
+        let i = build_elevation_info();
+        assert_eq!(
+            i.kind, "filtered",
+            "本机账户在 Administrators 组（whoami /groups 显示『只用于拒绝的组』），\
+             应判成 filtered；实际 {}，hint={}",
+            i.kind, i.hint
+        );
+        assert!(!i.privileged, "非提权时不该报成有权限");
+        assert!(i.can_request, "filtered 必须可以去申请");
+    }
+
+    /// `--check-elevation` 的输出必须**能被脚本断言**，也必须和界面用的
+    /// 那一份数据是同一个来源。少印一行、或者判定与 `elevation_info` 不一致，
+    /// 都会让这个诊断口子变成误导。
+    #[test]
+    fn elevation_report_matches_info() {
+        let text = elevation_report();
+        let i = build_elevation_info();
+
+        // 每一行该有的都得在 —— 报告的价值全在"齐全且是真值"
+        for key in [
+            "账户",
+            "令牌已提权",
+            "卷设备可直读",
+            "判定",
+            "可以去申请提权",
+            "本次启动带标记",
+            "将要执行的命令",
+            "偏好文件",
+        ] {
+            assert!(text.contains(key), "报告缺少「{key}」这一行：\n{text}");
+        }
+
+        // 判定必须与接口返回的一致（不能各算各的）
+        assert!(
+            text.contains(&format!("{}（{}）", i.label, i.kind)),
+            "报告里的判定与 elevation_info 不一致：{}\n{}",
+            i.kind,
+            text
+        );
+        assert!(
+            text.contains(&i.account),
+            "报告应含账户名 {}：\n{}",
+            i.account,
+            text
+        );
+
+        // 不能有未替换的占位符或者 "None"
+        assert!(!text.contains("None"), "报告里漏出了 None：\n{text}");
+        assert!(!text.contains("{}"), "报告里有没填上的格式占位符：\n{text}");
     }
 }

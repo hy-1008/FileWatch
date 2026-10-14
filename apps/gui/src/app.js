@@ -408,6 +408,149 @@ function renderDetail(info) {
     `</table>`;
 }
 
+/* ── F0 管理员权限（进入软件时申请）─────────────────────────────────────
+ *
+ * 清单保持 `asInvoker`（不靠 manifest 自动提权），所以"要不要管理员"这件事
+ * 由这里在启动时问一次。三条规则：
+ *
+ *   1. 只在**真的没权限**时问。`privileged` 是后端算好的并集判据
+ *      （令牌 + 卷设备能否打开），不要在界面上自己拼 —— UAC 被关掉的机器上
+ *      令牌会说"未提权"，而卷其实是能读的。
+ *   2. 带 `attempted` 时**不问**。那是"本次启动已经尝试过提权"的标记，
+ *      防止在提权无效的机器上"重启→又弹→再重启"地转圈（见后端的 elevate 模块）。
+ *   3. 用户勾了"不再自动询问"就落盘记住；但右下角的按钮永远能把窗调回来，
+ *      所以这个选择是可逆的 —— 不会被自己的偏好锁死。
+ */
+
+let adminInfo = null;
+
+/** 取权限现状并刷新状态栏按钮。 */
+async function loadElevation() {
+  adminInfo = await call('elevation_info');
+  renderPermButton();
+  return adminInfo;
+}
+
+function renderPermButton() {
+  const b = document.getElementById('admin-btn');
+  b.textContent = fwAdminButtonText(adminInfo);
+  b.className = fwAdminButtonClass(adminInfo);
+  if (!adminInfo) return;
+  b.title = adminInfo.privileged
+    ? `${adminInfo.hint}\n账户：${adminInfo.account}`
+    : `${adminInfo.hint}\n点这里申请管理员权限`;
+}
+
+async function loadPrefs() {
+  try {
+    return await invoke('gui_prefs');
+  } catch (e) {
+    // 偏好文件的读取在后端是容错的；这里再兜一层，免得一条读不到偏好
+    // 就让整个界面初始化失败
+    return { ask_admin_on_start: true };
+  }
+}
+
+async function savePrefs(next) {
+  try {
+    await invoke('set_gui_prefs', { value: next });
+  } catch (e) {
+    toast('偏好没能保存：' + (typeof e === 'string' ? e : (e && e.message) || e), true);
+  }
+}
+
+function adminFacts(info) {
+  const row = (k, v) => `<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`;
+  return (
+    row('账户', info.account) +
+    row('当前状态', info.hint) +
+    (info.action_hint ? row('点「重启」后', info.action_hint) : '') +
+    row('将要执行的命令', info.command_line)
+  );
+}
+
+/** 打开权限窗。`auto` 为真表示这是"进入软件时自动弹的"那一次。 */
+async function openAdminModal(auto) {
+  adminInfo = await call('elevation_info');
+  if (adminInfo.privileged) {
+    if (!auto) toast('当前已经是管理员权限：' + adminInfo.hint);
+    renderPermButton();
+    return;
+  }
+  const prefs = await loadPrefs();
+  document.getElementById('admin-title').textContent =
+    adminInfo.can_request ? '以管理员身份运行？' : '可以试着申请管理员权限';
+  document.getElementById('admin-facts').innerHTML = adminFacts(adminInfo);
+  document.getElementById('admin-remember').checked = !prefs.ask_admin_on_start;
+  document.getElementById('admin-yes').disabled = false;
+  const wait = document.getElementById('admin-wait');
+  wait.classList.add('hidden');
+  wait.textContent = '';
+  document.getElementById('admin-modal').classList.remove('hidden');
+}
+
+function closeAdminModal() {
+  document.getElementById('admin-modal').classList.add('hidden');
+}
+
+/** 弹窗里的两个按钮都先把"不再询问"落盘 —— 用户既然做了选择，就该被记住。 */
+async function adminRemembered() {
+  const remember = document.getElementById('admin-remember').checked;
+  await savePrefs({ ask_admin_on_start: !remember });
+}
+
+function wireAdminModal() {
+  document.getElementById('admin-btn').onclick = () => {
+    openAdminModal(false).catch(() => {});
+  };
+
+  // 「以管理员身份重启」：后端立刻返回，真正的结果走 admin:relaunch 事件 ——
+  // UAC 确认框会阻塞好几秒，等在这里会把界面冻住
+  document.getElementById('admin-yes').onclick = async () => {
+    await adminRemembered();
+    document.getElementById('admin-yes').disabled = true;
+    const wait = document.getElementById('admin-wait');
+    wait.textContent = '正在等待 Windows 的权限确认…';
+    wait.classList.remove('hidden');
+    try {
+      await call('relaunch_elevated');
+    } catch (e) {
+      // 命令本身被拒（比如正在扫描）：恢复按钮，让用户能换个时机再试
+      document.getElementById('admin-yes').disabled = false;
+      wait.classList.add('hidden');
+    }
+  };
+
+  document.getElementById('admin-no').onclick = async () => {
+    await adminRemembered();
+    closeAdminModal();
+    // 说清楚"降级"意味着什么，避免用户以为功能被砍了
+    if (!adminInfo.privileged) {
+      toast('已按降级模式运行：功能不缺，扫描会慢一些');
+    }
+  };
+}
+
+/** 后端的提权结果。 */
+function onRelaunchOutcome(r) {
+  if (r.started) {
+    const wait = document.getElementById('admin-wait');
+    wait.textContent = '已启动管理员实例，本窗口即将关闭…';
+    wait.classList.remove('hidden');
+    return;
+  }
+  document.getElementById('admin-yes').disabled = false;
+  document.getElementById('admin-wait').classList.add('hidden');
+  toast(r.reason || '提权重启失败', true);
+  // 顺手把真实状态刷一遍：万一刚才其实已经是管理员（比如 UAC 被关掉又开着），
+  // 按钮的颜色要跟着变，不能一直挂着"降级模式"
+  loadElevation()
+    .then(() => {
+      if (adminInfo.privileged) closeAdminModal();
+    })
+    .catch(() => {});
+}
+
 /* ── 启动 ──────────────────────────────────────────────────────────────── */
 
 async function boot() {
@@ -432,6 +575,8 @@ async function boot() {
   });
 
   await loadVolumes();
+  await loadElevation();
+  wireAdminModal();
 
   document.getElementById('refresh-vols').onclick = loadVolumes;
   document.getElementById('scan-root').onclick = () => {
@@ -463,6 +608,18 @@ async function boot() {
   await listen('scan:progress', (ev) => progressUI(ev.payload));
   await listen('scan:done', (ev) => afterScan(ev.payload, null));
   await listen('scan:error', (ev) => afterScan(null, String(ev.payload)));
+  await listen('admin:relaunch', (ev) => onRelaunchOutcome(ev.payload || {}));
+
+  // 进入软件时申请一次管理员权限。
+  // 判断本身在 admin-rule.js 里（那是个能被 tools/check-admin.js 跑真值表的
+  // 纯函数）—— 这里只做分派，别再往 if 里加条件。
+  const prefs = await loadPrefs();
+  const action = fwAdminBootAction(adminInfo, prefs);
+  if (action === 'ask') {
+    await openAdminModal(true);
+  } else if (action === 'notify-failed') {
+    toast('提权未生效，已按降级模式启动（可点右下角「权限」再试一次）');
+  }
 }
 
 boot().catch((e) => toast('界面初始化失败：' + (e && e.message ? e.message : e), true));
