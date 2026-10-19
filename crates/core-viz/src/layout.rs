@@ -618,6 +618,81 @@ mod tests {
         }
     }
 
+    /// **按类型着色必须真的分出颜色来。**
+    ///
+    /// 上面那条只检查「槽位在范围内」——上限永远满足，所以它对
+    /// 「所有文件都落进同一个槽位」完全无感。而那个 bug 真的发生过：
+    /// `ExtensionTable::id_of_node` 拿整个文件名去查以扩展名为键的表，
+    /// 每个文件都拿到 `u32::MAX`，整张面积图一个颜色。
+    ///
+    /// 因此这里断言的是「**不同扩展名的文件拿到不同槽位**」，不是范围。
+    #[test]
+    fn by_extension_actually_splits_colors() {
+        let (t, ci, e) = setup();
+        let opts = LayoutOptions {
+            policy: LodPolicy { min_side: 10.0, ..Default::default() },
+            shading: ShadingMode::ByExtension,
+            ..Default::default()
+        };
+        let r = compute_layout(&t, &ci, &e, 5, viewport(), &opts);
+
+        // 样本树里有 .bin / .log / .txt 三种扩展名
+        let slots: Vec<u8> = [11u32, 12, 21, 30]
+            .iter()
+            .filter_map(|n| r.find(*n))
+            .map(|it| it.shade_slot)
+            .collect();
+        assert_eq!(slots.len(), 4, "四个文件都该出现在布局里");
+        let mut uniq = slots.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert!(
+            uniq.len() >= 2,
+            "三种扩展名至少该分到两个色槽，实际 {slots:?}（0 个或 1 个色槽 = 整片同色）"
+        );
+        assert!(
+            !slots.iter().all(|s| *s == (SHADE_SLOTS - 1) as u8),
+            "全部落进「其他」桶 = 按名字查扩展名失败：{slots:?}"
+        );
+    }
+
+    /// 无扩展名的文件有自己的槽位，**不该**和「其他」桶混在一起。
+    #[test]
+    fn extensionless_files_are_not_the_other_bucket() {
+        let mut t = Tree::new("C:", 8);
+        t.arena.ensure(4);
+        let set = |t: &mut Tree, idx: u32, name: &str, dir: bool, size: u64| {
+            let off = t.names.intern_str(name);
+            t.arena.nodes[idx as usize] = Node {
+                parent: 0,
+                seq: 1,
+                flags: NODE_IN_USE | if dir { NODE_DIR } else { 0 },
+                size,
+                alloc: size,
+                mtime: 1_700_000_000,
+                name: off,
+            };
+        };
+        set(&mut t, 0, ".", true, 0);
+        set(&mut t, 1, "Makefile", false, 1_000_000);
+        aggregate(&mut t);
+        let ci = ChildIndex::build(&t);
+        let e = ExtensionTable::build(&t);
+        let opts = LayoutOptions {
+            policy: LodPolicy { min_side: 10.0, ..Default::default() },
+            shading: ShadingMode::ByExtension,
+            ..Default::default()
+        };
+        let r = compute_layout(&t, &ci, &e, 0, viewport(), &opts);
+        let it = r.find(1).expect("Makefile 应有方块");
+        assert_eq!(
+            it.ext_id,
+            e.id_of_ext("").expect("无扩展名应有独立的分组"),
+            "无扩展名要归到空扩展名那一组，而不是「其他」"
+        );
+        assert_ne!(it.shade_slot as usize, SHADE_SLOTS - 1);
+    }
+
     #[test]
     fn by_age_reflects_timestamps() {
         let (mut t, _, _) = setup();

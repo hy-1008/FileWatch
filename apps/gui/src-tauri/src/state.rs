@@ -171,6 +171,11 @@ pub struct AppState {
     /// 是否有扫描线程在跑（用来拒绝并发扫描）
     pub scanning: bool,
     pub last: Option<ScanSummary>,
+    /// 最近一次扫描的盘符（"用户当前在看哪块盘"）。
+    ///
+    /// 后台周期任务靠它决定该刷谁：扫**别的**盘会把进程里唯一的扫描结果换掉，
+    /// 等于偷偷把用户正在看的视图换掉（见 [`crate::scheduler`]）。
+    pub last_drive: Option<String>,
 }
 
 impl AppState {

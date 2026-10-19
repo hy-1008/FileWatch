@@ -48,6 +48,20 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+// WinError.h: directory notification details are no longer trustworthy.
+const ERROR_NOTIFY_ENUM_DIR: u64 = 1022;
+
+fn completion_error(bytes: u32, stopping: bool) -> u64 {
+    if bytes == 0 && !stopping { ERROR_NOTIFY_ENUM_DIR } else { 0 }
+}
+
+#[test]
+fn zero_byte_completion_requires_rescan_unless_stopping() {
+    assert_eq!(completion_error(0, false), ERROR_NOTIFY_ENUM_DIR);
+    assert_eq!(completion_error(0, true), 0);
+    assert_eq!(completion_error(64, false), 0);
+}
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -261,6 +275,15 @@ impl DirWatcher {
                                 err as u64
                             };
                         thread_exit.store(code, Ordering::Relaxed);
+                        break;
+                    }
+                    // Microsoft documents a successful zero-byte completion as a
+                    // lost notification buffer. Require a rescan, never silently
+                    // keep using the now-stale index.
+                    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw
+                    let lost = completion_error(ret, thread_stopping.load(Ordering::Acquire));
+                    if lost != 0 {
+                        thread_exit.store(lost, Ordering::Relaxed);
                         break;
                     }
                     if ret > 0 {
@@ -570,7 +593,8 @@ mod tests {
 
     #[test]
     fn watcher_starts_and_stops_on_temp_dir() {
-        let base = std::env::temp_dir();
+        let owned = core_io::test_dir::TestDir::new("watcher-start-stop").unwrap();
+        let base = owned.path().to_path_buf();
         let mut w = match DirWatcher::start(&base, 64 * 1024, false) {
             Ok(w) => w,
             Err(e) => {
@@ -592,7 +616,6 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = std::fs::remove_file(&probe);
         w.stop();
         assert!(
             got.iter().any(|e| e.rel.contains("fw_watch_probe_")),
@@ -612,8 +635,8 @@ mod tests {
     /// 跑 5 轮是因为只跑一轮有可能是运气 —— 线程偶尔调度得很快，掩盖问题。
     #[test]
     fn start_is_armed_before_returning() {
-        let base = std::env::temp_dir().join(format!("fw_armed_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-armed").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(&base).unwrap();
 
         for round in 0..5 {
@@ -621,7 +644,6 @@ mod tests {
                 Ok(w) => w,
                 Err(e) => {
                     eprintln!("跳过：无法打开目录句柄 ({})", e);
-                    let _ = std::fs::remove_dir_all(&base);
                     return;
                 }
             };
@@ -652,9 +674,8 @@ mod tests {
                 got.len(),
                 got
             );
-            let _ = std::fs::remove_file(base.join(&name));
+            owned.remove_file(&name).unwrap();
         }
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

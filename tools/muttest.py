@@ -15,19 +15,21 @@
 于是每次运行的文件删除量从 ~1400 降到个位数，而且单轮耗时从「复制整棵树」
 变成「复制一两个文件」。
 """
-import io, os, re, shutil, subprocess, sys, tempfile
+import io, os, re, shutil, subprocess, sys
+from safe_test_dir import SafeTestDir
 
-PY = r"C:\Users\HY\.workbuddy\binaries\python\versions\3.13.12\python.exe"
-BASE = r"C:\Users\HY\WorkBuddy\2026-10-13-22-04-36\filewatch"
+PY = sys.executable
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 刻意放在系统临时目录而不是工程目录里：里面全是复制出来的副本，
 # 放工程里既污染目录列表，又会被 check_api.py 的「孤儿文件」检查当成源码。
-ROOT = os.path.join(tempfile.gettempdir(), "filewatch_muttest")
+OWNED = SafeTestDir("muttest")
+ROOT = str(OWNED.path)
 PRIME = os.path.join(ROOT, "prime")   # 干净副本，只建一次
 WORK = os.path.join(ROOT, "work")     # 当前变异用的工作副本
 TMP = WORK                            # 旧名字，check_api.py 的目标目录
 
 # 复制时跳过的目录（道理同上：它们不是源码）
-SKIP_DIRS = ("target",)
+SKIP_DIRS = ("target", "node_modules", ".git", "__pycache__")
 
 # 本轮变异动过的**相对路径**。`fresh()` 靠它做定向还原。
 TOUCHED = []
@@ -83,7 +85,7 @@ def _refresh_prime():
         _sync(base_d, prime_d)
         # 源码里删掉的，副本里也要删，否则会一直报"孤儿源文件"
         for r in _extras(base_d, prime_d):
-            os.remove(os.path.join(prime_d, r))
+            OWNED.remove_file(os.path.join(prime_d, r))
     shutil.copyfile(os.path.join(BASE, 'Cargo.toml'), os.path.join(PRIME, 'Cargo.toml'))
     shutil.copyfile(os.path.join(BASE, 'tools', 'check_api.py'), os.path.join(PRIME, 'check_api.py'))
 
@@ -92,12 +94,12 @@ def prepare():
     """建好 `PRIME`（若不存在）并把 `WORK` 对齐到 `PRIME`。只在开跑前调用一次。"""
     os.makedirs(ROOT, exist_ok=True)
     if not os.path.isfile(os.path.join(PRIME, 'Cargo.toml')):
-        if os.path.isdir(PRIME):
-            # 上次跑到一半留下的残缺副本
-            shutil.rmtree(PRIME)
+        if os.path.exists(PRIME):
+            raise FileExistsError("Refusing to replace an existing mutation-test directory: " + PRIME)
         os.makedirs(PRIME)
         for d in ('crates', 'apps'):
-            shutil.copytree(os.path.join(BASE, d), os.path.join(PRIME, d))
+            shutil.copytree(os.path.join(BASE, d), os.path.join(PRIME, d),
+                            ignore=shutil.ignore_patterns(*SKIP_DIRS))
         shutil.copy(os.path.join(BASE, 'Cargo.toml'), PRIME)
         shutil.copy(os.path.join(BASE, 'tools', 'check_api.py'), PRIME)
     # 副本必须跟着源码走（见 _refresh_prime 的注释）
@@ -105,7 +107,7 @@ def prepare():
     os.makedirs(WORK, exist_ok=True)
     # 上次异常退出可能在 WORK 里留下变异产物 → 清掉（通常 0~1 个文件）
     for r in _extras(PRIME, WORK):
-        os.remove(os.path.join(WORK, r))
+        OWNED.remove_file(os.path.join(WORK, r))
     _sync(PRIME, WORK)
     TOUCHED.clear()
 
@@ -120,7 +122,7 @@ def fresh():
             shutil.copyfile(src, dst)
         elif os.path.isfile(dst):
             # 变异**新增**的文件（如孤儿源文件）→ 删掉。每轮至多一个。
-            os.remove(dst)
+            OWNED.remove_file(dst)
     TOUCHED.clear()
 
 
@@ -280,6 +282,18 @@ def m_dup_recno_mask():
     write(p, read(p) + '\nconst RECNO_MASK: u64 = 0xFFFF_FFFF_FFFF;\n')
 mut("重复定义 `const RECNO_MASK`", "I", m_dup_recno_mask)
 
+def m_dup_unix_ms():
+    """时间口径：曾经 CLI 与 GUI 各有一份 `base_ms` / `now_ms`。
+    在 CLI 里再写一个 → 必须在 I 类被拦住。"""
+    p = os.path.join(TMP, 'apps/cli/src/render.rs')
+    write(p, read(p) + '\nfn unix_ms() -> u64 { 0 }\n')
+mut("重复定义时间口径 `fn unix_ms`", "I", m_dup_unix_ms)
+
+def m_dup_unix_stamp():
+    p = os.path.join(TMP, 'apps/cli/src/args.rs')
+    write(p, read(p) + '\nfn unix_stamp(secs: i64) -> String { let _ = secs; String::new() }\n')
+mut("重复定义时间格式化 `fn unix_stamp`", "I", m_dup_unix_stamp)
+
 def m_regress_method_not_a_dup():
     """`impl` 里的同名方法不算重复：那是给会话加个便捷入口，不是另写一套"""
     q = os.path.join(TMP, 'crates/core-scan/src/paths.rs')
@@ -319,8 +333,6 @@ for name, expect, fn in MUTATIONS:
             print("  ❌ %-42s 未检出（期望 %s）" % (name, expect)); bad += 1
 print("=" * 78)
 print("通过 %d / 失败 %d" % (ok, bad))
-# 刻意**不**删除副本目录：那是一次上百个文件的批量删除，既没必要（下次运行
-# 会原地复用并自我对齐），也很容易触发环境的批量删除保护。
-# 想彻底清掉就自己 `rm -rf %s`。
-print("副本留在 %s（下次运行会复用，可自行删除）" % ROOT)
+# 保留本轮独占副本供检查；下次运行另建目录，不复用也不清理旧目录。
+print("本轮副本保留在 %s（下次运行将另建独占目录）" % ROOT)
 sys.exit(1 if bad else 0)

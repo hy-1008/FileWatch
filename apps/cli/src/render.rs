@@ -10,28 +10,18 @@ use core_viz::{LayoutResult, Rect};
 
 // ── 时间 ────────────────────────────────────────────────────────────────────
 
-/// Unix 秒 → `YYYY-MM-DD HH:MM:SS`（本地时区不处理，按 UTC 显示并标注）。
+/// Unix 秒 → `YYYY-MM-DD HH:MM:SSZ`。
 ///
-/// 不引 `chrono` 就得自己算民用历。这里用的是 Howard Hinnant 的
-/// `civil_from_days` 算法：把「1970-01-01 起的天数」映射到公历年月日，
-/// 对负数（1970 之前）也成立，且没有循环。
-pub fn fmt_unix_utc(secs: i64) -> String {
-    if secs <= 0 {
-        return "-".to_string();
-    }
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
+/// **实现搬到了 `core_io::util`**，这里只是换个终端习惯的名字转出去。
+/// 搬家的理由：界面里「保存快照」也要给默认文件名生成同样的时间戳，
+/// 两处各写一份民用历换算的话，跨年/闰年时会出现「界面标题写 2027、
+/// 文件名写 2026」这种一年只错一次、因而极难复现的问题。
+/// 换算属于「把人看不懂的值变成人看得懂的文本」，与 `human_size` 同类，
+/// 所以和它放在一起。
+pub use core_io::util::unix_utc as fmt_unix_utc;
+
+/// `20261014-131500`：给文件名用的紧凑时间戳（同一份换算，见上）。
+pub use core_io::util::unix_stamp as fmt_unix_stamp;
 
 /// 毫秒时间戳（相对起点）→ `mm:ss.mmm`，用于监控日志行首。
 pub fn fmt_offset_ms(ms: u64) -> String {
@@ -41,20 +31,6 @@ pub fn fmt_offset_ms(ms: u64) -> String {
         (ms % 60_000) / 1000,
         ms % 1000
     )
-}
-
-/// Howard Hinnant `civil_from_days`：天数 → (年, 月, 日)。
-pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 // ── 表格 ────────────────────────────────────────────────────────────────────
@@ -323,25 +299,12 @@ pub fn layout_audit(layout: &LayoutResult, viewport: &Rect) -> (f32, f32, f32) {
 mod tests {
     use super::*;
 
+    /// 时间格式化的用例**搬到了 `core_io::util`**（那里是唯一实现）。
+    /// 这里只留一条"转出去的名字没接错"的冒烟断言。
     #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(1), (1970, 1, 2));
-        assert_eq!(civil_from_days(365), (1971, 1, 1));
-        // 2000-03-01（闰年边界之后）
-        assert_eq!(civil_from_days(11017), (2000, 3, 1));
-        // 2024-02-29（闰日）
-        assert_eq!(civil_from_days(19782), (2024, 2, 29));
-    }
-
-    #[test]
-    fn fmt_unix_utc_is_stable() {
-        assert_eq!(fmt_unix_utc(0), "-");
-        assert_eq!(fmt_unix_utc(1), "1970-01-01 00:00:01Z");
-        // 2021-01-01 00:00:00Z
+    fn time_helpers_are_reexported_not_reimplemented() {
         assert_eq!(fmt_unix_utc(1_609_459_200), "2021-01-01 00:00:00Z");
-        // 闰日
-        assert_eq!(fmt_unix_utc(1_709_164_800), "2024-02-29 00:00:00Z");
+        assert_eq!(fmt_unix_stamp(1_609_459_200), "20210101-000000");
     }
 
     #[test]

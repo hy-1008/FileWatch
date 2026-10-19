@@ -3,7 +3,7 @@ name = "filewatch-gui"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
-license = "MIT"
+license = "GPL-3.0-or-later"
 description = "FileWatch 图形界面：盘符选择 / 全量扫描 / Treemap 面积图 / 增量监控"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,9 +19,14 @@ description = "FileWatch 图形界面：盘符选择 / 全量扫描 / Treemap �
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon`：关闭软件可以只藏到托盘（监控继续跑）。
+# `image-ico`：让 Tauri 能读 `icons/icon.ico`（窗口图标与托盘图标共用这一份）。
+tauri = { version = "2", features = ["tray-icon", "image-ico"] }
+# 系统通知（Windows 通知中心）。**只在 GUI 这一层**：引擎层仍然零依赖。
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
 
 core-io = { path = "../../../crates/core-io" }
 core-index = { path = "../../../crates/core-index" }

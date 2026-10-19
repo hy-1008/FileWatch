@@ -153,6 +153,16 @@ fn phase_cn(p: ScanPhase) -> &'static str {
     }
 }
 
+/// 列表类面板的行数上限。
+///
+/// **按运行模式缩放**（[`crate::profile::Budget::rows`]），缩放只此一处 ——
+/// 前端不自己乘倍率：那正是"切了模式但什么都没变"的来路，而且不报错。
+/// 前端传进来的 `limit` 是**基数**（标准模式下的行数）。
+fn row_limit(limit: Option<usize>, profile: Option<&str>, default: usize, max: usize) -> usize {
+    let budget = crate::profile::Budget::of(crate::profile::Profile::parse(profile));
+    budget.rows(limit.unwrap_or(default)).min(max)
+}
+
 /// 由界面参数构造 LOD 策略。
 ///
 /// `min_side` 会被夹到 `[4, 2000]`：太小会让 LOD 形同虚设（几十万个亚像素矩形
@@ -212,26 +222,50 @@ pub fn list_volumes() -> Vec<VolumeCard> {
 #[tauri::command]
 pub fn scan_start(
     app: AppHandle,
-    state: State<'_, Shared>,
-    hub: State<'_, std::sync::Arc<crate::monitor::MonitorHub>>,
     drive: String,
     root: Option<String>,
     watch: Option<bool>,
 ) -> Result<(), String> {
-    // 扫描会换掉整棵索引树，而监控正挂在树上 —— 两者不能同时进行。
-    // 与其让监控线程悄悄改一棵已经被丢弃的树，不如明确拒绝。
+    // 命令本身只做转发：真正的互斥检查在 [`spawn_scan`] 里。后台周期任务也走
+    // 那条路 —— 两处各判一次迟早会分叉（比如调度器忘了查"正在监控"）。
+    spawn_scan(&app, &drive, root.as_deref(), watch.unwrap_or(false))
+}
+
+/// 后台扫描的**唯一入口**：界面命令与后台周期任务都从这里进。
+///
+/// 互斥检查只此一处：扫描会换掉整棵索引树，而监控正挂在树上 —— 与其让监控
+/// 线程悄悄改一棵已经被丢弃的树，不如明确拒绝。
+///
+/// 记下的 `last_drive` 是「用户当前在看哪块盘」，后台周期任务靠它决定刷谁
+/// （**不能**去扫别的盘，那会把用户的视图换掉，见 [`crate::scheduler`]）。
+pub fn spawn_scan(
+    app: &AppHandle,
+    drive: &str,
+    root: Option<&str>,
+    watch: bool,
+) -> Result<(), String> {
+    let hub = app.state::<std::sync::Arc<crate::monitor::MonitorHub>>();
     if hub.is_running() {
         return Err("正在监控：请先停止监控再重新扫描（监控需要这棵索引树）".into());
     }
     {
-        let mut st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+        let shared = app.state::<Shared>();
+        let mut st = shared.inner().lock().map_err(|_| "状态锁被污染".to_string())?;
+        if hub.is_running() {
+            return Err("正在监控：请先停止监控再重新扫描".into());
+        }
         if st.scanning {
             return Err("已有一次扫描在进行中，请等它结束".into());
         }
         st.scanning = true;
+        st.last_drive = Some(drive.to_string());
     }
 
-    let watch = watch.unwrap_or(false);
+    let drive = drive.to_string();
+    let root = root.map(str::to_string);
+    // 线程要 `'static`，所以把句柄 clone 一份进去（AppHandle 是引用计数，
+    // clone 很便宜，不是复制窗口）
+    let app = app.clone();
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let mut cfg = SessionConfig::default();
@@ -354,6 +388,7 @@ pub fn tree_rows(
     offset: Option<usize>,
     limit: Option<usize>,
     mode: Option<String>,
+    profile: Option<String>,
 ) -> Result<Vec<TreeRow>, String> {
     let mut st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
     let l = st.loaded_mut()?;
@@ -365,7 +400,7 @@ pub fn tree_rows(
     let kids = l.children().children(parent);
     let ordered = sorted_children(tree, kids, m);
     let off = offset.unwrap_or(0).min(ordered.len());
-    let lim = limit.unwrap_or(500).min(4096);
+    let lim = row_limit(limit, profile.as_deref(), 500, 4096);
 
     Ok(ordered[off..(off + lim).min(ordered.len())]
         .iter()
@@ -453,7 +488,7 @@ pub fn layout(state: State<'_, Shared>, args: LayoutArgs) -> Result<Response, St
         policy: policy_of(&args),
         mode: size_mode(args.mode.as_deref()),
         shading: shading_of(args.shading.as_deref()),
-        now_unix: now_unix(),
+        now_unix: core_io::util::unix_secs(),
     };
 
     let viewport = Rect::new(0.0, 0.0, args.width, args.height);
@@ -491,7 +526,7 @@ pub fn layout_info(state: State<'_, Shared>, args: LayoutArgs) -> Result<LayoutI
         policy: policy_of(&args),
         mode: size_mode(args.mode.as_deref()),
         shading: shading_of(args.shading.as_deref()),
-        now_unix: now_unix(),
+        now_unix: core_io::util::unix_secs(),
     };
     let viewport = Rect::new(0.0, 0.0, args.width.max(1.0), args.height.max(1.0));
     let r = compute_layout(
@@ -518,12 +553,13 @@ pub fn ext_rows(
     state: State<'_, Shared>,
     limit: Option<usize>,
     mode: Option<String>,
+    profile: Option<String>,
 ) -> Result<Vec<ExtRow>, String> {
     let mut st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
     let l = st.loaded_mut()?;
     l.ensure_exts();
     let m = size_mode(mode.as_deref());
-    let n = limit.unwrap_or(50).min(4096);
+    let n = row_limit(limit, profile.as_deref(), 50, 4096);
     let (top, total) = l.ext_table().top(n, m);
 
     // `ext_id` 必须与面积图里那个 id **同一个来源**（`ExtensionTable`），
@@ -556,12 +592,13 @@ pub fn top_files(
     state: State<'_, Shared>,
     limit: Option<usize>,
     mode: Option<String>,
+    profile: Option<String>,
 ) -> Result<Vec<FileRow>, String> {
     let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
     let l = st.loaded()?;
     let tree = l.tree();
     let m = size_mode(mode.as_deref());
-    let n = limit.unwrap_or(200).min(10_000);
+    let n = row_limit(limit, profile.as_deref(), 200, 10_000);
     Ok(top_files_impl(tree, n, m)
         .into_iter()
         .map(|node| {
@@ -569,7 +606,7 @@ pub fn top_files(
             FileRow {
                 node,
                 name: name_of(tree, node),
-                path: tree.path_of(node),
+                path: l.session.path_remap().map(|r| r.apply(&tree.path_of(node))).unwrap_or_else(|| tree.path_of(node)),
                 size: nd.map(|x| x.size).unwrap_or(0),
                 alloc: nd.map(|x| x.alloc).unwrap_or(0),
                 mtime: nd.map(|x| x.mtime).unwrap_or(0),
@@ -578,8 +615,131 @@ pub fn top_files(
         .collect())
 }
 
+// ── 文件搜索（F13） ─────────────────────────────────────────────────────────
+//
+// 在**已扫出来的索引树**里搜，不碰磁盘：200 万节点的名字都在内存里，
+// 一次搜索几十毫秒。所以这是同步命令 —— 但要挡住"扫描进行中"（那时树正在
+// 变，搜出来的东西和界面对不上）。
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHitRow {
+    pub node: u32,
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+    pub mtime: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchView {
+    pub hits: Vec<SearchHitRow>,
+    /// 实际比过的节点数（父目录过滤已排除）
+    pub scanned: u64,
+    /// **全部**命中数（不受 limit 截断）
+    pub matched: u64,
+    pub truncated: bool,
+    pub elapsed_ms: u64,
+    pub mode: String,
+    pub scope: String,
+}
+
+#[tauri::command]
+pub fn search_nodes(
+    state: State<'_, Shared>,
+    text: String,
+    mode: Option<String>,
+    scope: Option<String>,
+    limit: Option<usize>,
+) -> Result<SearchView, String> {
+    let t0 = Instant::now();
+    let query_text = text.trim().to_string();
+    let m = core_index::MatchMode::parse(mode.as_deref().unwrap_or("contains"));
+    let s = core_index::Scope::parse(scope.as_deref().unwrap_or("files"));
+    // 空关键字：直接回空（不要把"所有文件"倒进列表里）
+    if query_text.is_empty() {
+        return Ok(SearchView {
+            hits: Vec::new(), scanned: 0, matched: 0, truncated: false, elapsed_ms: 0,
+            mode: m.key().to_string(), scope: s.key().to_string(),
+        });
+    }
+    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    if st.scanning {
+        return Err("正在扫描：扫描结束后再搜索（否则结果和界面上的树对不上）".into());
+    }
+    let l = st.loaded()?;
+    let tree = l.tree();
+    let out = core_index::search(
+        tree,
+        &core_index::Query { text: &query_text, mode: m, scope: s, limit: limit.unwrap_or(500) },
+    )?;
+    Ok(SearchView {
+        hits: out
+            .hits
+            .into_iter()
+            .map(|h| SearchHitRow {
+                node: h.node,
+                name: h.name,
+                // 合成路径要过 remap，否则点"在资源管理器打开"会去一个不存在的位置
+                path: l
+                    .session
+                    .path_remap()
+                    .map(|r| r.apply(&h.path))
+                    .unwrap_or(h.path),
+                size: h.size,
+                is_dir: h.is_dir,
+                mtime: h.mtime,
+            })
+            .collect(),
+        scanned: out.scanned,
+        matched: out.matched,
+        truncated: out.truncated,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        mode: m.key().to_string(),
+        scope: s.key().to_string(),
+    })
+}
+
 // ── 详情面板 ────────────────────────────────────────────────────────────────
 
+/// 批量取名字 —— 面积图一次要几百到几千个。
+///
+/// 名字不在布局里（wire 只传 id），前端要画文字就得问后端。逐节点问一次的话，
+/// 一次布局就是几千次跨语言往返，每次还要抢状态锁；更糟的是每回来一个名字都会
+/// 触发一次整图重画，成本变成 O(方块数²)。实测 19 000 个文件的目录、布局
+/// 6 300 个方块时，逐节点取名字要几秒，批量后一次调用几毫秒 —— 这就是
+/// 「文件夹树列表加载太慢」的主因（后端 `tree_rows` 本身只要 240 µs）。
+///
+/// **它不碰派生索引**（只读名字池），所以不需要先 `refresh_derived()`。
+#[tauri::command]
+pub fn node_names(state: State<'_, Shared>, nodes: Vec<u32>) -> Result<Vec<String>, String> {
+    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    names_of(st.loaded()?.tree(), &nodes)
+}
+
+/// 一次请求的上限。超了**报错而不是截断** —— 返回值是按位置对应的，
+/// 悄悄截断会让前端把名字安到别的方块上，而且完全不报错。
+const MAX_NAME_BATCH: usize = 20_000;
+
+/// `node_names` 的纯逻辑部分（可单测，不必造 Tauri 的 `State`）。
+pub fn names_of(tree: &core_index::Tree, nodes: &[u32]) -> Result<Vec<String>, String> {
+    if nodes.len() > MAX_NAME_BATCH {
+        return Err(format!(
+            "一次最多取 {MAX_NAME_BATCH} 个名字（收到 {}）",
+            nodes.len()
+        ));
+    }
+    Ok(nodes
+        .iter()
+        .map(|&n| match tree.node(n) {
+            Some(nd) if nd.in_use() => name_of(tree, n),
+            // 节点被删/不在索引里：给空串，前端按「没有名字就不画」处理
+            _ => String::new(),
+        })
+        .collect())
+}
+
+/// 单个节点的完整信息（点选/悬停时才用）。
 #[tauri::command]
 pub fn node_detail(state: State<'_, Shared>, node: u32) -> Result<NodeInfo, String> {
     let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
@@ -592,7 +752,7 @@ pub fn node_detail(state: State<'_, Shared>, node: u32) -> Result<NodeInfo, Stri
     Ok(NodeInfo {
         node,
         name: name_of(tree, node),
-        path: tree.path_of(node),
+        path: l.session.path_remap().map(|r| r.apply(&tree.path_of(node))).unwrap_or_else(|| tree.path_of(node)),
         is_dir: n.is_dir(),
         size: n.size,
         alloc: n.alloc,
@@ -612,7 +772,31 @@ pub fn node_detail(state: State<'_, Shared>, node: u32) -> Result<NodeInfo, Stri
 pub fn find_by_path(state: State<'_, Shared>, path: String) -> Result<Option<u32>, String> {
     let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
     let l = st.loaded()?;
-    Ok(l.session.find_node_by_path(&path))
+    Ok(find_directory(&l.session, &path))
+}
+
+/// 只接受扫描范围内精确存在的目录；输入错误不能静默跳回盘根。
+fn find_directory(session: &Session, path: &str) -> Option<u32> {
+    let key = path.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let remap = session.path_remap();
+    if let Some(node) = session.watch.as_ref().and_then(|w| w.lookup(&key)) {
+        if session.tree.node(node).map(|n| n.in_use() && n.is_dir()).unwrap_or(false) { return Some(node); }
+    }
+    session.tree.arena.nodes.iter().enumerate().find_map(|(i, n)| {
+        if !n.in_use() || !n.is_dir() { return None; }
+        let p = session.tree.path_of(i as u32);
+        let p = remap.as_ref().map(|r| r.apply(&p)).unwrap_or(p);
+        (p.trim_end_matches('\\').to_lowercase() == key).then_some(i as u32)
+    })
+}
+
+#[tauri::command]
+pub fn node_parent(state: State<'_, Shared>, node: u32) -> Result<u32, String> {
+    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    let tree = st.loaded()?.tree();
+    let n = tree.node(node).filter(|n| n.in_use()).ok_or("文件已不在当前扫描结果中")?;
+    tree.node(n.parent).filter(|p| p.in_use() && p.is_dir()).ok_or("父目录已不在当前扫描结果中")?;
+    Ok(n.parent)
 }
 
 // ── F0 管理员权限（进入软件时申请）─────────────────────────────────────────
@@ -773,10 +957,50 @@ pub fn gui_prefs() -> crate::prefs::GuiPrefs {
 /// 写偏好。
 ///
 /// 参数名不叫 `prefs`：那会和 `crate::prefs` 模块同名，`prefs::save` 就没法写了。
+///
+/// 写完要顺手把后台周期任务对齐到新偏好（`scheduler::SchedulerSlot::sync`）：
+/// 用户切到性能模式应该**立刻**生效，不该等下次启动；切回轻量/标准则要立刻停下。
 #[tauri::command]
-pub fn set_gui_prefs(value: crate::prefs::GuiPrefs) -> Result<crate::prefs::GuiPrefs, String> {
+pub fn set_gui_prefs(
+    app: AppHandle,
+    slot: State<'_, crate::scheduler::SchedulerSlot>,
+    value: crate::prefs::GuiPrefs,
+) -> Result<crate::prefs::GuiPrefs, String> {
+    let value = value.clamped();
     crate::prefs::save(&value)?;
+    slot.sync(&app, &value);
     Ok(value)
+}
+
+/// 开机自启动现状（读注册表）。
+///
+/// 不进偏好文件：注册表本身就是这份设置的真相源，存两份只会让两边不一致
+/// （用户在任务管理器里关掉之后，界面还会显示"已开启"）。
+#[tauri::command]
+pub fn autostart_status() -> crate::autostart::AutoStartInfo {
+    crate::autostart::status()
+}
+
+/// 打开 / 关闭开机自启动。返回**操作之后**的真实状态 —— 界面显示的是它，
+/// 而不是"用户刚才点的那个值"：写注册表可能被拦下（合规策略、权限），
+/// 那种情况下如实说"没开成"比假装成功好。
+#[tauri::command]
+pub fn set_autostart(enable: bool) -> Result<crate::autostart::AutoStartInfo, String> {
+    if enable {
+        crate::autostart::enable()?;
+    } else {
+        crate::autostart::disable()?;
+    }
+    Ok(crate::autostart::status())
+}
+
+/// 运行模式派生出来的具体数字（LOD 倍率、行数倍率……）。
+///
+/// 前端**不要**自己再算一遍：那正是"界面显示轻量模式、实际什么都没变"的来路。
+/// 切换模式时调一次，把数字存起来用。
+#[tauri::command]
+pub fn profile_budget(profile: Option<String>) -> crate::profile::Budget {
+    crate::profile::Budget::of(crate::profile::Profile::parse(profile.as_deref()))
 }
 
 /// 权限现状的纯文本报告（`filewatch-gui.exe --check-elevation`）。
@@ -814,9 +1038,27 @@ pub fn elevation_report() -> String {
         crate::prefs::prefs_path().display()
     ));
     s.push_str(&format!(
-        "  当前偏好        : 进入软件时自动询问 = {}\n",
-        yes(p.ask_admin_on_start)
+        "  当前偏好        : 自动询问 = {}　盘符栏折叠 = {}\n",
+        yes(p.ask_admin_on_start),
+        yes(p.drives_collapsed)
     ));
+    let prof = crate::profile::Profile::parse(Some(&p.profile));
+    s.push_str(&format!(
+        "  运行模式        : {}（{}）　后台周期任务 = {}\n",
+        prof.label_cn(),
+        p.profile,
+        yes(crate::scheduler::should_run(&p))
+    ));
+    s.push_str(&format!("                    {}\n", prof.cost_cn()));
+    if crate::scheduler::should_run(&p) {
+        s.push_str(&format!(
+            "  周期任务        : 每 {} 分钟刷新容量　轮流扫描 = {}\n",
+            p.periodic_minutes.clamp(1, 24 * 60),
+            yes(p.periodic_scan)
+        ));
+    }
+    let au = crate::autostart::status();
+    s.push_str(&format!("  开机自启动      : {}\n", if au.enabled { if au.stale { "已启用（但指向的路径已失效）" } else { "已启用" } } else { "未启用" }));
     s
 }
 
@@ -828,25 +1070,29 @@ pub fn print_elevation_report() {
     let _ = std::io::stdout().flush();
 }
 
-/// 当前时间（epoch 毫秒）。
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::Loaded;
+
+    #[test]
+    fn path_navigation_is_exact_and_remaps_deep_scan_roots() {
+        let owned = core_io::test_dir::TestDir::new("gui-exact-navigation").unwrap();
+        let root = owned.path().to_path_buf();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("file.txt"), b"x").unwrap();
+        let mut cfg = SessionConfig { scan_root: Some(root.clone()), force_traverse: true, allow_traverse_watch: false, ..Default::default() };
+        cfg.engine.write_changelog = false;
+        let s = Session::open(cfg, |_, _, _| {}).unwrap();
+        assert_eq!(find_directory(&s, &root.to_string_lossy()), Some(s.tree.root));
+        let sub = find_directory(&s, &root.join("sub").to_string_lossy()).unwrap();
+        assert_ne!(sub, s.tree.root);
+        assert!(find_directory(&s, &root.join("sub/missing").to_string_lossy()).is_none());
+        assert!(find_directory(&s, &root.join("sub/file.txt").to_string_lossy()).is_none());
+        assert!(find_directory(&s, r"Z:\outside").is_none());
+        assert_eq!(find_directory(&s, &(root.join("sub").to_string_lossy().replace('\\', "/").to_uppercase() + "/")), Some(sub));
+    }
 
     /// 参数映射：这些「字符串 → 枚举」的翻译只有一处，错了界面就会用错口径
     /// 或者画错着色，而画面本身不会报错 —— 所以单独钉住。
@@ -862,11 +1108,52 @@ mod tests {
         assert_eq!(shading_of(Some("age")), ShadingMode::ByAge);
     }
 
+    /// 批量取名：**按位置一一对应**，越界节点给空串而不是 panic。
+    ///
+    /// 这条钉的是面积图的主要成本项：名字必须一次拿回来。前端按返回数组的下标
+    /// 给方块安名字，所以「顺序错」和「悄悄截断」都会让文字安到别的方块上，
+    /// 而且完全不报错 —— 两种都在这条里挡掉。
+    #[test]
+    fn batch_name_lookup_is_positional_and_safe() {
+        let owned = core_io::test_dir::TestDir::new("fw-gui-names").unwrap();
+        let dir = owned.path().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        std::fs::write(dir.join("beta.log"), b"bb").unwrap();
+
+        let mut cfg = SessionConfig::default();
+        cfg.drive = "C:".into();
+        cfg.scan_root = Some(dir.clone());
+        cfg.force_traverse = true;
+        cfg.allow_traverse_watch = false;
+        cfg.engine.write_changelog = false;
+        let s = Session::open(cfg, |_, _, _| {}).expect("会话应能打开");
+        let root = s.tree.root;
+
+        let mut loaded = Loaded::new(s);
+        loaded.refresh_derived();
+        let kids: Vec<u32> = loaded.children().children(root).to_vec();
+        assert_eq!(kids.len(), 2, "应看到两个文件");
+
+        let t = loaded.tree();
+        let want = vec![
+            name_of(t, kids[1]),
+            String::new(), // 不存在的节点
+            name_of(t, kids[0]),
+        ];
+        let got = names_of(t, &[kids[1], 999_999, kids[0]]).unwrap();
+        assert_eq!(got, want, "返回值必须与请求按位置对应");
+
+        // 超上限要**报错**：截断会让名字与方块错位
+        let too_many = vec![0u32; MAX_NAME_BATCH + 1];
+        assert!(names_of(t, &too_many).is_err());
+
+    }
+
     /// `min_side` 必须被夹住：前端一个笔误不该让 LOD 失效（几十万个亚像素矩形
     /// 全画出来 = 帧率崩）或让任何目录都不展开（面积图只剩一层）。
     #[test]
-    fn min_side_is_clamped() {
-        let mk = |v: Option<f32>| {
+    fn min_side_is_clamped() {        let mk = |v: Option<f32>| {
             policy_of(&LayoutArgs {
                 width: 100.0,
                 height: 100.0,
@@ -893,8 +1180,8 @@ mod tests {
     ///   ③ 线格式的长度/偏移（前端按硬编码偏移读，错一个字节就全乱）。
     #[test]
     fn engine_to_layout_to_wire() {
-        let dir = std::env::temp_dir().join(format!("fw_gui_wire_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("fw-gui-wire").unwrap();
+        let dir = owned.path().to_path_buf();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.bin"), vec![b'a'; 4096]).unwrap();
         std::fs::write(dir.join("sub").join("b.txt"), vec![b'b'; 1024]).unwrap();
@@ -964,15 +1251,14 @@ mod tests {
             "头里的 root 要与第 0 项一致"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 面包屑必须从扫描根一路挂到目标节点，且**根在最前**（界面靠它决定
     /// 「已经在最外层了」的边界）。
     #[test]
     fn breadcrumb_reaches_the_root() {
-        let dir = std::env::temp_dir().join(format!("fw_gui_crumb_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("fw-gui-crumb").unwrap();
+        let dir = owned.path().to_path_buf();
         std::fs::create_dir_all(dir.join("sub").join("deep")).unwrap();
         std::fs::write(dir.join("sub").join("deep").join("f.txt"), b"x").unwrap();
 
@@ -1022,7 +1308,6 @@ mod tests {
         assert_eq!(*chain.last().unwrap(), deep, "链条末端必须是目标节点");
         assert_eq!(chain.len(), 3, "root → sub → deep");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 权限信息的自洽性。
@@ -1136,8 +1421,120 @@ mod tests {
             text
         );
 
+
         // 不能有未替换的占位符或者 "None"
         assert!(!text.contains("None"), "报告里漏出了 None：\n{text}");
         assert!(!text.contains("{}"), "报告里有没填上的格式占位符：\n{text}");
     }
+
+    /// 诊断（默认不跑）：真实大目录上量一遍每个环节的耗时。
+    ///
+    /// `cargo test --release -- --ignored --nocapture perf_probe`
+    ///
+    /// 为什么需要它：「界面卡」这种反馈没法靠读代码定位 —— 扫描 / 派生索引 /
+    /// 布局 / 单点查询里到底哪一段慢，只能量。这台机器上的数字不代表用户机器，
+    /// 但**相对占比**是稳的。
+    #[test]
+    #[ignore]
+    fn perf_probe_real_directory() {
+        use std::time::Instant;
+        // 默认挑一个「文件夹树最难受」的目录：子项多、层级深、文件名长
+        let dir = std::env::var("FW_PROBE_DIR")
+            .unwrap_or_else(|_| "C:\\Windows\\System32".to_string());
+
+        let mut cfg = SessionConfig::default();
+        cfg.drive = "C:".into();
+        cfg.scan_root = Some(std::path::PathBuf::from(&dir));
+        cfg.force_traverse = true;
+        cfg.allow_traverse_watch = false;
+        cfg.engine.write_changelog = false;
+
+        let t0 = Instant::now();
+        let s = Session::open(cfg, |_, _, _| {}).expect("会话应能打开");
+        println!("扫描 {dir}：{:?}（{} 个文件 / {} 个目录）",
+                 t0.elapsed(), s.tree.file_count, s.tree.dir_count);
+        let root = s.tree.root;
+
+        let t = Instant::now();
+        let mut loaded = Loaded::new(s);
+        loaded.ensure_exts();
+        println!("首次建派生索引（ChildIndex + ExtensionTable）：{:?}", t.elapsed());
+
+        let t = Instant::now();
+        loaded.refresh_derived();
+        println!("refresh_derived（代数没变时）：{:?}", t.elapsed());
+
+        // 找子项最多的那个目录 —— 那才是 tree_rows 的最坏情况
+        let mut worst = (0usize, root);
+        for n in 0..(loaded.tree().arena.nodes.len() as u32) {
+            let c = loaded.children().child_count(n);
+            if c > worst.0 {
+                worst = (c, n);
+            }
+        }
+        println!("子项最多的目录：node {} 有 {} 个直接子项", worst.1, worst.0);
+
+        for (label, node, lim) in [("根目录", root, 200usize), ("最宽目录", worst.1, 200usize)] {
+            let kids = loaded.children().children(node);
+            let t = Instant::now();
+            let ordered = sorted_children(loaded.tree(), kids, SizeMode::Logical);
+            let sort_ms = t.elapsed();
+
+            let t = Instant::now();
+            let page: Vec<TreeRow> = ordered[..lim.min(ordered.len())]
+                .iter()
+                .map(|&n| {
+                    let node = loaded.tree().node(n);
+                    TreeRow {
+                        node: n,
+                        name: name_of(loaded.tree(), n),
+                        is_dir: node.map(|x| x.is_dir()).unwrap_or(false),
+                        size: node.map(|x| x.size).unwrap_or(0),
+                        alloc: node.map(|x| x.alloc).unwrap_or(0),
+                        children: loaded.children().child_count(n),
+                        files: loaded.tree().dir_file_counts.get(n as usize).copied().unwrap_or(0) as u64,
+                        mtime: node.map(|x| x.mtime).unwrap_or(0),
+                    }
+                })
+                .collect();
+            println!("tree_rows[{label}]：排序 {:?} + 取 {lim} 条 {:?}（共 {} 条）",
+                     sort_ms, t.elapsed(), ordered.len());
+            assert!(!page.is_empty() || ordered.is_empty());
+        }
+
+        let vp = Rect::new(0.0, 0.0, 1200.0, 700.0);
+        let mk_opts = |shading: ShadingMode| LayoutOptions {
+            policy: LodPolicy::default(),
+            mode: SizeMode::Logical,
+            shading,
+            now_unix: core_io::util::unix_secs(),
+        };
+        let t = Instant::now();
+        let r = compute_layout(loaded.tree(), loaded.children(), loaded.ext_table(), root, vp, &mk_opts(ShadingMode::ByExtension));
+        println!("compute_layout：{:?}（{} 个矩形）", t.elapsed(), r.items.len());
+        let t = Instant::now();
+        let _ = compute_layout(loaded.tree(), loaded.children(), loaded.ext_table(), root, vp, &mk_opts(ShadingMode::ByExtension));
+        println!("layout_info 的第二次布局：{:?}", t.elapsed());
+
+        // 前端为每个方块要一次名字 —— 模拟 2000 次
+        let t = Instant::now();
+        let mut n = 0;
+        for it in r.items.iter().take(2000) {
+            let node = loaded.tree().node(it.node);
+            if node.is_some() {
+                n += 1;
+            }
+        }
+        println!("（前端名字风暴的等价物：{} 次 node_detail 的树侧开销 {:?}）", n, t.elapsed());
+
+        // 色槽分布 —— 面积图是不是只有一种颜色
+        let mut slots = std::collections::BTreeMap::new();
+        for it in &r.items {
+            *slots.entry(it.shade_slot).or_insert(0usize) += 1;
+        }
+        println!("按文件类型着色的色槽分布：{:?}", slots);
+        assert!(slots.len() > 1, "面积图只有一个色槽 = 整片同色（正是用户报的问题）：{slots:?}");
+    }
+
+
 }

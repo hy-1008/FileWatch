@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 内存里保留多少条变更（导出 CSV 的数据源也是它）。
@@ -108,6 +108,8 @@ pub struct ChangeRow {
     pub seq: u64,
     /// 相对监控起点的毫秒
     pub at_ms: u64,
+    /// 接收事件的 Unix 毫秒；界面按操作系统本地时区显示。
+    pub time_ms: u64,
     /// `"created"` / `"deleted"` / `"renamed"` / `"modified"` / …
     pub kind: String,
     pub kind_cn: String,
@@ -133,6 +135,7 @@ pub struct ChangeRow {
 pub struct AlertRow {
     pub seq: u64,
     pub at_ms: u64,
+    pub time_ms: u64,
     pub kind: String,
     pub kind_cn: String,
     pub path: String,
@@ -190,6 +193,10 @@ pub struct MonitorTick {
     pub total_events: u64,
     pub total_alerts: u64,
     pub backpressure: bool,
+    pub backpressure_total: u64,
+    pub queue_dropped: u64,
+    pub evicted: u64,
+    pub error: Option<String>,
     pub still_pending: usize,
     pub generation: u64,
     /// 树当前的实时总量
@@ -212,6 +219,7 @@ pub struct ChangePage {
 struct Logged {
     seq: u64,
     at_ms: u64,
+    time_ms: u64,
     ev: PendingEvent,
     path: String,
 }
@@ -220,6 +228,7 @@ struct Logged {
 struct LoggedAlert {
     seq: u64,
     at_ms: u64,
+    time_ms: u64,
     alert: Alert,
 }
 
@@ -235,6 +244,7 @@ struct Ring {
     queue_dropped: u64,
     still_pending: usize,
     next_seq: u64,
+    elapsed_ms: u64,
     error: Option<String>,
 }
 
@@ -243,7 +253,7 @@ impl Ring {
         self.next_seq += 1;
         let seq = self.next_seq;
         let row = change_row(seq, at_ms, &ev, &path);
-        self.changes.push_back(Logged { seq, at_ms, ev, path });
+        self.changes.push_back(Logged { seq, at_ms, time_ms: row.time_ms, ev, path });
         while self.changes.len() > RING_CAPACITY {
             self.changes.pop_front();
             self.evicted += 1;
@@ -255,7 +265,7 @@ impl Ring {
         self.next_seq += 1;
         let seq = self.next_seq;
         let row = alert_row(seq, at_ms, &alert);
-        self.alerts.push_back(LoggedAlert { seq, at_ms, alert });
+        self.alerts.push_back(LoggedAlert { seq, at_ms, time_ms: row.time_ms, alert });
         while self.alerts.len() > ALERT_CAPACITY {
             self.alerts.pop_front();
         }
@@ -269,7 +279,7 @@ impl Ring {
             .rev()
             .filter(|l| kind.map(|k| l.ev.kind.as_str() == k).unwrap_or(true))
             .take(limit)
-            .map(|l| change_row(l.seq, l.at_ms, &l.ev, &l.path))
+            .map(|l| { let mut row = change_row(l.seq, l.at_ms, &l.ev, &l.path); row.time_ms = l.time_ms; row })
             .collect()
     }
 
@@ -285,10 +295,11 @@ impl Ring {
     }
 }
 
-fn change_row(seq: u64, at_ms: u64, ev: &PendingEvent, path: &str) -> ChangeRow {
+pub(crate) fn change_row(seq: u64, at_ms: u64, ev: &PendingEvent, path: &str) -> ChangeRow {
     ChangeRow {
         seq,
         at_ms,
+        time_ms: core_io::util::unix_ms(),
         kind: ev.kind.as_str().to_string(),
         kind_cn: ev.kind.label_cn().to_string(),
         is_dir: ev.is_dir,
@@ -303,10 +314,11 @@ fn change_row(seq: u64, at_ms: u64, ev: &PendingEvent, path: &str) -> ChangeRow 
     }
 }
 
-fn alert_row(seq: u64, at_ms: u64, a: &Alert) -> AlertRow {
+pub(crate) fn alert_row(seq: u64, at_ms: u64, a: &Alert) -> AlertRow {
     AlertRow {
         seq,
         at_ms,
+        time_ms: core_io::util::unix_ms(),
         kind: a.kind.as_str().to_string(),
         kind_cn: a.kind.label_cn().to_string(),
         path: a.path.clone(),
@@ -384,13 +396,13 @@ impl MonitorHub {
             queue_dropped: r.queue_dropped,
             evicted: r.evicted,
             still_pending: r.still_pending,
-            elapsed_ms: self
+            elapsed_ms: if self.is_running() { self
                 .started
                 .lock()
                 .ok()
                 .and_then(|s| *s)
                 .map(|t| t.elapsed().as_millis() as u64)
-                .unwrap_or(0),
+                .unwrap_or(0) } else { r.elapsed_ms },
             generation: self.generation_of(),
             error: r.error.clone(),
         }
@@ -398,13 +410,6 @@ impl MonitorHub {
 }
 
 // ── 时间 ────────────────────────────────────────────────────────────────────
-
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 // ── 启动计划 ────────────────────────────────────────────────────────────────
 
@@ -458,7 +463,10 @@ pub fn monitor_start(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let interval = interval_ms.unwrap_or(core_monitor::DEFAULT_POLL_INTERVAL_MS).max(MIN_INTERVAL_MS);
+    let interval = interval_ms.unwrap_or(core_monitor::DEFAULT_POLL_INTERVAL_MS);
+    if !(MIN_INTERVAL_MS..=60_000).contains(&interval) {
+        return Err("轮询间隔须在 100 到 60000 毫秒之间".into());
+    }
 
     {
         let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
@@ -468,17 +476,21 @@ pub fn monitor_start(
         if st.loaded.is_none() {
             return Err("还没有扫描结果：请先扫描一次，监控需要在索引树上注册目标".into());
         }
+        if hub.is_running() { return Err("已经在监控中".into()); }
+        hub.stop.store(false, Ordering::Release);
+        // 与 scan_start 在同一把状态锁下占用会话，两个启动请求不能交错。
+        hub.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "已经在监控中".to_string())?;
     }
 
     // 标记为运行中（真正的线程在下面起来）。放在这里而不是线程里，
     // 是为了让「两个请求同时进来」的竞态被这一层挡住。
-    hub.running.store(true, Ordering::Release);
-    hub.stop.store(false, Ordering::Release);
     {
         let mut r = hub.ring.lock().unwrap_or_else(|e| e.into_inner());
         *r = Ring::default();
     }
     *hub.info.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *hub.generation.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *hub.started.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 
     let plan = Plan {
@@ -491,7 +503,12 @@ pub fn monitor_start(
     };
 
     let hub2 = hub.inner().clone();
-    std::thread::spawn(move || run(app, hub2, plan));
+    std::thread::Builder::new().name("filewatch-monitor".into())
+        .spawn(move || run(app, hub2, plan))
+        .map_err(|e| {
+            hub.running.store(false, Ordering::Release);
+            format!("无法启动监控线程：{e}")
+        })?;
     Ok(())
 }
 
@@ -539,7 +556,7 @@ pub fn monitor_alerts(hub: State<'_, Arc<MonitorHub>>, limit: Option<usize>) -> 
         .iter()
         .rev()
         .take(n)
-        .map(|a| alert_row(a.seq, a.at_ms, &a.alert))
+        .map(|a| { let mut row = alert_row(a.seq, a.at_ms, &a.alert); row.time_ms = a.time_ms; row })
         .collect()
 }
 
@@ -685,8 +702,9 @@ fn absorb(
     }
     ring.queue_dropped = ring.queue_dropped.max(dropped);
     ring.still_pending = out.still_pending;
+    ring.elapsed_ms = elapsed_ms;
 
-    let changed = !rows.is_empty() || !alert_rows.is_empty() || out.backpressure;
+    let changed = out.applied > 0;
     let tick = MonitorTick {
         elapsed_ms,
         applied: out.applied,
@@ -700,12 +718,68 @@ fn absorb(
         total_events: ring.total_events,
         total_alerts: ring.total_alerts,
         backpressure: out.backpressure,
+        backpressure_total: ring.backpressure,
+        queue_dropped: ring.queue_dropped,
+        evicted: ring.evicted,
+        error: ring.error.clone(),
         still_pending: ring.still_pending,
         // 由调用方盖章（只有它知道代数计数器）
         generation: 0,
         totals,
     };
     (tick, changed)
+}
+
+fn path_key(path: &str) -> String {
+    path.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+fn path_within(path: &str, root: &str) -> bool {
+    let path = path_key(path);
+    let root = path_key(root);
+    !root.is_empty() && (path == root || path.starts_with(&(root + "\\")))
+}
+
+/// 监控目标必须精确命中真实目录，不能把输错的路径回退到整个盘根。
+fn exact_target(session: &Session, path: &str) -> Option<u32> {
+    let key = path_key(path);
+    let remap = session.path_remap();
+    session.tree.arena.nodes.iter().enumerate().find_map(|(i, n)| {
+        if !n.in_use() || !n.is_dir() { return None; }
+        let p = session.tree.path_of(i as u32);
+        let real = remap.as_ref().map(|r| r.apply(&p)).unwrap_or(p);
+        (path_key(&real) == key).then_some(i as u32)
+    })
+}
+
+fn configure_session(session: &mut Session, plan: &Plan) -> Result<(), String> {
+    if !plan.targets.iter().any(|p| exact_target(session, p).is_some()) {
+        return Err("监控目标未精确匹配当前扫描中的目录，请先扫描目标所在目录".into());
+    }
+    // “扫描时同时建立监视”的会话默认不收集事件；复用时也要开启。
+    session.engine.cfg.collect_events = true;
+    session.cfg.engine.collect_events = true;
+    session.engine.rules.clear();
+    session.engine.alerts = core_monitor::alert::AlertSink::new(session.engine.cfg.alert_dedup_ms);
+    let log = match &plan.changelog {
+        Some(path) => Some(core_monitor::changelog::ChangeLog::open(path)
+            .map_err(|e| format!("无法写入变更流水 {}：{e}", path.display()))?),
+        None => None,
+    };
+    session.engine.changelog = log;
+    session.engine.cfg.write_changelog = plan.changelog.is_some();
+    session.cfg.engine.write_changelog = plan.changelog.is_some();
+    session.cfg.changelog_path = plan.changelog.clone();
+    Ok(())
+}
+
+fn close_session(session: &mut Session, now: u64) -> std::io::Result<core_monitor::TickOutcome> {
+    let result = session.shutdown(now);
+    // shutdown 后的句柄不可复用，重启需要重新扫描并建立来源。
+    session.watch.take();
+    session.incremental.take();
+    session.engine.changelog.take();
+    result
 }
 
 fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
@@ -738,12 +812,18 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
         let Some(l) = g.loaded.as_mut() else {
             return fail(&app, &hub, "会话不见了".into());
         };
-        let now = crate::commands::now_ms();
+        if let Err(e) = configure_session(&mut l.session, &plan) {
+            return fail(&app, &hub, e);
+        }
+        let now = core_io::util::unix_ms();
         let mut ok_paths = Vec::new();
         let mut missed = Vec::new();
         for t in &plan.targets {
-            match l.session.add_target_by_path(t, plan.rules.clone(), now) {
-                Some(_) => ok_paths.push(t.clone()),
+            match exact_target(&l.session, t) {
+                Some(node) => {
+                    l.session.add_target(node, t.clone(), plan.rules.clone(), now);
+                    ok_paths.push(t.clone());
+                }
                 None => missed.push(t.clone()),
             }
         }
@@ -766,7 +846,7 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
             let cl_s = cl.to_string_lossy().to_string();
             if let Some(hit) = ok_paths
                 .iter()
-                .find(|p| cl_s.to_lowercase().starts_with(&p.to_lowercase()))
+                .find(|p| path_within(&cl_s, p))
             {
                 warnings.push(format!(
                     "变更流水写在被监视目录内部（{cl_s} ← {hit}）：日志自身的增长会触发阈值规则"
@@ -788,7 +868,7 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
                 .collect(),
             backend: l.session.backend.label_cn().to_string(),
             incremental: l.session.incremental_source_cn().to_string(),
-            started_ms: now_ms(),
+            started_ms: core_io::util::unix_ms(),
             interval_ms: plan.interval_ms,
             changelog: l
                 .session
@@ -806,7 +886,7 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
 
     // 轮询循环
     let t0 = Instant::now();
-    let epoch0 = now_ms();
+    let epoch0 = core_io::util::unix_ms();
     let mut last_ckpt = Instant::now();
 
     loop {
@@ -825,17 +905,24 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
             };
             let Some(l) = guard.loaded.as_mut() else { break };
             let mut r = hub.ring.lock().unwrap_or_else(|e| e.into_inner());
-            poll_once(&mut l.session, &mut r, elapsed, now)
+            let result = poll_once(&mut l.session, &mut r, elapsed, now);
+            if result.as_ref().map(|(_, changed)| *changed).unwrap_or(false) {
+                // 索引与代数必须在同一把状态锁下发布，避免读取到旧缓存。
+                gen_arc.fetch_add(1, Ordering::AcqRel);
+            }
+            result
         };
 
-        if let Some((payload, changed)) = step {
-            if changed {
-                // 代数 +1：界面据此知道索引变了、面积图该重画
-                let g = gen_arc.fetch_add(1, Ordering::AcqRel) + 1;
-                let mut t = payload;
-                t.generation = g;
-                let _ = app.emit("monitor:tick", t);
+        if let Some((payload, _)) = step {
+            let mut t = payload;
+            t.generation = gen_arc.load(Ordering::Acquire);
+            // 空闲时也报告心跳：运行时间、待合并数量与错误状态仍需更新。
+            // 阈值命中：系统通知 + 托盘闪动 + 托盘菜单记一条。
+            // 放在 emit 之前 —— emit 把 t 按值吃掉，先取出来才拿得到这句话。
+            if let Some(note) = t.notification.clone() {
+                crate::tray::notify_alert(&app, &note);
             }
+            let _ = app.emit("monitor:tick", t);
 
             if last_ckpt.elapsed() >= Duration::from_millis(CHECKPOINT_MS) {
                 last_ckpt = Instant::now();
@@ -849,9 +936,15 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
                     }
                 }
             }
+        } else {
+            // 出错不能一直显示“监控中”并空转，正常走收尾并报告错误。
+            break;
         }
 
-        std::thread::sleep(Duration::from_millis(plan.interval_ms));
+        let deadline = Instant::now() + Duration::from_millis(plan.interval_ms);
+        while !hub.stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25)));
+        }
     }
 
     // 收尾：吐完 debounce 池里剩下的事件、保存游标
@@ -860,7 +953,7 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
         if let Ok(mut g) = handle.inner().lock() {
             if let Some(l) = g.loaded.as_mut() {
                 let now = epoch0 + t0.elapsed().as_millis() as u64;
-                match l.session.shutdown(now) {
+                match close_session(&mut l.session, now) {
                     Ok(out) => {
                         // 与轮询那条路走**同一个**记账函数：收尾这几条变更
                         // 的计数口径不能跟平时不一样
@@ -873,7 +966,13 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
                         };
                         let dropped = l.session.engine.stats.queue_dropped;
                         let mut r = hub.ring.lock().unwrap_or_else(|x| x.into_inner());
-                        absorb(&l.session, &mut r, &out, elapsed, totals, dropped);
+                        let (mut tick, _) = absorb(&l.session, &mut r, &out, elapsed, totals, dropped);
+                        tick.generation = gen_arc.fetch_add(1, Ordering::AcqRel) + 1;
+                        // 收尾时也可能吐出预警（debounce 池里的最后几条）
+                        if let Some(note) = tick.notification.clone() {
+                            crate::tray::notify_alert(&app, &note);
+                        }
+                        let _ = app.emit("monitor:tick", tick);
                     }
                     Err(e) => {
                         let mut r = hub.ring.lock().unwrap_or_else(|x| x.into_inner());
@@ -882,9 +981,11 @@ fn run(app: AppHandle, hub: Arc<MonitorHub>, plan: Plan) {
                 }
             }
         }
-        gen_arc.fetch_add(1, Ordering::AcqRel);
     }
 
+    // 发布停止快照期间阻止新一次启动，否则旧 stopped 可能带上新会话的 ring。
+    let handle = app.state::<Shared>();
+    let _guard = handle.inner().lock().unwrap_or_else(|e| e.into_inner());
     hub.running.store(false, Ordering::Release);
     let _ = app.emit("monitor:stopped", hub.snapshot());
 }
@@ -907,7 +1008,9 @@ fn ensure_source(app: &AppHandle, plan: &Plan) -> Result<bool, String> {
             .loaded
             .as_ref()
             .ok_or_else(|| "会话不见了".to_string())?;
-        l.session.incremental.is_none() && l.session.watch.is_none()
+        (l.session.incremental.is_none() && l.session.watch.is_none())
+            || (plan.create_journal && !l.session.cfg.allow_create_journal
+                && !l.session.cfg.force_traverse && l.session.incremental.is_none())
     };
     if !need_reopen {
         return Ok(false);
@@ -965,6 +1068,9 @@ fn ensure_source(app: &AppHandle, plan: &Plan) -> Result<bool, String> {
 
     let t0 = Instant::now();
     let session = core_scan::Session::open(cfg, progress).map_err(|e| format!("重新扫描失败：{e}"))?;
+    if session.incremental.is_none() && session.watch.is_none() {
+        return Err(format!("无法建立实时监视：{}", session.warnings.join("；")));
+    }
     let summary = crate::commands::summarize(&session, t0.elapsed().as_millis() as u64);
 
     let handle = app.state::<Shared>();
@@ -988,6 +1094,66 @@ fn fail(app: &AppHandle, hub: &Arc<MonitorHub>, msg: String) {
     }
     hub.running.store(false, Ordering::Release);
     let _ = app.emit("monitor:error", msg);
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn path_boundaries_and_idle_clock() {
+        assert!(path_within(r"C:\logs\today.jsonl", r"c:/logs/"));
+        assert!(!path_within(r"C:\logs-old\today.jsonl", r"C:\logs"));
+        assert!(!path_within(r"C:\logs", ""));
+        let hub = MonitorHub::new();
+        *hub.started.lock().unwrap() = Some(Instant::now());
+        hub.ring.lock().unwrap().elapsed_ms = 123;
+        assert_eq!(hub.snapshot().elapsed_ms, 123, "stopped runtime must be frozen");
+    }
+
+    #[test]
+    fn watched_scan_collects_rows_and_stop_allows_a_fresh_restart() {
+        let owned = core_io::test_dir::TestDir::new("gui-monitor-restart").unwrap();
+        let root = owned.path().to_path_buf();
+        std::fs::write(root.join("seed.txt"), b"seed").unwrap();
+        let cfg = SessionConfig {
+            scan_root: Some(root.clone()), force_traverse: true,
+            allow_traverse_watch: true, changelog_path: None,
+            engine: core_monitor::EngineConfig {
+                collect_events: false, write_changelog: false,
+                debounce: core_monitor::debounce::DebounceConfig {
+                    window_ms: 30, ..Default::default()
+                }, ..Default::default()
+            }, ..Default::default()
+        };
+        let plan = Plan {
+            targets: vec![root.to_string_lossy().into_owned()], rules: vec![],
+            rule_texts: vec![], changelog: None, interval_ms: 100, create_journal: false,
+        };
+        let mut session = Session::open(cfg.clone(), |_, _, _| {}).unwrap();
+        assert!(session.watch.is_some());
+        assert!(exact_target(&session, &root.join("missing").to_string_lossy()).is_none());
+        assert!(exact_target(&session, &root.join("seed.txt").to_string_lossy()).is_none());
+        for round in 0..2 {
+            configure_session(&mut session, &plan).unwrap();
+            assert!(session.engine.cfg.collect_events);
+            let file = format!("round-{round}.txt");
+            std::fs::write(root.join(&file), b"new").unwrap();
+            let start = Instant::now();
+            let epoch = core_io::util::unix_ms();
+            let mut ring = Ring::default();
+            while start.elapsed() < Duration::from_secs(3) {
+                let elapsed = start.elapsed().as_millis() as u64;
+                poll_once(&mut session, &mut ring, elapsed, epoch + elapsed).unwrap();
+                if ring.changes.iter().any(|row| row.ev.name == file) { break; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ring.changes.iter().any(|row| row.ev.name == file), "round {round} received no event");
+            close_session(&mut session, epoch + 4000).unwrap();
+            assert!(session.watch.is_none() && session.incremental.is_none());
+            if round == 0 { session = Session::open(cfg.clone(), |_, _, _| {}).unwrap(); }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1053,6 +1219,17 @@ mod tests {
         assert!(rows.iter().all(|x| x.kind == "created"));
     }
 
+    #[test]
+    fn local_clock_timestamp_is_stable_when_history_is_backfilled() {
+        let mut ring = Ring::default();
+        let before = core_io::util::unix_ms();
+        let live = ring.push_change(1234, ev(EventKind::Modified), r"C:\a.txt".into());
+        assert!(live.time_ms >= before && live.time_ms <= core_io::util::unix_ms());
+        ring.changes.back_mut().unwrap().time_ms = 1_700_000_000_123;
+        assert_eq!(ring.tail(1, None)[0].time_ms, 1_700_000_000_123, "回填不能把时间改为当前查询时间");
+        assert_eq!(ring.tail(1, None)[0].at_ms, 1234);
+    }
+
     /// 行里的 `size_text` 必须与 CLI 同源（`event_size_text`），
     /// 否则同一条变更在终端与界面上数字不一样。
     #[test]
@@ -1114,8 +1291,8 @@ mod tests {
     /// 本机没有管理员权限，这恰好也是普通用户的实际路径。
     #[test]
     fn real_directory_change_reaches_the_ring() {
-        let dir = std::env::temp_dir().join(format!("fw_gui_mon_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("fw-gui-mon").unwrap();
+        let dir = owned.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("seed.txt"), b"seed").unwrap();
 
@@ -1137,7 +1314,7 @@ mod tests {
 
         let mut ring = Ring::default();
         let t0 = Instant::now();
-        let epoch = now_ms();
+        let epoch = core_io::util::unix_ms();
 
         // 真实变更：新建 + 追加写
         std::fs::write(dir.join("added.bin"), vec![b'x'; 4096]).unwrap();
@@ -1195,6 +1372,5 @@ mod tests {
         assert_eq!(tick.totals.files, s.tree.file_count);
         assert!(tick.totals.logical > 0, "树上应当有文件字节数");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

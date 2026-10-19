@@ -268,8 +268,8 @@ mod tests {
 
     #[test]
     fn writes_and_reads_back() {
-        let dir = std::env::temp_dir().join(format!("fw_changelog_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("fw-changelog-test").unwrap();
+        let dir = owned.path().to_path_buf();
         let path = dir.join("changelog.jsonl");
 
         {
@@ -292,13 +292,12 @@ mod tests {
             Some("deleted")
         );
 
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rotation_keeps_one_generation() {
-        let dir = std::env::temp_dir().join(format!("fw_rotate_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("fw-rotate-test").unwrap();
+        let dir = owned.path().to_path_buf();
         let path = dir.join("changelog.jsonl");
 
         let mut log = ChangeLog::open(&path).unwrap();
@@ -316,19 +315,17 @@ mod tests {
         let rotated = fs::read_to_string(path.with_extension("1.jsonl")).unwrap();
         assert!(rotated.contains("created"));
 
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn append_creates_parent_dir() {
-        let dir = std::env::temp_dir().join(format!("fw_mkdir_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("fw-mkdir-test").unwrap();
+        let dir = owned.path().to_path_buf();
         let path = dir.join("nested").join("deep").join("log.jsonl");
         let mut log = ChangeLog::open(&path).unwrap();
         log.append(&ev(EventKind::Created), "p").unwrap();
         log.flush().unwrap();
         assert!(path.exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// 体积说法四条规则。这些数字会**同时**出现在 CLI 的变更行和界面的

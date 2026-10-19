@@ -7,7 +7,7 @@
 //! 这些用例全部**不要求管理员权限**：降级路径本来就是「普通用户也能用」
 //! 那条路，正好用来在无人值守的 CI 上验收。
 
-use std::path::PathBuf;
+use core_io::test_dir::TestDir;
 use std::process::{Command, Output};
 
 fn bin() -> Command {
@@ -30,16 +30,16 @@ fn stderr(o: &Output) -> String {
 }
 
 /// 造一个带子目录与文件的临时目录。
-fn fixture(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("fw_e2e_{}_{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+fn fixture(tag: &str) -> TestDir {
+    let owned = TestDir::new(tag).unwrap();
+    let base = owned.path();
     std::fs::create_dir_all(base.join("docs")).unwrap();
     std::fs::create_dir_all(base.join("media")).unwrap();
     std::fs::write(base.join("docs").join("readme.md"), vec![b'r'; 1500]).unwrap();
     std::fs::write(base.join("docs").join("notes.txt"), vec![b'n'; 300]).unwrap();
     std::fs::write(base.join("media").join("clip.mp4"), vec![b'm'; 90_000]).unwrap();
     std::fs::write(base.join("root.bin"), vec![b'x'; 40]).unwrap();
-    base
+    owned
 }
 
 #[test]
@@ -91,7 +91,8 @@ fn volumes_reports_at_least_one_volume() {
 
 #[test]
 fn scan_degraded_json_on_fixture() {
-    let base = fixture("scan");
+    let owned = fixture("scan");
+    let base = owned.path();
     let root = format!("--root={}", base.to_string_lossy());
     let o = run(&["scan", "C:", &root, "--json", "--top=5"]);
     assert!(o.status.success(), "stderr={}", stderr(&o));
@@ -110,12 +111,12 @@ fn scan_degraded_json_on_fixture() {
     // Top 列表里最大的是 clip.mp4
     assert!(s.contains("clip.mp4"), "Top-N 缺少最大文件：{}", s);
 
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
 fn scan_layout_preview_renders_grid() {
-    let base = fixture("layout");
+    let owned = fixture("layout");
+    let base = owned.path();
     let root = format!("--root={}", base.to_string_lossy());
     let o = run(&["scan", "C:", &root, "--layout=70x20", "--top=0", "--exts=0"]);
     assert!(o.status.success(), "stderr={}", stderr(&o));
@@ -126,12 +127,12 @@ fn scan_layout_preview_renders_grid() {
     assert!(s.contains('+'), "网格未渲染：{}", s);
     assert!(s.contains("同层最大重叠"), "{}", s);
 
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
 fn scan_ext_and_dedup_sections() {
-    let base = fixture("ext");
+    let owned = fixture("ext");
+    let base = owned.path();
     let root = format!("--root={}", base.to_string_lossy());
     let o = run(&["scan", "C:", &root, "--top=0", "--exts=10", "--dedup"]);
     assert!(o.status.success(), "stderr={}", stderr(&o));
@@ -139,7 +140,6 @@ fn scan_ext_and_dedup_sections() {
     assert!(s.contains("扩展名 Top"), "{}", s);
     assert!(s.contains("口径差异说明"), "{}", s);
 
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
@@ -158,7 +158,8 @@ fn invalid_rule_is_rejected() {
 
 #[test]
 fn monitor_detects_new_file_end_to_end() {
-    let base = fixture("live");
+    let owned = fixture("live");
+    let base = owned.path();
     let root = base.to_string_lossy().to_string();
 
     // 4 秒监控；期间由本线程制造变更。
@@ -184,7 +185,7 @@ fn monitor_detects_new_file_end_to_end() {
     std::thread::sleep(std::time::Duration::from_millis(700));
     std::fs::write(base.join("incoming").join("payload.dat"), vec![b'q'; 50_000]).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    std::fs::remove_file(base.join("incoming").join("payload.dat")).unwrap();
+    owned.remove_file("incoming/payload.dat").unwrap();
 
     let out = child.wait_with_output().expect("monitor 未能正常结束");
     let s = stdout(&out);
@@ -200,7 +201,6 @@ fn monitor_detects_new_file_end_to_end() {
     assert!(s.contains("删除"), "未捕获删除事件：\n{}", s);
     assert!(s.contains("payload.dat"), "事件里没有目标文件：\n{}", s);
 
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

@@ -18,6 +18,7 @@ pub mod aggregate;
 pub mod arena;
 pub mod ext_stats;
 pub mod hardlink;
+pub mod search;
 pub mod string_pool;
 pub mod tree;
 
@@ -27,5 +28,6 @@ pub use aggregate::{
 pub use arena::{recno_of, Arena, Node, INVALID_PARENT, RECNO_MASK};
 pub use ext_stats::{ExtensionTable, ExtStat};
 pub use hardlink::{build_report, DedupReport};
+pub use search::{search, Hit, MatchMode, Outcome, Query, Scope, SimpleRegex};
 pub use string_pool::StringPool;
 pub use tree::{ChildIndex, Tree};

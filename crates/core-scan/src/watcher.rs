@@ -201,8 +201,6 @@ impl WatcherSession {
             self.handle(ev, tree, engine, now_ms);
         }
 
-        self.reconcile(tree, now_ms);
-
         // 回读真实大小的闭包：查登记过的路径，不借用 tree
         let paths = &self.probe_paths;
         let cluster = self.cluster;
@@ -214,16 +212,27 @@ impl WatcherSession {
         // 只按 TTL 过期淘汰，绝不无条件清空 —— 见 ProbeEntry 的说明
         let ttl = probe_ttl_ms(engine.cfg.debounce.window_ms);
         self.probe_paths
-            .retain(|_, e| now_ms.saturating_sub(e.at_ms) < ttl);
+            .retain(|idx, e| {
+                engine.debouncer.has_pending(make_frn(*idx as u64, 0))
+                    || now_ms.saturating_sub(e.at_ms) < ttl
+            });
+        self.reconcile(tree, engine, now_ms);
         out
     }
 
     /// 收尾：把 debounce 池里剩余事件全部吐出。
     pub fn flush(&mut self, tree: &mut Tree, engine: &mut MonitorEngine, now_ms: u64) -> TickOutcome {
         let mut evs: Vec<FsEvent> = Vec::with_capacity(256);
-        self.watcher.drain(65_536, &mut evs);
-        for ev in evs.iter() {
-            self.handle(ev, tree, engine, now_ms);
+        // Session 收尾先停止生产者，再按批吃完队列；限内存而不截断剩余通知。
+        loop {
+            evs.clear();
+            if self.watcher.drain(4096, &mut evs) == 0 {
+                break;
+            }
+            self.stats.notifications += evs.len() as u64;
+            for ev in evs.iter() {
+                self.handle(ev, tree, engine, now_ms);
+            }
         }
         let paths = &self.probe_paths;
         let cluster = self.cluster;
@@ -275,7 +284,11 @@ impl WatcherSession {
         };
 
         let abs = self.abs_of(&ev.rel);
-        let md = std::fs::metadata(&abs).ok();
+        let md = std::fs::symlink_metadata(&abs).ok();
+        if md.as_ref().map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0).unwrap_or(false) {
+            self.stats.skipped += 1;
+            return;
+        }
         let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let name = last_component(&ev.rel);
         let idx = self.alloc_idx(tree);
@@ -287,6 +300,7 @@ impl WatcherSession {
         if is_dir {
             // ① 立刻物化占位节点：父链必须完整，否则子文件的 delta 传不上来
             tree.upsert_incremental(idx, parent_idx, 0, true, 0, 0, mtime, name);
+            tree.dir_count = tree.dir_count.saturating_add(1);
             self.placeholders.push(Placeholder {
                 idx,
                 key: key.clone().into_boxed_str(),
@@ -336,7 +350,7 @@ impl WatcherSession {
             let prefix = format!("{}\\", key);
             self.map.retain(|k, _| !k.starts_with(prefix.as_str()));
         }
-        self.placeholders.retain(|p| p.idx != idx);
+        // 占位目录仍交给对账：创建+删除可能被防抖抵消，树节点需另行清理。
 
         self.stats.removed += 1;
         engine.ingest(
@@ -440,19 +454,22 @@ impl WatcherSession {
         let parent_idx = self
             .parent_of(&new_key)
             .unwrap_or(INVALID_PARENT);
+        let new_abs = self.abs_of(&ev.rel);
 
         // 目录整体搬家 → 子树的键全部要跟着改前缀
         if tree.node(idx).map(|n| n.is_dir()).unwrap_or(false) {
-            self.rekey(&old_key, &new_key);
-            for p in self.placeholders.iter_mut() {
-                if let Some(tail) = p.key.strip_prefix(old_key.as_ref()) {
-                    if tail.starts_with('\\') {
-                        p.key = format!("{}{}", new_key, tail).into_boxed_str();
-                    }
-                }
-            }
+            self.stats.rekeyed += remap_directory_paths(
+                &mut self.map,
+                &mut self.placeholders,
+                &mut self.probe_paths,
+                &old_key,
+                &new_key,
+                &new_abs,
+                now_ms,
+            );
         } else {
             self.map.remove(old_key.as_ref());
+            self.note_probe(idx, new_abs, now_ms);
         }
         self.map.insert(new_key.into_boxed_str(), idx);
 
@@ -470,49 +487,39 @@ impl WatcherSession {
         );
     }
 
-    /// 把 `old_key` 及其所有子孙的键改写成 `new_key` 前缀。
-    ///
-    /// O(映射规模)，只在**目录搬家**时触发——这类操作本来就不频繁，
-    /// 换来的是「移动一个大目录后立刻还能定位到里面的文件」。
-    fn rekey(&mut self, old_key: &str, new_key: &str) {
-        let prefix = format!("{}\\", old_key);
-        let moved: Vec<(Box<str>, u32)> = self
-            .map
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix.as_str()))
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        for (k, v) in moved {
-            let tail = &k[old_key.len()..];
-            self.map.remove(&k);
-            self.map.insert(format!("{}{}", new_key, tail).into_boxed_str(), v);
-            self.stats.rekeyed += 1;
-        }
-    }
-
     /// 对账：占位目录过了窗口期还在索引里，就回查磁盘确认它真的存在。
     ///
     /// 不存在的（"创建 + 删除"在同一窗口内互相抵消）要摘掉节点并做负向上传，
     /// 否则会留下一个体积为 0 的幽灵目录。
-    fn reconcile(&mut self, tree: &mut Tree, now_ms: u64) {
+    fn reconcile(&mut self, tree: &mut Tree, engine: &MonitorEngine, now_ms: u64) {
         if self.placeholders.is_empty() {
             return;
         }
         let mut keep: Vec<Placeholder> = Vec::with_capacity(self.placeholders.len());
         for p in std::mem::take(&mut self.placeholders) {
-            // 键已被改写/移除 → 说明节点本身已经被别的事件处理过
-            if self.map.get(p.key.as_ref()) != Some(&p.idx) {
-                continue;
-            }
-            if now_ms.saturating_sub(p.at_ms) < RECONCILE_AFTER_MS {
+            if now_ms.saturating_sub(p.at_ms) < RECONCILE_AFTER_MS
+                || engine.debouncer.has_pending(make_frn(p.idx as u64, 0))
+            {
                 keep.push(p);
                 continue;
             }
-            if Path::new(p.key.as_ref()).exists() {
-                continue; // 真的存在，不再跟踪
+            let still_mapped = self.map.get(p.key.as_ref()) == Some(&p.idx);
+            if still_mapped {
+                match std::fs::symlink_metadata(p.key.as_ref()) {
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        // 权限不足或短暂共享冲突不能被当作删除。
+                        keep.push(p);
+                        continue;
+                    }
+                }
             }
             if let Some((size, alloc)) = tree.remove_node(p.idx) {
-                self.map.remove(p.key.as_ref());
+                tree.dir_count = tree.dir_count.saturating_sub(1);
+                if still_mapped {
+                    self.map.remove(p.key.as_ref());
+                }
                 if size != 0 || alloc != 0 {
                     propagate_delta(tree, p.idx, -(size as i64), -(alloc as i64), |_, _| {});
                 }
@@ -605,6 +612,41 @@ impl std::fmt::Debug for WatcherSession {
 
 // ── 纯函数工具（可单测） ────────────────────────────────────────────────────
 
+/// 目录改名时同步更新目录自身、后代、占位目录与待回读路径。
+/// 前缀必须位于路径组件边界，避免误改同名前缀的相邻目录。
+fn remap_directory_paths(
+    map: &mut HashMap<Box<str>, u32>,
+    placeholders: &mut [Placeholder],
+    probes: &mut HashMap<u32, ProbeEntry>,
+    old_key: &str,
+    new_key: &str,
+    new_abs: &str,
+    now_ms: u64,
+) -> u64 {
+    let prefix = format!("{}\\", old_key);
+    let moved: Vec<(Box<str>, u32)> = map
+        .iter()
+        .filter(|(key, _)| key.as_ref() == old_key || key.starts_with(&prefix))
+        .map(|(key, idx)| (key.clone(), *idx))
+        .collect();
+    for (key, idx) in &moved {
+        let tail = &key[old_key.len()..];
+        map.remove(key.as_ref());
+        map.insert(format!("{}{}", new_key, tail).into_boxed_str(), *idx);
+        if let Some(probe) = probes.get_mut(idx) {
+            probe.abs = format!("{}{}", new_abs, tail);
+            probe.at_ms = now_ms;
+        }
+    }
+    for placeholder in placeholders {
+        if placeholder.key.as_ref() == old_key || placeholder.key.starts_with(&prefix) {
+            placeholder.key = format!("{}{}", new_key, &placeholder.key[old_key.len()..])
+                .into_boxed_str();
+        }
+    }
+    moved.len() as u64
+}
+
 /// `c:\a\b\c.txt` → `c:\a\b`
 pub fn parent_key(key: &str) -> Option<&str> {
     // 盘根（`c:\`）没有父目录
@@ -649,8 +691,8 @@ fn probe_ttl_ms(window_ms: u64) -> u64 {
 ///
 /// 目录返回 `None`：目录的体积是聚合值，绝不能由外向内覆写。
 pub fn probe_path(abs: &str, cluster: u64) -> Option<(u64, u64, i64)> {
-    let md = std::fs::metadata(abs).ok()?;
-    if md.is_dir() {
+    let md = std::fs::symlink_metadata(abs).ok()?;
+    if md.is_dir() || md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return None;
     }
     let len = md.len();
@@ -678,6 +720,35 @@ mod tests {
     // 放进 `mod tests` 而不是文件顶部，是因为 `#[cfg(test)]` 模块在 `cargo build`
     // 下根本不参与编译，顶部导入会变成 dead import 并触发 unused_imports 警告。
     use crate::dirwatch::normalize_root;
+
+    #[test]
+    fn directory_rename_updates_all_path_registries_on_component_boundaries() {
+        let mut map: HashMap<Box<str>, u32> = [
+            (r"c:\root\old".into(), 10),
+            (r"c:\root\old\child.bin".into(), 11),
+            (r"c:\root\older\keep.bin".into(), 12),
+        ].into_iter().collect();
+        let mut placeholders = vec![Placeholder {
+            idx: 10,
+            key: r"c:\root\old".into(),
+            at_ms: 1000,
+        }];
+        let mut probes = HashMap::from([
+            (11, ProbeEntry { abs: r"C:\root\old\child.bin".into(), at_ms: 1000 }),
+            (12, ProbeEntry { abs: r"C:\root\older\keep.bin".into(), at_ms: 1000 }),
+        ]);
+        let count = remap_directory_paths(&mut map, &mut placeholders, &mut probes,
+            r"c:\root\old", r"c:\root\new", r"C:\root\New", 2000);
+        assert_eq!(count, 2);
+        assert!(!map.contains_key(r"c:\root\old"));
+        assert_eq!(map.get(r"c:\root\new"), Some(&10));
+        assert_eq!(map.get(r"c:\root\new\child.bin"), Some(&11));
+        assert_eq!(map.get(r"c:\root\older\keep.bin"), Some(&12));
+        assert_eq!(placeholders[0].key.as_ref(), r"c:\root\new");
+        assert_eq!(probes[&11].abs, r"C:\root\New\child.bin");
+        assert_eq!(probes[&11].at_ms, 2000);
+        assert_eq!(probes[&12].abs, r"C:\root\older\keep.bin");
+    }
 
     #[test]
     fn parent_key_handles_drive_root() {
@@ -710,9 +781,8 @@ mod tests {
 
     #[test]
     fn probe_path_reports_allocated_not_smaller_than_logical() {
-        let dir = std::env::temp_dir().join(format!("fw_probe_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let owned = core_io::test_dir::TestDir::new("probe").unwrap();
+        let dir = owned.path().to_path_buf();
         let f = dir.join("x.bin");
         std::fs::write(&f, vec![b'z'; 100]).unwrap();
 
@@ -725,7 +795,6 @@ mod tests {
         // 不存在的路径
         assert!(probe_path(r"C:\definitely\not\here_zzz", 4096).is_none());
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

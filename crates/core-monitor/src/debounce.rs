@@ -134,6 +134,10 @@ impl Debouncer {
         self.slots.len()
     }
 
+    pub fn has_pending(&self, frn: u64) -> bool {
+        self.index.contains_key(&frn)
+    }
+
     /// 投递一个原始事件。
     pub fn offer(&mut self, raw: RawEvent, now_ms: u64) {
         self.stats.offered += 1;
@@ -149,6 +153,7 @@ impl Debouncer {
         // ② 回收站：重命名为 $Rxxxx → 当作删除
         if self.cfg.recycle_bin_as_delete
             && kind == EventKind::Renamed
+            && raw.reason & normalize::USN_REASON_RENAME_NEW_NAME != 0
             && normalize::is_recycle_bin_content(&raw.name)
         {
             kind = EventKind::Deleted;
@@ -206,6 +211,7 @@ impl Debouncer {
         slot.ev.merged += 1;
         slot.ev.usn = raw.usn;
         slot.ev.reason |= raw.reason;
+        slot.ev.is_dir |= raw.is_dir();
         // 父指针只允许被**有效**值覆盖。
         //
         // FRN 低 48 位是 MFT 记录号，`u32::MAX` 是「无父」哨兵
@@ -225,18 +231,25 @@ impl Debouncer {
         if is_old_name {
             // 记录旧名，等配对
             slot.pending_old_name = Some(raw.name.clone());
-            slot.ev.old_name = Some(raw.name.clone());
-            // 如果这之前已经产生了新名（乱序），保持 Renamed
-            if prev_kind == EventKind::Renamed {
-                return;
+            if slot.ev.old_name.is_none() {
+                slot.ev.old_name = Some(raw.name.clone());
             }
+            // 旧名不是一次新的状态转换，尤其不能让尚未入树的 Created 丢失。
+            return;
         } else {
             slot.ev.name = raw.name.clone();
             // ④ rename 配对：旧名 + 新名 → 合成一条 Renamed
-            if kind == EventKind::Renamed || slot.pending_old_name.is_some() {
+            if raw.reason & normalize::USN_REASON_RENAME_NEW_NAME != 0 {
                 if let Some(old) = slot.pending_old_name.take() {
-                    slot.ev.old_name = Some(old);
-                    slot.ev.kind = EventKind::Renamed;
+                    if slot.ev.old_name.is_none() {
+                        slot.ev.old_name = Some(old);
+                    }
+                    slot.ev.kind = match (prev_kind, kind) {
+                        (EventKind::Created, EventKind::Deleted) => EventKind::Unknown,
+                        (EventKind::Created, _) => EventKind::Created,
+                        (EventKind::Deleted, _) => EventKind::Deleted,
+                        (_, k) => k,
+                    };
                     self.stats.rename_pairs += 1;
                     return;
                 }
@@ -262,12 +275,23 @@ impl Debouncer {
 
     /// 取出已「成熟」（距最近一次变更超过窗口）的事件。
     pub fn drain_matured(&mut self, now_ms: u64, out: &mut Vec<PendingEvent>) {
+        self.drain_matured_limited(now_ms, usize::MAX, out);
+    }
+
+    /// 达到本轮处理额度后保留其余事件，下一轮继续；不能截断已取出的事件。
+    pub fn drain_matured_limited(
+        &mut self,
+        now_ms: u64,
+        limit: usize,
+        out: &mut Vec<PendingEvent>,
+    ) {
         let window = self.cfg.window_ms;
         let mut keep: Vec<Slot> = Vec::with_capacity(self.slots.len());
+        let mut emitted = 0;
 
         for slot in self.slots.drain(..) {
             let matured = now_ms.saturating_sub(slot.ev.last_ms) >= window;
-            if matured {
+            if matured && (emitted < limit || slot.ev.kind == EventKind::Unknown) {
                 if slot.ev.kind == EventKind::Unknown {
                     self.stats.cancelled += 1;
                 } else {
@@ -275,6 +299,7 @@ impl Debouncer {
                         self.stats.unpaired_renames += 1;
                     }
                     self.stats.emitted += 1;
+                    emitted += 1;
                     out.push(slot.ev);
                 }
             } else {
@@ -433,6 +458,60 @@ mod tests {
         assert_eq!(out[0].old_name.as_deref(), Some("old.txt"));
         assert_eq!(out[0].name, "new.txt");
         assert_eq!(d.stats().rename_pairs, 1);
+    }
+
+    #[test]
+    fn create_then_rename_keeps_create_and_final_name() {
+        let mut d = Debouncer::new(DebounceConfig::default());
+        d.offer(raw(7, USN_REASON_FILE_CREATE, "draft.txt"), 1000);
+        d.offer(raw(7, USN_REASON_RENAME_OLD_NAME, "draft.txt"), 1010);
+        d.offer(raw(7, USN_REASON_RENAME_NEW_NAME, "saved.txt"), 1020);
+        let out = drain(&mut d, 2000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, EventKind::Created);
+        assert_eq!(out[0].name, "saved.txt");
+    }
+
+    #[test]
+    fn paired_recycle_rename_remains_deleted() {
+        let mut d = Debouncer::new(DebounceConfig::default());
+        d.offer(raw(7, USN_REASON_RENAME_OLD_NAME, "old.txt"), 1000);
+        d.offer(raw(7, USN_REASON_RENAME_NEW_NAME, "$RABCDEF.txt"), 1010);
+        let out = drain(&mut d, 2000);
+        assert_eq!(out[0].kind, EventKind::Deleted);
+    }
+
+    #[test]
+    fn chained_renames_preserve_original_name() {
+        let mut d = Debouncer::new(DebounceConfig::default());
+        for (offset, reason, name) in [
+            (0, USN_REASON_RENAME_OLD_NAME, "a.txt"),
+            (10, USN_REASON_RENAME_NEW_NAME, "b.txt"),
+            (20, USN_REASON_RENAME_OLD_NAME, "b.txt"),
+            (30, USN_REASON_RENAME_NEW_NAME, "c.txt"),
+        ] {
+            d.offer(raw(7, reason, name), 1000 + offset);
+        }
+        let out = drain(&mut d, 2000);
+        assert_eq!(out[0].old_name.as_deref(), Some("a.txt"));
+        assert_eq!(out[0].name, "c.txt");
+    }
+
+    #[test]
+    fn bounded_drain_retains_mature_events() {
+        let mut d = Debouncer::new(DebounceConfig::default());
+        for frn in 1..=3 {
+            d.offer(raw(frn, USN_REASON_FILE_CREATE, "file.txt"), 1000);
+        }
+        let mut out = Vec::new();
+        d.drain_matured_limited(2000, 1, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(d.pending_len(), 2);
+        assert!(d.has_pending(2));
+        d.drain_matured_limited(2000, 1, &mut out);
+        d.drain_matured_limited(2000, 1, &mut out);
+        assert_eq!(out.iter().map(|e| e.frn).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(d.pending_len(), 0);
     }
 
     #[test]

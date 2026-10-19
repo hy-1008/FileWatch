@@ -13,6 +13,8 @@
 //! | [`dirwatch`] | `ReadDirectoryChangesW` 封装（降级模式的实时事件源） | 风险 R2 |
 //! | [`watcher`] | 路径事件 → FRN 事件的翻译层（含路径索引与对账） | 风险 R2 |
 //! | [`paths`] | 合成路径拼接 / 事件 → 可显示路径（CLI 与界面共用） | 显示与落盘一致性 |
+//! | [`dedup`] | 重复文件三级去重（体积 → 部分哈希 → 全哈希）+ 逐字节复核 | F12 |
+//! | [`snapshot`] | 扫描快照落盘 / 读取 + 两次快照的 diff | F11 |
 //! | [`incremental`] | USN 增量会话：拉页 → 归一化 → 回读大小 | M2 |
 //! | [`session`] | **统一入口**：选后端 → 全量 → 建增量 → 注册监控 | M1~M3 |
 //!
@@ -38,14 +40,21 @@
 //! 扫描完成再把游标对齐回「扫描开始前」。反过来的话，扫描过程中产生的
 //! 变更（尤其是扫描过该目录之后的写入）会被永久漏掉——见模块内注释。
 
+pub mod content;
+pub mod dedup;
 pub mod dirwatch;
 pub mod full_scan;
 pub mod incremental;
 pub mod paths;
 pub mod session;
+pub mod snapshot;
 pub mod traverse;
 pub mod watcher;
 
+pub use dedup::{
+    collect_candidates, find_duplicates, groups_to_csv, CandidateSet, ContentSource, DupCandidate,
+    DupGroup, DupOptions, DupProgress, DupReport, DupStage, FsSource,
+};
 pub use dirwatch::{parse_notifications, DirWatcher, FsEvent};
 pub use full_scan::{
     full_scan_mft, probe_volume, scan_physical_range, top_n_files_via_mft, ProbeReport, ScanOptions,
@@ -54,6 +63,10 @@ pub use full_scan::{
 pub use incremental::IncrementalSession;
 pub use paths::{event_path, join_path, raw_event_path};
 pub use session::{ScanBackend, ScanPhase, Session, SessionConfig};
+pub use snapshot::{
+    diff, rows_to_csv, signed_size, DiffKind, DiffOptions, DiffOrder, DiffReport, DiffRow,
+    SnapEntry, Snapshot, SnapshotOptions,
+};
 pub use traverse::{
     full_scan_traverse, full_scan_traverse_indexed, TraverseOptions, TraverseStats,
 };

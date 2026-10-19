@@ -4,101 +4,128 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FileWatch — 文件增量监控</title>
+  <meta name="color-scheme" content="dark light">
+  <script src="theme.js"></script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div id="app">
 
   <header class="topbar">
-    <div class="brand">FileWatch</div>
-
-    <!-- 口径与着色：全局开关，改动后只重画面积图，不重新扫描 -->
-    <label class="field">
-      <span>口径</span>
-      <select id="mode">
-        <option value="logical">逻辑大小</option>
-        <option value="allocated">占用大小</option>
-      </select>
-    </label>
-
-    <label class="field">
-      <span>着色</span>
-      <select id="shading">
-        <option value="ext">按文件类型</option>
-        <option value="depth">按目录深度</option>
-        <option value="age">按文件年龄</option>
-      </select>
-    </label>
-
-    <label class="field">
-      <span>细节</span>
-      <input id="detail" type="range" min="0" max="3" step="1" value="1">
-    </label>
-
-    <div class="spacer"></div>
-    <div id="backend-badge" class="badge">未扫描</div>
+    <div class="topbar-main">
+      <div class="brand">FileWatch</div>
+      <nav class="menubar" aria-label="主菜单">
+        <details class="menu" id="file-menu">
+          <summary>文件</summary>
+          <div class="menu-popup file-menu">
+            <button id="select-folder" type="button">选择文件夹…</button>
+            <button id="menu-scan" type="button">扫描当前目录</button>
+            <div class="menu-divider"></div>
+            <button id="menu-refresh" type="button">刷新磁盘列表</button>
+          </div>
+        </details>
+        <details class="menu" id="interface-menu">
+          <summary>界面</summary>
+          <div class="menu-popup interface-menu">
+            <label class="field"><span>主题</span><select id="theme-select" aria-label="主题">
+              <option value="system">系统</option><option value="light">浅色</option><option value="dark">深色</option>
+            </select></label>
+            <label class="field"><span>密度</span><select id="density-select" aria-label="密度">
+              <option value="compact">紧凑</option><option value="comfortable">舒适</option>
+            </select></label>
+            <label class="field"><span>布局</span><select id="layout-select" aria-label="布局">
+              <option value="full">完整布局</option><option value="focus">专注分析</option>
+            </select></label>
+            <div class="menu-divider"></div>
+            <label class="field"><span>着色</span><select id="shading">
+              <option value="ext">按文件类型</option><option value="depth">按目录深度</option><option value="age">按文件年龄</option>
+            </select></label>
+            <label class="field"><span>统计口径</span><select id="mode">
+              <option value="logical">逻辑大小</option><option value="allocated">占用大小</option>
+            </select></label>
+            <label class="field"><span>细节</span><input id="detail" aria-label="面积图细节" type="range" min="0" max="3" step="1" value="1"></label>
+          </div>
+        </details>
+        <!-- 模式：**开机自启**与**关闭软件**都在这里，和「界面」一样是个弹出面板。
+             它们都是"这个程序该怎么跑"的选择，不是一个随时要点的按钮 ——
+             开机自启的开关塞在顶栏时，用户要么看不见，要么误当成"立即启动"。
+             具体数字（采样倍率、行数倍率）**由后端下发**，这里只有三个名字。 -->
+        <details class="menu" id="mode-menu">
+          <summary>模式</summary>
+          <div class="menu-popup mode-menu">
+            <label class="field" title="轻量：极致省内存、按需加载；性能：自动异步懒加载 + 周期各盘扫描">
+              <span>运行模式</span><select id="profile" aria-label="运行模式">
+                <option value="balanced">标准</option><option value="lean">轻量</option><option value="performance">性能</option>
+              </select>
+            </label>
+            <div class="menu-divider"></div>
+            <!-- 开机自启的真相在注册表里（HKCU 的 Run 键），**不进偏好文件**：
+                 用户在任务管理器里关掉之后，偏好文件里还写着"开"就是骗人的显示。
+                 所以每次打开这个面板都重新问后端一次。 -->
+            <label class="check autostart-row" id="autostart-row">
+              <input id="autostart-toggle" type="checkbox">
+              <span>开机自启动</span>
+            </label>
+            <div class="menu-divider"></div>
+            <span class="menu-label">关闭软件</span>
+            <label class="check" title="关掉窗口但程序继续运行：监控不停，从托盘图标可以再叫出来">
+              <input type="radio" name="close-behavior" id="close-tray" value="tray">
+              <span>最小化到托盘（监控继续）</span>
+            </label>
+            <label class="check" title="常规退出：结束监控并退出所有进程">
+              <input type="radio" name="close-behavior" id="close-quit" value="quit" checked>
+              <span>关闭所有进程（退出）</span>
+            </label>
+          </div>
+        </details>
+      </nav>
+      <span class="spacer"></span>
+      <div id="heat-legend" class="heat hidden"><span>新</span><span id="heat-bar" class="heat-bar"></span><span>旧</span></div>
+      <span class="brand-caption">空间分析 · 实时监控</span>
+    </div>
   </header>
 
   <main>
-    <!-- ── 左栏：盘符 / 扫描 / 文件夹树 ─────────────────────────────── -->
-    <aside class="panel left">
-      <section class="block">
-        <h2>盘符 <button id="refresh-vols" class="mini">刷新</button></h2>
-        <div id="volumes" class="volumes"></div>
-        <div class="row">
-          <input id="custom-root" type="text" placeholder="或粘贴一个目录，如 D:\projects">
-          <button id="scan-root" class="primary">扫描</button>
-        </div>
-        <label class="check">
-          <input id="watch" type="checkbox">
-          <span>同时建立实时监视（F6，大目录会多占内存）</span>
-        </label>
-      </section>
-
+    <!-- ── 第 1 栏：盘符（一列，展示 + 选择） ──────────────────────────
+         盘符**自己占一栏**，不再和文件夹树堆在同一个 aside 里：堆在一起时
+         两个块都是"可被压扁"的 flex 项，窗口一矮（或挂载的卷一多）盘符卡片
+         就会溢出自己的块、盖到下面那棵树上 —— 实测出现过的重叠就是这么来的。
+         拆开之后：盘符列表自己滚动，粘贴目录 / 扫描固定在底部，两者互不影响。 -->
+    <aside class="panel drives">
       <section class="block grow">
-        <h2>文件夹树 <span id="tree-hint" class="hint"></span></h2>
+        <h2>盘符 <button id="refresh-vols" class="mini">刷新</button>
+          <!-- 折叠按钮固定在最右侧（`margin-left:auto`）：那个位置本身就是
+               「收起这一栏」的约定俗成。图标是一个 chevron，折叠后整个
+               rotate(180deg) 掉头指回去，所以只用一份图标、没有第二个字形。
+               折叠后腾出的宽度全部给文件夹树，中间区与右栏不动。 -->
+          <button id="drives-toggle" class="mini icon" type="button"
+                  aria-expanded="true" aria-label="折叠或展开盘符栏"
+                  title="折叠盘符栏（把宽度让给文件夹树）">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.9 3.4 5.1 8l4.8 4.6"/></svg>
+          </button>
+        </h2>
+        <div id="volumes" class="volumes"></div>
+      </section>
+      <!-- 这里原本有一块「扫描目录」输入框。它去掉了：盘符列表本身就是
+           "选扫描范围"的地方，再放一个输入框，两个入口会互相抢 —— 用户
+           填了框却点的是盘符，或者反过来。扫描入口现在只剩两处，且都不会
+           跟当前的视图打架：点盘符卡片，或者「文件 → 选择文件夹…」。 -->
+    </aside>
+
+    <!-- ── 第 2 栏：文件夹树（紧挨面积图左侧，导航用） ───────────────── -->
+    <aside class="panel left">
+      <div class="navigation-tabs" role="tablist" aria-label="导航功能">
+        <button id="nav-tree" class="tab on" role="tab" aria-selected="true" aria-controls="tree-pane" type="button">文件夹树</button>
+        <button id="nav-monitor" class="tab" role="tab" aria-selected="false" aria-controls="monitor" type="button">实时监控</button>
+      </div>
+      <section id="tree-pane" class="block grow" role="tabpanel" aria-labelledby="nav-tree">
+        <div class="tree-location"><input id="tree-path" type="text" aria-label="文件夹路径" placeholder="输入已扫描的文件夹路径"><button id="tree-go" type="button" title="前往文件夹" aria-label="前往文件夹">→</button></div>
         <div id="tree" class="tree"></div>
       </section>
-    </aside>
-
-    <!-- ── 中间：面积图 ─────────────────────────────────────────────── -->
-    <section class="panel center">
-      <div class="breadcrumb" id="breadcrumb"></div>
-      <div class="canvas-wrap">
-        <canvas id="canvas"></canvas>
-        <div id="tip" class="tip hidden"></div>
-        <div id="empty-hint" class="empty-hint">
-          <p>左侧选择盘符或目录开始扫描</p>
-          <p class="dim">非管理员会走「目录遍历」降级模式：功能完整，只是慢 1~2 个数量级</p>
-          <p class="dim">点右下角「权限」可以申请管理员权限（直读 MFT，快很多）</p>
-        </div>
-      </div>
-      <div class="canvas-status" id="canvas-status"></div>
-    </section>
-
-    <!-- ── 右栏：类型 / 大文件 / 详情 ───────────────────────────────── -->
-    <aside class="panel right">
-      <section class="block">
-        <h2>文件类型 <button id="clear-highlight" class="mini hidden">取消高亮</button></h2>
-        <div id="exts" class="exts"></div>
-      </section>
-      <section class="block">
-        <h2>最大的文件</h2>
-        <div id="topfiles" class="files"></div>
-      </section>
-      <section class="block">
-        <h2>详情</h2>
-        <div id="detail-panel" class="detail dim">点选任意方块查看</div>
-      </section>
-    </aside>
-  </main>
-
-  <!-- ── F6/F7/F8 实时监控：底部抽屉 ────────────────────────────────────
-       放在整个窗口下方而不是塞进某一栏：变更流水是表格，路径又长，
-       全宽才放得下。收起时只占一行。 -->
-  <section id="monitor" class="monitor">
+      <section id="monitor" class="monitor hidden" role="tabpanel" aria-labelledby="nav-monitor">
+    <div class="monitor-mode"><label for="monitor-mode">监控方式</label><select id="monitor-mode"><option value="linked">联动面积图</option><option value="independent">独立监控 · 固定路径</option></select></div>
+    <div id="linked-monitor" class="linked-monitor">
     <div class="mon-head">
-      <button id="mon-toggle" class="mini" type="button" title="展开 / 收起监控面板">▸ 实时监控</button>
       <span id="mon-state" class="badge">未启动</span>
       <span id="mon-targets" class="mon-meta">—</span>
       <span id="mon-source" class="mon-meta">—</span>
@@ -109,7 +136,7 @@
       <button id="mon-stop" class="mini hidden" type="button">停止监控</button>
     </div>
 
-    <div id="mon-body" class="mon-body hidden">
+        <div id="mon-body" class="mon-body">
       <div class="mon-setup">
         <label class="f">
           <span>监控目标</span>
@@ -121,7 +148,7 @@
         </div>
 
         <label class="f">
-          <span>阈值规则</span>
+          <span>阈值规则 <button type="button" class="rule-help mini" aria-label="阈值规则说明">?</button></span>
           <textarea id="mon-rules" rows="2" placeholder="abs=1G / grow=500M / rate=10M/60s　每行一条"></textarea>
         </label>
 
@@ -131,7 +158,7 @@
 
         <label class="check">
           <input id="mon-journal" type="checkbox">
-          <span>允许启用 USN Journal（系统级变更，见文档 R3）</span>
+          <span>允许创建 USN 日志（需管理员权限，会更改卷设置）</span>
         </label>
 
         <label class="f"><span>变更落盘</span>
@@ -146,30 +173,252 @@
           <span id="mon-export-hint" class="hint"></span>
         </div>
       </div>
-
-      <div class="mon-lists">
-        <div class="mon-tabs">
-          <button id="mon-tab-changes" class="tab on" type="button" data-tab="changes">变更流水</button>
-          <button id="mon-tab-alerts" class="tab" type="button" data-tab="alerts">阈值预警</button>
-          <span class="spacer"></span>
-          <select id="mon-filter" title="按变更类型筛选">
-            <option value="">全部类型</option>
-            <option value="created">新增</option>
-            <option value="deleted">删除</option>
-            <option value="renamed">重命名</option>
-            <option value="modified">修改</option>
-          </select>
-          <span id="mon-list-hint" class="hint"></span>
         </div>
-        <div id="mon-list" class="mon-list"></div>
-      </div>
     </div>
-  </section>
+    <div id="independent-pane" class="independent-pane hidden">
+      <p class="hint">只读监控固定路径，可与盘符扫描同时运行。</p>
+      <div class="row"><button id="ind-new" class="mini" type="button">新增监控</button><span id="ind-count" class="hint"></span></div>
+      <p id="ind-error" class="mon-err hidden"></p>
+      <div id="ind-editor" class="mon-setup hidden">
+        <label class="f"><span id="ind-editor-title">新增监控</span><input id="ind-path" type="text" placeholder="文件或文件夹的完整路径" aria-label="独立监控路径"></label>
+        <div class="row"><button id="ind-file" type="button" class="mini">选择文件…</button><button id="ind-folder" type="button" class="mini">选择文件夹…</button></div>
+        <label class="f"><span>阈值规则 <button type="button" class="rule-help mini" aria-label="阈值规则说明">?</button></span><textarea id="ind-rules" rows="2" placeholder="每行一条；留空只记录变更"></textarea></label>
+        <label class="check"><input id="ind-enabled" type="checkbox" checked><span>启用监控</span></label>
+        <div class="row"><button id="ind-save" type="button" class="mini primary">保存监控</button><button id="ind-cancel" type="button" class="mini">收起</button></div>
+      </div>
+      <div id="ind-targets"></div>
+      <p class="hint">配置自动保存，下次启动恢复。移除监控不会删除文件。文件夹需建立独立索引，大目录会占用更多时间和内存。</p>
+    </div>
+      </section>
+    </aside>
+
+    <!-- ── 中间：面积图 / 重复文件 / 快照对比 ───────────────────────── -->
+    <section class="panel center">
+      <!-- 视图切换。三个视图共用中间这一整块：面积图要的是"尽量大的画布"，
+           另外两个要的是"尽量宽的表"，把它们并排挤在一起两边都难受。 -->
+      <div class="viewtabs">
+        <button id="view-tab-map" class="tab on" type="button">面积图</button>
+        <button id="view-tab-dup" class="tab" type="button">重复文件</button>
+        <button id="view-tab-diff" class="tab" type="button">快照对比</button>
+        <button id="view-tab-search" class="tab" type="button">文件搜索</button>
+        <span class="spacer"></span>
+        <span id="view-hint" class="hint"></span>
+      </div>
+
+      <div id="view-map" class="view">
+        <div class="pathbar"><div class="breadcrumb" id="breadcrumb"></div><span id="tree-hint" class="hint tree-summary"></span></div>
+        <div class="canvas-wrap">
+          <canvas id="canvas" tabindex="0" aria-label="面积图，支持右键菜单"></canvas>
+          <canvas id="canvas-previous" aria-hidden="true"></canvas>
+          <div id="tip" class="tip hidden"></div>
+          <div id="empty-hint" class="empty-hint">
+            <div class="empty-mark" aria-hidden="true">▦</div>
+            <p class="empty-title">从一个目录开始</p>
+            <p>选择左侧磁盘，或粘贴目录后点击「扫描」</p>
+            <p class="dim">扫描后可查看空间分布、查找重复文件，或开始实时监控。</p>
+            <p class="dim">普通权限也可使用；右下角「权限」可查看扫描方式。</p>
+          </div>
+        </div>
+        <div class="canvas-status" id="canvas-status"></div>
+      </div>
+
+      <!-- F12 重复文件。三级筛选（体积 → 部分哈希 → 全哈希 → 逐字节复核）
+           全在引擎里，界面只负责喂参数、显示进度、导出 CSV。 -->
+      <div id="view-dup" class="view hidden">
+        <div class="tool">
+          <label class="f"><span>最小体积</span>
+            <input id="dup-min-size" class="num" type="text" value="1M" size="6" title="与 CLI 的 --min-size 同一套写法：1M / 512K / 1073741824">
+          </label>
+          <label class="f"><span>最多组数</span>
+            <input id="dup-top" class="num" type="text" value="300" size="5">
+          </label>
+          <label class="f"><span>每组最多</span>
+            <input id="dup-per-group" class="num" type="text" value="50" size="4">
+          </label>
+          <button id="dup-start" class="primary" type="button">开始查找</button>
+          <span id="dup-state" class="badge">未开始</span>
+          <span class="spacer"></span>
+          <input id="dup-csv" class="path" type="text" placeholder="导出 CSV 的路径，留空 = 桌面默认名">
+          <button id="dup-export" class="mini" type="button">导出 CSV</button>
+        </div>
+        <div class="tool thin">
+          <div class="progress"><div id="dup-bar"></div></div>
+          <span id="dup-summary" class="hint"></span>
+        </div>
+        <div id="dup-list" class="list"></div>
+      </div>
+
+      <!-- F11 快照对比。方向固定为「快照 → 现在的扫描结果」，
+           所以界面上没有"谁比谁"的选择，也就不会看反。 -->
+      <div id="view-diff" class="view hidden">
+        <div class="tool">
+          <!-- 用 span 而不是 label 包住：label 会把点按钮也算成点输入框 -->
+          <!-- 「浏览」做成图标按钮：一行里有三个路径框各带一个，写成文字按钮
+               会把这一行挤到换行（`.f` 是 flex，宽度不够时按钮先掉下去）。
+               作用写在 title 与 aria-label 里，悬停就能看到。 -->
+          <span class="f"><span>基准快照</span>
+            <input id="diff-path" class="path" type="text" placeholder="要对比的 .tsv 快照路径">
+            <button id="diff-pick" class="mini pick" type="button"
+                    aria-label="浏览：从磁盘上选一份 .tsv 快照"
+                    title="浏览：从磁盘上选一份 .tsv 快照">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1.9h4.9l3.2 3.2v9H4z"/><path d="M8.9 1.9v3.2h3.2"/></svg>
+            </button>
+          </span>
+          <label class="f"><span>排序</span>
+            <select id="diff-order">
+              <option value="growth">按增量</option>
+              <option value="abs">按幅度</option>
+              <option value="path">按路径</option>
+            </select>
+          </label>
+          <label class="f"><span>最小增量</span>
+            <input id="diff-min-delta" class="num" type="text" value="0" size="6" title="小于它的变化不进列表（仍计入统计）：0 / 1M / 512K">
+          </label>
+          <!-- 按钮只写两个字，作用放 title：这一行还有排序、最小增量两个框，
+               把"与当前扫描对比"整句写上去会在窄窗口里把别的控件挤掉。 -->
+          <button id="diff-compare" class="primary" type="button"
+                  title="对比：拿上面这份基准快照与当前扫描结果比，列出新增 / 删除 / 变大 / 变小的文件">
+            对比
+          </button>
+          <span id="diff-state" class="badge">未对比</span>
+        </div>
+        <div class="tool thin">
+          <span class="f"><span>存快照到</span>
+            <input id="diff-save-path" class="path" type="text" placeholder="留空 = 桌面；浏览选文件夹也行">
+            <button id="diff-save-pick" class="mini pick" type="button"
+                    aria-label="浏览：选一个文件夹，文件名由程序补"
+                    title="浏览：选一个文件夹，文件名由程序补">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.8 4.3h4.1l1.4 1.7h6.9v7.7H1.8z"/></svg>
+            </button>
+          </span>
+          <button id="diff-save" class="mini" type="button"
+                  title="保存快照：把当前扫描结果存成一份 .tsv；存完会自动填进上面的「基准快照」，下次可以直接拿它比">
+            保存快照
+          </button>
+          <span class="spacer"></span>
+          <span class="f"><span>CSV</span>
+            <input id="diff-csv" class="path" type="text" placeholder="留空 = 桌面；浏览选文件夹也行">
+            <button id="diff-csv-pick" class="mini pick" type="button"
+                    aria-label="浏览：选一个文件夹，文件名由程序补"
+                    title="浏览：选一个文件夹，文件名由程序补">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.8 4.3h4.1l1.4 1.7h6.9v7.7H1.8z"/></svg>
+            </button>
+          </span>
+          <button id="diff-export" class="mini" type="button">导出 CSV</button>
+        </div>
+        <!-- 存快照 / 对比都要好几秒（几百 MB 的读写）。少了这一行，点下去只看到
+             界面不动，用户只能猜是不是卡住了 —— 进度条 + 阶段名 + 已用时间
+             才说明"它在跑"。空闲时整行收起，不白占一行。 -->
+        <div id="diff-progress" class="tool thin hidden">
+          <div class="progress"><div id="diff-bar"></div></div>
+          <span id="diff-stage" class="hint"></span>
+        </div>
+        <div class="tool thin"><span id="diff-summary" class="hint"></span></div>
+        <div id="diff-list" class="list"></div>
+      </div>
+
+      <!-- F13 文件搜索。搜的是**内存里的索引**（扫过才有结果），所以它比
+           "再遍历一次磁盘"快两个数量级 —— 也因此没扫过时要把话说清楚。 -->
+      <div id="view-search" class="view hidden">
+        <div class="tool">
+          <label class="f grow"><span>查找</span>
+            <input id="search-text" class="path" type="text" autocomplete="off"
+                   placeholder="文件名（支持包含 / 模糊 / 正则）"
+                   title="回车即搜索">
+          </label>
+          <label class="f"><span>方式</span>
+            <select id="search-mode" aria-label="匹配方式" title="包含：子串；模糊：按顺序的字符（rpt 命中 report）；正则：支持 . * + ? [abc] [a-z] [^…] ^ $">
+              <option value="contains">包含</option>
+              <option value="fuzzy">模糊</option>
+              <option value="regex">正则</option>
+            </select>
+          </label>
+          <label class="f"><span>范围</span>
+            <select id="search-scope" aria-label="搜索范围">
+              <option value="files">文件</option>
+              <option value="dirs">文件夹</option>
+              <option value="both">两者</option>
+            </select>
+          </label>
+          <button id="search-run" class="primary" type="button">搜索</button>
+          <span id="search-state" class="badge">未搜索</span>
+        </div>
+
+        <!-- 第二行：按**文件内容**搜。和上面的名字搜索是两件事，各填各的：
+             名字可以留空、内容也可以留空，两个都填就是"名字命中 或 内容命中"。
+             范围写清楚：只搜纯文本类，Office 文档（docx/xlsx/pptx）是 zip 包，
+             引擎层不引第三方库，暂不解析。 -->
+        <div class="tool">
+          <label class="f grow"><span>内容</span>
+            <input id="search-content" class="path" type="text" autocomplete="off"
+                   placeholder="在文件内容里找（纯文本类：txt / 日志 / CSV / 源码…）"
+                   title="只搜纯文本类文件；Office 文档暂不解析。回车即搜">
+          </label>
+          <label class="check" title="按正则解析内容关键字（与上面的「方式」无关）">
+            <input id="search-content-regex" type="checkbox">
+            <span>内容用正则</span>
+          </label>
+          <span class="hint" id="search-content-hint">不含 Office 文档</span>
+        </div>
+
+        <div id="content-progress" class="tool thin hidden">
+          <div class="progress"><div id="content-bar"></div></div>
+          <span id="content-stage" class="hint"></span>
+        </div>
+        <div class="tool thin">
+          <span id="search-summary" class="hint">在已扫描的索引里搜，不重新遍历磁盘。
+            双击结果可前往它所在的目录，右键还有更多操作。</span>
+        </div>
+        <div id="search-list" class="list"></div>
+        <div id="content-list" class="list"></div>
+      </div>
+    </section>
+
+    <!-- ── 右栏：类型 / 大文件 / 详情 ─────────────────────────────────
+         三块的类名决定了它们各分多少高度（见 style.css 的 `.grow-*`）：
+         都是"内容高度只是上限"的滚动列表，所以按权重分而不是按内容分。 -->
+    <aside class="panel right">
+      <section id="analysis-types" class="block grow-ext">
+        <h2>文件类型 <button id="clear-highlight" class="mini hidden">取消高亮</button></h2>
+        <div id="exts" class="exts"></div>
+      </section>
+      <section id="analysis-top" class="block grow-top">
+        <h2>最大的文件</h2>
+        <div id="topfiles" class="files"></div>
+      </section>
+      <section id="monitor-changes" class="block grow-changes hidden">
+        <h2>变更流水 <span id="mon-list-hint" class="hint"></span></h2>
+        <div class="monitor-filter"><select id="mon-filter" aria-label="按变更类型筛选">
+          <option value="">全部类型</option><option value="created">新增</option><option value="deleted">删除</option>
+          <option value="renamed">重命名</option><option value="modified">修改</option>
+        </select></div>
+        <div id="mon-list" class="mon-list"></div>
+      </section>
+      <!-- 折叠后只留标题栏（条数还在），省下的高度全给变更流水 -->
+      <section id="monitor-alerts" class="block grow-alerts hidden">
+        <h2>阈值预警 <span id="mon-alert-hint" class="hint"></span>
+          <button id="alerts-toggle" class="mini icon" type="button"
+                  aria-expanded="true" aria-label="折叠或展开阈值预警"
+                  title="折叠预警区（把高度让给变更流水）">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.1 6 8 10.1 11.9 6"/></svg>
+          </button>
+        </h2>
+        <div id="mon-alert-list" class="mon-list"></div>
+      </section>
+      <section class="block grow-detail">
+        <h2>详情</h2>
+        <div id="detail-panel" class="detail dim">点选任意方块查看</div>
+      </section>
+    </aside>
+  </main>
 
   <footer class="statusbar">
-    <span id="st-backend">—</span>
+    <span id="backend-badge" class="badge">未扫描</span>
     <span id="st-counts">—</span>
     <span id="st-size">—</span>
+    <!-- 所在盘的可用 / 总空间。**独立于扫描结果**：它来自盘符容量，不是索引
+         里的字节数，所以没扫描时也能显示（扫完会再刷新一次，免得显示过期值）。 -->
+    <span id="st-space" title="当前盘符的可用空间 / 总容量">—</span>
     <span id="st-memory">—</span>
     <span id="st-time">—</span>
     <span id="st-layout">—</span>
@@ -236,12 +485,32 @@
     </div>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 </div>
 
 <script src="wire.js"></script>
 <script src="admin-rule.js"></script>
+<script src="view-rule.js"></script>
 <script src="treemap.js"></script>
+<dialog id="rule-help-dialog" aria-labelledby="rule-help-title">
+  <h3 id="rule-help-title">阈值规则说明</h3>
+  <p>每行一条，规则之间是<strong>“或”</strong>：任意一条满足即可触发。使用严格大于（&gt;），等于阈值不触发。每次计算每个目标最多产生一条预警；留空只记录变更。</p>
+  <p><code>abs=1G</code>：当前逻辑大小超过 1 GiB。文件夹计算其子树文件总大小。</p>
+  <p><code>grow=500M</code>：相对本次启动基线，净增长超过 500 MiB；删除、缩小会抵消增长。</p>
+  <p><code>rate=10M/60s</code>：当前采样窗口累计净增长除以 60 秒，超过 10 MiB / 60 秒。分母使用规则窗口长度；窗口到期后更新采样基线，短时累计增长超过 10 MiB 也可提前触发。</p>
+  <p>大小单位 B / K / M / G / T 按 1024 换算；时间单位 ms / s / m / h。支持多个监控目标，每个目标独立计算。</p>
+  <p>默认冷却 10 分钟。同类预警触发后，指标需先回落到阈值的 90% 以下，且冷却结束，才会再次触发。建议每个目标每种规则只写一条，同类规则共用抑制状态。</p>
+  <p>独立监控在启动、修改、恢复启用或断开后重连时重新建立基线。联动监控在开始监控时建立基线。重启程序会清空内存中的流水和预警。</p>
+  <form method="dialog"><button type="submit">知道了</button></form>
+</dialog>
+<script src="independent.js"></script>
+<div id="context-menu" class="context-menu hidden" role="menu" aria-label="操作菜单"></div>
+<dialog id="copy-dialog" aria-labelledby="copy-title">
+  <h3 id="copy-title">复制内容</h3><p>自动复制不可用，内容已选中，可按 Ctrl+C 复制。</p>
+  <textarea id="copy-text" readonly rows="6" aria-label="待复制内容"></textarea>
+  <form method="dialog"><button type="submit">关闭</button></form>
+</dialog>
+<script src="context-menu.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

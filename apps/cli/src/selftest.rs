@@ -23,12 +23,17 @@ use core_index::{ExtensionTable, Tree};
 use core_monitor::debounce::{DebounceConfig, Debouncer, RawEvent};
 use core_monitor::rules::{Rule, RuleConfig, RuleEngine};
 use core_monitor::Severity;
+use core_scan::snapshot::{DiffOptions, SnapEntry, Snapshot, SnapshotOptions};
+use core_scan::{ContentSource, DupCandidate, DupOptions};
 use core_usn::cursor::{evaluate, Cursor, CursorValidity};
 use core_usn::normalize::*;
 use core_usn::record::parse_records;
 use core_usn::UsnJournalData;
 use core_viz::{compute_layout, Camera, LayoutOptions, LodPolicy, Rect, ShadingMode};
 use std::fmt::Write as _;
+
+use core_scan::diff;
+use core_scan::find_duplicates;
 
 // ── 结果类型 ────────────────────────────────────────────────────────────────
 
@@ -111,6 +116,10 @@ pub fn run(verbose: bool) -> Report {
         ("阈值规则触发一次且只一次（滞回）", t_rule_hysteresis),
         ("冷却期内不重复预警", t_rule_cooldown),
         ("预警严重级别：超 2 倍 = Critical", t_severity),
+        // ── F11/F12 去重与快照 ─────────────────────────────────────────
+        ("重复文件三级去重：体积唯一者不读内容", t_dedup_funnel),
+        ("重复文件：哈希撞车被逐字节复核挡住", t_dedup_collision),
+        ("快照往返 + diff 四类变更", t_snapshot_roundtrip_and_diff),
         // ── 真实磁盘（尽力而为） ───────────────────────────────────────
         ("目录遍历扫描真实临时目录", t_traverse_real),
         ("面积图布局接真实树", t_layout_on_real_tree),
@@ -855,6 +864,201 @@ fn t_rule_cooldown() -> Outcome {
     )
 }
 
+// ── F12 重复文件三级去重（内存内容源，不碰真实文件） ────────────────────────
+
+/// 自检用的内存内容源。
+///
+/// 三级筛选最有价值的分支是「体积唯一 → 一个字节都不读」和「哈希全撞上 →
+/// 靠逐字节复核兜住」，这两件事在真实文件系统上都很难**故意**造出来。
+/// 所以要有一个能记录「读过谁」、也能强行让哈希相等的内容源。
+struct MemSource {
+    files: std::collections::HashMap<String, Vec<u8>>,
+    /// 被读过内容的路径（按读取次数追加）
+    reads: std::cell::RefCell<Vec<String>>,
+    /// 打开后所有哈希都返回同一个值（模拟极端碰撞）
+    collide: bool,
+}
+
+impl MemSource {
+    fn new(collide: bool) -> MemSource {
+        MemSource {
+            files: std::collections::HashMap::new(),
+            reads: std::cell::RefCell::new(Vec::new()),
+            collide,
+        }
+    }
+
+    fn put(&mut self, path: &str, data: &[u8]) -> &mut Self {
+        self.files.insert(path.to_string(), data.to_vec());
+        self
+    }
+
+    fn get(&self, p: &str) -> std::io::Result<&Vec<u8>> {
+        self.reads.borrow_mut().push(p.to_string());
+        self.files.get(p).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("没有 {p}"))
+        })
+    }
+}
+
+impl ContentSource for MemSource {
+    fn partial_hash(&self, c: &DupCandidate, block: usize) -> std::io::Result<u64> {
+        if self.collide {
+            return Ok(1);
+        }
+        Ok(core_io::hash::hash_head_tail_bytes(self.get(&c.path)?, block))
+    }
+    fn full_hash(&self, c: &DupCandidate) -> std::io::Result<u64> {
+        if self.collide {
+            return Ok(1);
+        }
+        let d = self.get(&c.path)?;
+        core_io::hash::hash_reader(&mut d.as_slice())
+    }
+    fn equal(&self, a: &str, b: &str) -> std::io::Result<bool> {
+        Ok(self.get(a)? == self.get(b)?)
+    }
+}
+
+fn cand(path: &str, size: u64) -> DupCandidate {
+    DupCandidate {
+        path: path.to_string(),
+        size,
+        mtime: 0,
+    }
+}
+
+fn t_dedup_funnel() -> Outcome {
+    // 两个体积唯一（永远不该被读）+ 一对真重复 + 一对同体积但内容不同
+    let mut src = MemSource::new(false);
+    src.put("u1", &vec![7u8; 1000])
+        .put("u2", &vec![8u8; 2000])
+        .put("d1", &vec![9u8; 5000])
+        .put("d2", &vec![9u8; 5000])
+        .put("e1", &vec![1u8; 3000])
+        .put("e2", &vec![2u8; 3000]);
+    let entries = vec![
+        cand("u1", 1000),
+        cand("u2", 2000),
+        cand("d1", 5000),
+        cand("d2", 5000),
+        cand("e1", 3000),
+        cand("e2", 3000),
+    ];
+    let opts = DupOptions::default();
+    let rep = find_duplicates(&entries, &opts, &src, &mut |_| {});
+    let reads = src.reads.borrow();
+    let never_read = !reads.iter().any(|p| p == "u1" || p == "u2");
+    let one_group = rep.groups.len() == 1
+        && rep.groups[0].count == 2
+        && rep.groups[0].wasted == 5000
+        && !rep.groups[0].truncated;
+    check(
+        "三级漏斗",
+        never_read && one_group && rep.same_size_groups == 2 && rep.group_count == 1,
+        format!(
+            "体积唯一者未被读={never_read}；体积相同 {} 组 → 部分哈希 {} → 完整哈希 {}；\
+             确认 {} 组，可回收 {}",
+            rep.same_size_groups,
+            rep.partial_files,
+            rep.full_files,
+            rep.group_count,
+            core_io::util::human_size(rep.total_wasted)
+        ),
+    )
+}
+
+fn t_dedup_collision() -> Outcome {
+    // 三个**内容互不相同**的文件，但内容源对所有文件都返回同一个哈希
+    let mut src = MemSource::new(true);
+    src.put("a", &[1u8; 4000])
+        .put("b", &[2u8; 4000])
+        .put("c", &[3u8; 4000]);
+    let entries = vec![cand("a", 4000), cand("b", 4000), cand("c", 4000)];
+    let rep = find_duplicates(&entries, &DupOptions::default(), &src, &mut |_| {});
+
+    // 再放两个真重复的进去：只有那两个成组，第三个不许被带上
+    let mut src2 = MemSource::new(true);
+    src2.put("a", &[1u8; 4000])
+        .put("b", &[1u8; 4000])
+        .put("c", &[3u8; 4000]);
+    let rep2 = find_duplicates(&entries, &DupOptions::default(), &src2, &mut |_| {});
+
+    let ok = rep.groups.is_empty()
+        && rep2.groups.len() == 1
+        && rep2.groups[0].count == 2
+        && rep2.groups[0].files.iter().all(|f| f.path != "c");
+    check(
+        "哈希撞车被复核挡住",
+        ok,
+        format!(
+            "三个不同文件哈希全相同 → 报出 {} 组（应为 0）；\
+             两个真相同 + 一个不同 → 报出 {} 组、{} 个文件（应为 1 组 2 个）",
+            rep.groups.len(),
+            rep2.groups.len(),
+            rep2.groups.first().map(|g| g.count).unwrap_or(0)
+        ),
+    )
+}
+
+fn t_snapshot_roundtrip_and_diff() -> Outcome {
+    let t = mk_tree();
+    let s1 = Snapshot::capture(&t, None, "C:", 1_700_000_000, &SnapshotOptions::default());
+    let text = s1.to_tsv();
+    let back = match Snapshot::from_tsv(&text) {
+        Ok(v) => v,
+        Err(e) => return Outcome::Fail(format!("快照往返失败：{e}")),
+    };
+    if back.entries != s1.entries || back.created_unix != s1.created_unix {
+        return Outcome::Fail("快照往返后内容不一致".to_string());
+    }
+    // 转义：磁盘路径的反斜杠在文件里是双写（这是它唯一"不好看"的地方，但可逆）
+    if !text.contains(r"C:\\docs\\a.txt") {
+        return Outcome::Fail(format!("快照里的路径没有被正确转义：{text}"));
+    }
+
+    // 编辑一份"一周后"的快照：a.txt 变大 1 MB、b.log 被删、新增 5 MB 文件
+    let mut s2 = back.clone();
+    s2.created_unix = s1.created_unix + 7 * 86_400;
+    s2.entries.retain(|e| !e.path.ends_with("b.log"));
+    for e in s2.entries.iter_mut() {
+        if e.path.ends_with("a.txt") {
+            e.size += MB;
+            e.mtime += 1;
+        }
+    }
+    s2.entries.push(SnapEntry {
+        path: r"C:\docs\new.bin".to_string(),
+        size: 5 * MB,
+        mtime: 1_700_600_000,
+    });
+    s2.entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let rep = diff(&back, &s2, &DiffOptions { top: 0, ..Default::default() });
+    let expect_net = (MB + 5 * MB) as i64 - (2 * MB) as i64;
+    let ok = rep.grew == 1
+        && rep.removed == 1
+        && rep.added == 1
+        && rep.shrank == 0
+        && rep.net_delta == expect_net
+        && rep.rows.len() == 3;
+    check(
+        "快照往返 + diff",
+        ok,
+        format!(
+            "旧 {} 条 / 新 {} 条；变大 {} 删除 {} 新增 {} 变小 {}；净变化 {}（应为 {}）",
+            back.len(),
+            s2.len(),
+            rep.grew,
+            rep.removed,
+            rep.added,
+            rep.shrank,
+            core_scan::signed_size(rep.net_delta),
+            core_scan::signed_size(expect_net)
+        ),
+    )
+}
+
 fn t_severity() -> Outcome {
     use core_monitor::alert::severity_of;
     let s = [
@@ -872,8 +1076,12 @@ fn t_severity() -> Outcome {
 }
 
 fn t_traverse_real() -> Outcome {
-    let base = std::env::temp_dir().join(format!("fw_selftest_trav_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let owned = core_io::test_dir::TestDir::new("fw-selftest-trav");
+    let owned = match owned {
+        Ok(dir) => dir,
+        Err(e) => return Outcome::Skip(format!("Cannot create owned test directory: {e}")),
+    };
+    let base = owned.path().to_path_buf();
     if std::fs::create_dir_all(base.join("a").join("b")).is_err() {
         return Outcome::Skip("无法创建临时目录".to_string());
     }
@@ -894,7 +1102,6 @@ fn t_traverse_real() -> Outcome {
     let has_root = paths.get(root_key.as_str()) == Some(&5);
 
     let ok = stats.files_visited == 2 && root == 3410 && tree.file_count == 2 && has_root;
-    let _ = std::fs::remove_dir_all(&base);
 
     if ok {
         Outcome::Pass(format!(
@@ -911,8 +1118,12 @@ fn t_traverse_real() -> Outcome {
 }
 
 fn t_layout_on_real_tree() -> Outcome {
-    let base = std::env::temp_dir().join(format!("fw_selftest_lay_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let owned = core_io::test_dir::TestDir::new("fw-selftest-lay");
+    let owned = match owned {
+        Ok(dir) => dir,
+        Err(e) => return Outcome::Skip(format!("Cannot create owned test directory: {e}")),
+    };
+    let base = owned.path().to_path_buf();
     if std::fs::create_dir_all(base.join("sub")).is_err() {
         return Outcome::Skip("无法创建临时目录".to_string());
     }
@@ -941,7 +1152,6 @@ fn t_layout_on_real_tree() -> Outcome {
     let art = crate::render::render_ascii(&res, 60, 16);
     let lines = art.lines().count();
     let all_ok = res.items.len() >= 2 && lines == 16 && art.contains('+');
-    let _ = std::fs::remove_dir_all(&base);
     check(
         "真实树布局",
         all_ok,
@@ -991,15 +1201,18 @@ fn t_dirwatch_parse() -> Outcome {
 }
 
 fn t_dirwatch_live() -> Outcome {
-    let base = std::env::temp_dir().join(format!("fw_selftest_dw_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let owned = core_io::test_dir::TestDir::new("fw-selftest-dw");
+    let owned = match owned {
+        Ok(dir) => dir,
+        Err(e) => return Outcome::Skip(format!("Cannot create owned test directory: {e}")),
+    };
+    let base = owned.path().to_path_buf();
     if std::fs::create_dir_all(&base).is_err() {
         return Outcome::Skip("无法创建临时目录".to_string());
     }
     let mut w = match core_scan::DirWatcher::start(&base, 64 * 1024, true) {
         Ok(w) => w,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&base);
             return Outcome::Skip(format!("无法打开目录句柄（{}）—— 常见于受限容器", e));
         }
     };
@@ -1016,7 +1229,6 @@ fn t_dirwatch_live() -> Outcome {
     let hit = got.iter().any(|e| e.rel.contains("probe.bin"));
     let received = w.received();
     w.stop();
-    let _ = std::fs::remove_dir_all(&base);
     check(
         "实时投递",
         hit,
@@ -1025,8 +1237,12 @@ fn t_dirwatch_live() -> Outcome {
 }
 
 fn t_degraded_live() -> Outcome {
-    let base = std::env::temp_dir().join(format!("fw_selftest_live_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let owned = core_io::test_dir::TestDir::new("fw-selftest-live");
+    let owned = match owned {
+        Ok(dir) => dir,
+        Err(e) => return Outcome::Skip(format!("Cannot create owned test directory: {e}")),
+    };
+    let base = owned.path().to_path_buf();
     if std::fs::create_dir_all(base.join("seed")).is_err() {
         return Outcome::Skip("无法创建临时目录".to_string());
     }
@@ -1040,13 +1256,11 @@ fn t_degraded_live() -> Outcome {
     let mut s = match core_scan::Session::open(cfg, |_, _, _| {}) {
         Ok(s) => s,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&base);
             return Outcome::Skip(format!("会话打开失败：{}", e));
         }
     };
     if s.watch.is_none() {
         let w = s.warnings.clone();
-        let _ = std::fs::remove_dir_all(&base);
         return Outcome::Skip(format!("目录监视不可用：{}", w.join(" / ")));
     }
 
@@ -1086,7 +1300,6 @@ fn t_degraded_live() -> Outcome {
     let dump = dump.join("\n            ");
 
     let _ = s.shutdown(30_000);
-    let _ = std::fs::remove_dir_all(&base);
 
     let ok = after == before + 7000 && src.contains("ReadDirectoryChangesW");
     // 树内容只在失败时才有价值 —— 无条件打出来会把 28 项自检的输出整个淹掉。

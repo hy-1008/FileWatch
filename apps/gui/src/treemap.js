@@ -21,7 +21,14 @@
 const Treemap = (() => {
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d', { alpha: false });
+  const previous = document.getElementById('canvas-previous');
+  const previousCtx = previous.getContext('2d', { alpha: false });
+  const snapshot = document.createElement('canvas');
+  const snapshotCtx = snapshot.getContext('2d', { alpha: false });
   const tip = document.getElementById('tip');
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  let fade = null;
+  let labelNames = new Map();
 
   let layout = null;      // 当前 Layout 实例
   let dpr = 1;
@@ -29,6 +36,9 @@ const Treemap = (() => {
   let selIdx = -1;
   /** 高亮的 ext_id 集合；null = 不高亮 */
   let highlightExt = null;
+  /** 当前着色模式：`ext` / `depth` / `age`（年龄走热力图色带，见 wire.js 的 fwHeat） */
+  let shadingMode = 'ext';
+  let pendingShading = 'ext';
   /** node → 显示名，由 app 提供（布局里只有 id，没有名字） */
   let nameOf = () => '';
   let pathOf = () => '';
@@ -36,14 +46,27 @@ const Treemap = (() => {
   let onPick = () => {};
   let onZoomIn = () => {};
   let onZoomOut = () => {};
+  let onContext = () => {};
 
-  function resize() {
+  /** 方块上能写字的最小屏幕尺寸。
+   *
+   *  **预取名字与画字必须用同一个判据** —— 两边各写一份的话，要么白取一批名字，
+   *  要么出现「该画字却没有名字」的空方块。 */
+  const LABEL_MIN_W = 40;
+  const LABEL_MIN_H = 14;
+
+  function measure() {
     const wrap = canvas.parentElement;
-    const w = Math.max(1, wrap.clientWidth);
-    const h = Math.max(1, wrap.clientHeight);
+    return { w: Math.max(1, wrap.clientWidth), h: Math.max(1, wrap.clientHeight) };
+  }
+
+  function resize(size = measure()) {
+    const { w, h } = size;
     dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
+    // 给 width/height 赋同样的值也会清空位图，只在提交新帧时按需调整。
+    const width = Math.round(w * dpr), height = Math.round(h * dpr);
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
     return { w, h };
   }
 
@@ -51,11 +74,52 @@ const Treemap = (() => {
     return { w: canvas.width / dpr, h: canvas.height / dpr };
   }
 
-  function setLayout(l) {
+  function stopFade() {
+    if (fade) fade.cancel();
+    fade = null;
+    previous.style.opacity = '0';
+  }
+
+  function setLayout(l, size) {
+    const oldSelection = layout && selIdx >= 0 && selIdx < layout.count ? layout.node(selIdx) : null;
+    const oldHover = layout && hoverIdx >= 0 && hoverIdx < layout.count ? layout.node(hoverIdx) : null;
+    const smooth = layout && layout.count > 0 && !reducedMotion.matches && typeof previous.animate === 'function';
+    if (smooth) {
+      snapshot.width = canvas.width;
+      snapshot.height = canvas.height;
+      snapshotCtx.globalAlpha = 1;
+      snapshotCtx.drawImage(canvas, 0, 0);
+      // 连续刷新从当前可见的合成画面开始，避免中途打断渐变时跳回上一帧。
+      if (fade) {
+        snapshotCtx.globalAlpha = Number(getComputedStyle(previous).opacity) || 0;
+        snapshotCtx.drawImage(previous, 0, 0, snapshot.width, snapshot.height);
+        snapshotCtx.globalAlpha = 1;
+      }
+    }
+    stopFade();
     layout = l;
+    shadingMode = pendingShading;
+    labelNames = new Map();
     hoverIdx = -1;
     selIdx = -1;
+    for (let i = 0; i < l.count; i++) {
+      const node = l.node(i);
+      if (node === oldSelection) selIdx = i;
+      if (node === oldHover) hoverIdx = i;
+      const r = l.rect(i);
+      if (r[2] >= LABEL_MIN_W && r[3] >= LABEL_MIN_H) labelNames.set(node, nameOf(node));
+    }
+    tip.classList.add('hidden');
+    resize(size);
     draw();
+    if (smooth) {
+      previous.width = canvas.width;
+      previous.height = canvas.height;
+      previousCtx.drawImage(snapshot, 0, 0, previous.width, previous.height);
+      fade = previous.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 160, easing: 'ease-out' });
+      const active = fade;
+      active.onfinish = () => { if (fade === active) stopFade(); };
+    }
   }
 
   function pick(x, y) {
@@ -68,7 +132,7 @@ const Treemap = (() => {
   function draw() {
     const { w, h } = cssSize();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#101216';
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg-canvas').trim() || '#11171f';
     ctx.fillRect(0, 0, w, h);
     if (!layout || layout.count === 0) return;
 
@@ -79,7 +143,11 @@ const Treemap = (() => {
       if (r[2] < 0.5 || r[3] < 0.5) continue;
       const dim = highlightExt !== null && layout.extId(i) !== highlightExt;
       ctx.globalAlpha = dim ? 0.22 : 1;
-      ctx.fillStyle = fwColor(layout.slot(i), layout.shadeT(i));
+      // 年龄模式走热力图色带（同一个槽位、按 shade_t 换色相），其余模式是
+      // 「槽位定色相 + shade_t 调亮度」。
+      ctx.fillStyle = shadingMode === 'age'
+        ? fwHeat(layout.shadeT(i))
+        : fwColor(layout.slot(i), layout.shadeT(i));
       ctx.fillRect(r[0], r[1], r[2], r[3]);
     }
     ctx.globalAlpha = 1;
@@ -106,8 +174,8 @@ const Treemap = (() => {
     ctx.font = '11px "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace';
     for (let i = 0; i < layout.count; i++) {
       const r = layout.rect(i);
-      if (r[2] < 40 || r[3] < 14) continue;
-      const name = nameOf(layout.node(i));
+      if (r[2] < LABEL_MIN_W || r[3] < LABEL_MIN_H) continue;
+      const name = labelNames.get(layout.node(i));
       if (!name) continue;
       const hd = layout.header(i);
       const ty = hd[3] > 0 ? hd[1] + 3 : r[1] + 2;
@@ -140,7 +208,9 @@ const Treemap = (() => {
 
   function localPos(ev) {
     const b = canvas.getBoundingClientRect();
-    return { x: ev.clientX - b.left, y: ev.clientY - b.top };
+    const size = cssSize();
+    return { x: (ev.clientX - b.left) * size.w / Math.max(1, b.width),
+             y: (ev.clientY - b.top) * size.h / Math.max(1, b.height) };
   }
 
   function showTip(ev, idx) {
@@ -149,7 +219,7 @@ const Treemap = (() => {
     const kind = layout.isDir(idx) ? '目录' : '文件';
     const extra = layout.collapsed(idx) ? '　（因太小已折叠，双击可下钻）' : '';
     tip.innerHTML =
-      `<div class="t-name">${esc(nameOf(node))}</div>` +
+      `<div class="t-name">${esc(labelNames.get(node) || nameOf(node))}</div>` +
       `<div class="t-meta">${kind}　${sizeText(layout.size(idx))}${extra}</div>` +
       `<div class="t-path">${esc(pathOf(node))}</div>`;
     tip.classList.remove('hidden');
@@ -192,6 +262,19 @@ const Treemap = (() => {
   });
 
   // 双击 = 下钻到该方块
+  canvas.addEventListener('contextmenu', (ev) => {
+    const { x, y } = localPos(ev), idx = pick(x, y);
+    if (idx >= 0) { selIdx = idx; draw(); }
+    tip.classList.add('hidden');
+    onContext(ev, idx >= 0 ? layout.node(idx) : null, canvas);
+  });
+  canvas.addEventListener('keydown', (ev) => {
+    if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) {
+      onContext(ev, layout && selIdx >= 0 && selIdx < layout.count ? layout.node(selIdx) : null, canvas);
+    }
+  });
+
+  // 双击 = 下钻到该方块
   canvas.addEventListener('dblclick', (ev) => {
     const { x, y } = localPos(ev);
     const idx = pick(x, y);
@@ -215,11 +298,19 @@ const Treemap = (() => {
   }, { passive: false });
 
   window.addEventListener('keydown', (ev) => {
+    // 输入路径、调整下拉框或关闭弹窗时，不能误触面积图导航。
+    if (ev.defaultPrevented || ev.ctrlKey || ev.altKey || ev.metaKey) return;
+    const target = ev.target;
+    if (target && (target.isContentEditable || target.closest?.('input, textarea, select, button, summary, .menu'))) return;
+    if (document.querySelector('.overlay:not(.hidden)')) return;
+    if (document.querySelector('dialog[open]')) return;
+    if (document.getElementById('view-map').classList.contains('hidden')) return;
     if (ev.key === 'Escape') onZoomOut();
-    else if (ev.key === 'Enter' && selIdx >= 0) onZoomIn(layout.node(selIdx));
+    else if (ev.key === 'Enter' && layout && selIdx >= 0 && selIdx < layout.count) onZoomIn(layout.node(selIdx));
   });
 
-  window.addEventListener('resize', () => { resize(); draw(); });
+  // 调整窗口时先让旧帧随 CSS 尺寸缩放，应用拿到完整新布局后再替换位图。
+  window.addEventListener('filewatch:appearance', draw);
 
   return {
     init(opts) {
@@ -229,13 +320,36 @@ const Treemap = (() => {
       onPick = opts.onPick;
       onZoomIn = opts.onZoomIn;
       onZoomOut = opts.onZoomOut;
+      onContext = opts.onContext || (() => {});
       resize();
     },
-    size: () => { resize(); return cssSize(); },
+    size: measure,
     setLayout,
     redraw: draw,
-    clear() { layout = null; draw(); },
+    clear() { stopFade(); layout = null; labelNames.clear(); hoverIdx = -1; selIdx = -1; tip.classList.add('hidden'); draw(); },
     setHighlight(extId) { highlightExt = extId; draw(); },
+    setShading(mode) { pendingShading = mode; },
+    /**
+     * 指定布局里需要显示名字的节点（默认当前布局，去重、保持首次出现顺序）。
+     *
+     * 布局数据里只有 id，前端拿不到名字，所以得向后端要。这个方法的作用是
+     * 让调用方**一次把要用的名字全取了** —— 逐个方块去要的话，一次布局就是
+     * 几千次 IPC，而且每回来一个都会触发一次整图重画。
+     */
+    labelNodes(candidate = layout) {
+      if (!candidate) return [];
+      const seen = new Set();
+      const out = [];
+      for (let i = 0; i < candidate.count; i++) {
+        const r = candidate.rect(i);
+        if (r[2] < LABEL_MIN_W || r[3] < LABEL_MIN_H) continue;
+        const n = candidate.node(i);
+        if (seen.has(n)) continue;
+        seen.add(n);
+        out.push(n);
+      }
+      return out;
+    },
     selectIdx: (i) => { selIdx = i; draw(); },
     get layout() { return layout; },
   };

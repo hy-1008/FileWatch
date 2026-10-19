@@ -31,7 +31,7 @@ function loadWire() {
   // 不会变成 `sandbox` 的属性（只有 `var` 和函数声明会）。所以要在同一个
   // 上下文里再求值一次，才能把它们取出来。
   return vm.runInContext(
-    '({ Layout, fwColor, FW_PALETTE, FW_VERSION, ITEM_BYTES, HEADER_BYTES, FW_MAGIC })',
+    '({ Layout, fwColor, fwHeat, FW_PALETTE, FW_HEAT, FW_VERSION, ITEM_BYTES, HEADER_BYTES, FW_MAGIC })',
     sandbox,
     { filename: 'wire-exports' });
 }
@@ -99,10 +99,16 @@ function throws(fn, what) {
   catch (e) { pass++; }
 }
 
+/** `rgb(r,g,b)` → `{r,g,b}`；不是这个格式返回 null。 */
+function parseRgb(css) {
+  const m = /^rgb\((\d+),(\d+),(\d+)\)$/.exec(String(css));
+  return m ? { r: +m[1], g: +m[2], b: +m[3] } : null;
+}
+
 /* ── 跑 ────────────────────────────────────────────────────────────────── */
 function main() {
   const sandbox = loadWire();
-  const { Layout, fwColor, FW_PALETTE, FW_VERSION, ITEM_BYTES, HEADER_BYTES } = sandbox;
+  const { Layout, fwColor, fwHeat, FW_PALETTE, FW_HEAT, FW_VERSION, ITEM_BYTES, HEADER_BYTES } = sandbox;
 
   // 常量本身也要对：前端按这些值算偏移
   eq(FW_VERSION, VERSION, '版本号常量');
@@ -186,17 +192,44 @@ function main() {
     }
     const a = fwColor(0, 0.5), b = fwColor(1, 0.5);
     ok(a !== b, '不同槽位应有不同颜色');
-    // 强度为 0 与 1 必须真的不同（否则热力图/深度着色就是摆设）
+    // 强度为 0 与 1 必须真的不同（否则深度着色就是摆设）
     ok(fwColor(3, 0) !== fwColor(3, 1), '强度参数应影响亮度');
     // 越界槽位不能崩
     ok(/^rgb\(/.test(fwColor(999, 0.5)), '槽位越界应回绕而不是报错');
+  }
+
+  /* 年龄热力图：**必须换色相**，不能只调亮度。
+   *
+   * 这条是给一次真实返工留的：以前年龄模式把色槽固定成 0、只调亮度，
+   * 于是整张图同一个颜色，用户反馈「按文件年龄的图也是同一颜色」。
+   * 只断言「格式合法」是抓不到的 —— 得断言两端颜色差别够大。 */
+  {
+    const hot = parseRgb(fwHeat(0));    // 刚改过
+    const cold = parseRgb(fwHeat(1));   // 三年以上
+    ok(hot && cold, 'fwHeat 应产出合法 rgb()');
+    const d = Math.abs(hot.r - cold.r) + Math.abs(hot.g - cold.g) + Math.abs(hot.b - cold.b);
+    ok(d > 120, `热力图两端应明显不同（实际通道差之和 ${d}）`);
+    ok(hot.r > hot.b, '最近改过的应偏暖（红分量大于蓝分量）');
+    ok(cold.b > cold.r, '最旧的应偏冷（蓝分量大于红分量）');
+    // 单调：t 越大越冷（红分量单调不增）
+    let prevR = 256;
+    for (let i = 0; i <= 20; i++) {
+      const c = parseRgb(fwHeat(i / 20));
+      ok(c.r <= prevR, `热力图红分量应随 t 单调不增（t=${i / 20}）`);
+      prevR = c.r;
+    }
+    // 越界/非法输入不能崩
+    ok(/^rgb\(/.test(fwHeat(-5)), 'fwHeat 负值应夹住');
+    ok(/^rgb\(/.test(fwHeat(9)), 'fwHeat 超过 1 应夹住');
+    ok(/^rgb\(/.test(fwHeat(null)), 'fwHeat 非数字应回落到 0');
+    eq(fwHeat(0), fwHeat(0), '同一个 t 必须稳定（图例与画面取同一份调色点）');
   }
 
   /* 结果 */
   console.log('='.repeat(72));
   console.log('前端线格式解码端校验（src/wire.js vs 文档偏移）');
   console.log('='.repeat(72));
-  console.log(`  ${COUNT} 项逐字段对拍 + 命中测试 + 3 条错误路径 + 色板`);
+  console.log(`  ${COUNT} 项逐字段对拍 + 命中测试 + 3 条错误路径 + 色板 + 年龄热力图`);
   if (fails.length) {
     console.log(`\n  ❌ 失败 ${fails.length} 项：`);
     for (const f of fails.slice(0, 20)) console.log('     · ' + f);

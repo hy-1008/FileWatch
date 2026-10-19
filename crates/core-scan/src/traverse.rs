@@ -284,8 +284,8 @@ mod tests {
     #[test]
     fn traverse_real_temp_dir() {
         // 在临时目录里造一棵小树，验证遍历路径本身能跑通
-        let base = std::env::temp_dir().join(format!("fw_traverse_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-traverse").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(base.join("sub")).unwrap();
         std::fs::write(base.join("a.txt"), vec![b'x'; 5000]).unwrap();
         std::fs::write(base.join("sub").join("b.bin"), vec![b'y'; 10]).unwrap();
@@ -300,13 +300,12 @@ mod tests {
         // 根的大小应聚合到 5010
         assert_eq!(tree.arena.get(5).unwrap().size, 5010);
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn traverse_reports_allocated_larger_than_logical() {
-        let base = std::env::temp_dir().join(format!("fw_traverse_alloc_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-traverse-alloc").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("small.txt"), b"hi").unwrap();
 
@@ -316,7 +315,6 @@ mod tests {
         assert_eq!(stats.total_alloc % stats.cluster_size, 0);
         assert_eq!(tree.arena.get(5).unwrap().size, 2);
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -331,8 +329,8 @@ mod tests {
 
     #[test]
     fn progress_callback_is_invoked() {
-        let base = std::env::temp_dir().join(format!("fw_traverse_prog_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-traverse-prog").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(&base).unwrap();
         for i in 0..30 {
             std::fs::write(base.join(format!("f{}.txt", i)), b"x").unwrap();
@@ -346,13 +344,12 @@ mod tests {
         full_scan_traverse(&base, "C:", opts, |_, _| calls += 1);
         assert!(calls >= 6, "至少每 5 个节点回调一次，实际 {}", calls);
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn depth_limit_stops_recursion() {
-        let base = std::env::temp_dir().join(format!("fw_traverse_depth_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-traverse-depth").unwrap();
+        let base = owned.path().to_path_buf();
         let deep = base.join("a").join("b").join("c");
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("deep.txt"), b"z").unwrap();
@@ -364,6 +361,5 @@ mod tests {
         let (_, stats) = full_scan_traverse(&base, "C:", opts, |_, _| {});
         assert_eq!(stats.files_visited, 0, "超过深度限制的文件不应被统计");
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1,8 +1,7 @@
 /* FileWatch GUI —— 配色与排版
  *
- * 用深色：这类工具通常在长时间盯盘/排查时使用，深色底 + 饱和的分类色
- * 更容易分辨面积图里的色块，也不刺眼。
- * 颜色全部走 CSS 变量，换主题只改这一处。
+ * 所有面板、控件、提示与画布底色共用主题变量。
+ * theme.js 在首次绘制前恢复主题、信息密度和布局偏好。
  */
 
 :root {
@@ -14,16 +13,70 @@
   --border-strong: #3d4655;
   --text: #e6e8ec;
   --text-dim: #8b93a1;
-  --text-faint: #5c6577;
+  --text-faint: #939dad;
   --accent: #4c8dff;
   --accent-dim: #2f5da8;
   --warn: #f2994a;
   --crit: #eb5757;
   --ok: #57c98a;
+  --bg-selected: #243752;
+  --bg-track: #101419;
+  --bg-canvas: #11171f;
+  --bg-tip: #1c2430;
+  --text-dir: #a6c9ff;
+  --text-error: #ffd9d9;
+  --shadow: 0 8px 28px rgba(0, 0, 0, .28);
 
-  --row: 22px;
-  --font: "Cascadia Mono", "Consolas", "Microsoft YaHei UI", "Segoe UI", monospace;
+  /* 滚动条：细的浮动式（见文件里「滚动条」一段），不是系统那条粗的 */
+  --sb-size: 10px;
+  --sb-thumb: #3a424e;
+  --sb-thumb-hover: #525d6e;
+
+  --row: 28px;
+  --font: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", "Microsoft YaHei UI", monospace;
 }
+
+.context-menu { position: fixed; z-index: 2000; min-width: 220px; max-width: min(340px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow-y: auto; padding: 5px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--bg-raised); color: var(--text); box-shadow: var(--shadow); }
+.context-title { padding: 7px 9px; color: var(--text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 310px; }
+.context-menu button { display: block; width: 100%; text-align: left; border: none; background: transparent; color: var(--text); padding: 7px 10px; border-radius: 4px; white-space: normal; line-height: 1.5; }
+.context-menu button:hover:not(:disabled), .context-menu button:focus-visible { background: var(--bg-selected); outline: 1px solid var(--accent); }
+.context-menu button:disabled { color: var(--text-faint); opacity: .6; cursor: default; }
+.context-separator { border-top: 1px solid var(--border); margin: 4px 5px; }
+.context-anchor { box-shadow: inset 0 0 0 1px var(--accent); }
+.tr:focus-visible, .file:focus-visible, .ext:focus-visible, .vol:focus-visible, .ind-target:focus-visible, .mrow:focus-visible, .arow:focus-visible, .crumb:focus-visible, #canvas:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+#copy-dialog { width: min(560px, calc(100vw - 40px)); padding: 22px; background: var(--bg-panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 8px; }
+#copy-dialog::backdrop { background: #0006; }
+#copy-dialog textarea { width: 100%; box-sizing: border-box; resize: vertical; color: var(--text); background: var(--bg); border: 1px solid var(--border); padding: 8px; }
+#copy-dialog form { text-align: right; margin-top: 12px; }
+
+:root[data-theme="light"] {
+  --bg: #f0f3f8;
+  --bg-panel: #ffffff;
+  --bg-raised: #f5f7fb;
+  --bg-hover: #e9eef7;
+  --border: #dce3ee;
+  --border-strong: #b9c7dc;
+  --text: #1f2d43;
+  --text-dim: #53647c;
+  --text-faint: #65758a;
+  --accent: #245fcd;
+  --accent-dim: #245fcd;
+  --warn: #965306;
+  --crit: #be3045;
+  --ok: #197449;
+  --bg-selected: #e8f0ff;
+  --bg-track: #e1e7f0;
+  --bg-canvas: #edf2f9;
+  --bg-tip: #ffffff;
+  --text-dir: #265ba4;
+  --text-error: #a91e34;
+  --shadow: 0 8px 28px rgba(32, 55, 89, .14);
+  --sb-thumb: #b7c3d4;
+  --sb-thumb-hover: #8c9db5;
+}
+
+:root[data-density="compact"] { --row: 22px; }
 
 * { box-sizing: border-box; }
 
@@ -37,23 +90,88 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 
-#app { display: flex; flex-direction: column; height: 100vh; }
+#app { display: flex; flex-direction: column; height: 100vh; min-width: 0; }
+
+/* ── 滚动条 ──────────────────────────────────────────────────────────────
+ *
+ * WebView2 就是 Chromium，不给样式的话它画的是**系统默认滚动条**：
+ * 16px 宽、浅灰实心轨道、两端两个三角箭头。摆在深色面板上非常扎眼，
+ * 而且宽度会实打实地吃掉列表右边 16px（用户反馈「太难看了」）。
+ *
+ * 这里统一改成细的**浮动式**：轨道透明、圆角滑块、四周留 2px 透明边，
+ * 视觉宽度只有 6px，静态浏览时只剩一丝痕迹，指针压上去才提亮。
+ * 因为轨道是透明的，列表行能一直铺到最右边，看着像浮在上面。
+ *
+ * 【别加 `scrollbar-width` / `scrollbar-color`】标准属性和 `::-webkit-scrollbar`
+ * 是**互斥**的：一旦设了那两个，Chromium 会整段忽略下面的规则，界面悄悄退回
+ * 那条默认的粗滚动条 —— 不报错，只有亲眼看到才发现。想换外观就改这三个变量。
+ */
+::-webkit-scrollbar { width: var(--sb-size); height: var(--sb-size); }
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner { background: transparent; }
+/* 两端的箭头按钮：在 10px 宽的滚动条上会被压成一个小三角，直接去掉 */
+::-webkit-scrollbar-button { display: none; }
+
+::-webkit-scrollbar-thumb {
+  min-height: 40px;          /* 上万行的列表里，按比例算出的滑块会短到抓不住 */
+  background-color: var(--sb-thumb);
+  border: 2px solid transparent;   /* 透明边 + background-clip → 视觉 6px 的圆角滑块，
+                                      但命中区域仍有 10px，细而不难抓 */
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+/* 只改颜色、不用 `background` 简写：简写会把上面的 background-clip 一起重置回
+   border-box，滑块立刻变胖 4px（这个坑很容易在改配色时踩到）。 */
+::-webkit-scrollbar-thumb:hover { background-color: var(--sb-thumb-hover); }
+::-webkit-scrollbar-thumb:active { background-color: var(--border-strong); }
 
 /* ── 顶栏 ────────────────────────────────────────────────────────────── */
 
 .topbar {
-  display: flex; align-items: center; gap: 14px;
-  padding: 0 12px; height: 40px;
-  background: var(--bg-panel);
-  border-bottom: 1px solid var(--border);
-  flex: 0 0 auto;
+  flex: 0 0 auto; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  position: relative; z-index: 20;
 }
-.brand { font-weight: 700; letter-spacing: .5px; color: var(--accent); }
+.topbar-main { display: flex; align-items: center; gap: 20px; min-height: 48px; padding: 6px 16px; }
+.brand { font-size: 18px; font-weight: 700; letter-spacing: -.3px; white-space: nowrap; }
+.brand-caption { color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+.menubar { display: flex; align-items: center; gap: 4px; }
+.menu { position: relative; }
+.menu > summary { list-style: none; padding: 6px 14px; cursor: pointer; border: 1px solid transparent; border-radius: 5px; }
+.menu > summary::-webkit-details-marker { display: none; }
+.menu > summary::after { content: '▾'; color: var(--text-faint); margin-left: 7px; font-size: 10px; }
+.menu > summary:hover, .menu[open] > summary { background: var(--bg-selected); border-color: var(--border); }
+.menu > summary:focus-visible { outline: 2px solid var(--accent); }
+.menu-popup {
+  position: absolute; top: calc(100% + 8px); left: 0; width: 258px; max-height: calc(100vh - 80px);
+  overflow: auto; padding: 8px; background: var(--bg-panel); border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 4px;
+}
+.file-menu { width: 210px; }
+.menu-popup > button { text-align: left; border: 0; background: transparent; padding: 9px 12px; }
+.menu-popup > button:hover { background: var(--bg-hover); }
+.menu-popup .field { display: grid; grid-template-columns: 66px minmax(0, 1fr); padding: 6px 8px; gap: 8px; }
+.menu-popup .field select, .menu-popup .field input[type=range] { width: 100%; min-width: 0; }
+.menu-divider { height: 1px; margin: 5px 4px; background: var(--border); }
+/* 菜单里的分组标题（「关闭软件」）。它下面是同一组单选，
+   没有这行字的话两个 radio 看起来像两个互不相干的选项。 */
+.menu-label { padding: 4px 10px 2px; color: var(--text-faint); font-size: 11px; }
+/* 菜单里的复选/单选项：整行可点（label 包住了 input），
+   行高按菜单项给，不要用表单里那套更紧凑的行距。 */
+.menu-popup .check { align-items: center; gap: 8px; margin: 0; padding: 7px 10px; border-radius: 5px; }
+.menu-popup .check:hover { background: var(--bg-hover); }
+.menu-popup .check input { margin: 0; }
+.mode-menu { width: 246px; }
 .spacer { flex: 1; }
 
 .field { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
 .field select, .field input[type=range] { width: 120px; }
 .field input[type=range] { width: 90px; }
+
+/* 热力图图例（只在「按文件年龄」时出现）。宽度固定，切模式时右栏不会跳。 */
+.heat { display: flex; align-items: center; gap: 5px; color: var(--text-faint); font-size: 11px; }
+.heat-bar { display: flex; width: 84px; height: 9px; border-radius: 5px;
+            overflow: hidden; border: 1px solid var(--border); }
+.heat-bar i { flex: 1 1 0; display: block; }
 
 select, input[type=text] {
   background: var(--bg-raised);
@@ -64,16 +182,22 @@ select, input[type=text] {
   font: inherit;
 }
 select:focus, input:focus { outline: 1px solid var(--accent); }
+button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+input[type=range], input[type=checkbox] { accent-color: var(--accent); }
 
 button {
   background: var(--bg-raised); color: var(--text);
   border: 1px solid var(--border); border-radius: 4px;
   padding: 4px 10px; font: inherit; cursor: pointer;
+  white-space: nowrap;   /* 「浏览…」被挤成竖排两行比溢出更难看 */
 }
 button:hover { background: var(--bg-hover); }
 button.primary { background: var(--accent-dim); border-color: var(--accent); color: #fff; }
 button.primary:hover { background: var(--accent); }
 button.mini { padding: 1px 6px; font-size: 11px; color: var(--text-dim); font-weight: 400; }
+button.mini.primary { color: #fff; }
 button:disabled { opacity: .45; cursor: default; }
 
 .badge {
@@ -84,45 +208,206 @@ button:disabled { opacity: .45; cursor: default; }
 .badge.mft { color: var(--ok); border-color: var(--ok); }
 .badge.traverse { color: var(--warn); border-color: var(--warn); }
 
-/* ── 三栏 ────────────────────────────────────────────────────────────── */
+/* ── 四栏：盘符 / 文件夹树 / 面积图 / 类型·大文件·详情 ────────────────── */
 
-main { flex: 1 1 auto; display: flex; min-height: 0; }
+main { flex: 1 1 auto; display: flex; min-height: 0; overflow: hidden; }
 
-.panel { display: flex; flex-direction: column; min-height: 0; }
-.panel.left  { width: 320px; flex: 0 0 auto; border-right: 1px solid var(--border); }
-.panel.right { width: 340px; flex: 0 0 auto; border-left: 1px solid var(--border); }
+.panel { display: flex; flex-direction: column; min-height: 0; background: var(--bg-panel); }
+/* 盘符单独一栏（第 1 栏）：一列卡片、自己滚动。
+   宽度按"一行能放下 `可用 931.51 GB`"取；原来它和文件夹树同处一栏、
+   卡片还是两列，每张只有 150px 宽，容量那行挤成一团。
+   `overflow: hidden` 是栏与栏之间的**硬隔离**：三个侧栏里的内容再怎么样
+   也只能被自己裁掉，不可能画到隔壁栏上面去。 */
+/* 第 1、2 栏的宽度交给变量：折叠时盘符栏让出的宽度要**原样**转给文件夹树
+   （见下面的 `body.drives-collapsed`），两边各写一个数字就迟早对不上。
+   窄屏那档只改变量，折叠规则自动跟着走。 */
+:root {
+  --panel-header-height: 40px;
+  --right-w: 286px;
+  --drives-w: 192px;          /* 第 1 栏：盘符 */
+  --left-w: 224px;            /* 第 2 栏：文件夹树 */
+  --drives-w-collapsed: 64px; /* 折叠态：正好放得下「盘符」+ 一个图标 */
+}
+
+.panel.drives { width: var(--drives-w); flex: 0 0 auto; overflow: hidden;
+                border-right: 1px solid var(--border); }
+/* 文件夹树紧挨面积图左侧（第 2 栏）：它是面积图的导航，放在同一视线里 */
+.panel.left   { width: var(--left-w); flex: 0 0 auto; overflow: hidden;
+                border-right: 1px solid var(--border); }
+.panel.right  { width: var(--right-w); flex: 0 0 auto; overflow: hidden;
+                border-left: 1px solid var(--border); }
 .panel.center { flex: 1 1 auto; min-width: 0; background: var(--bg); }
 
+/* 窗口窄时三栏一起收：面积图是主角，不该最先被挤掉。
+   窗口最小宽 960，收完中间还剩 ~290px。 */
+@media (max-width: 1220px) {
+  :root { --drives-w: 168px; --left-w: 186px; --right-w: 248px; }
+}
+
+:root[data-layout="focus"] .panel.right { display: none; }
+
+/* ── 盘符栏折叠 ────────────────────────────────────────────────────────────
+ *
+ * 「盘符」这一栏的横向空间，用户可能更想给文件夹树（树的路径长，窄了全是
+ * 省略号）。点标题栏最右侧那个按钮之后：
+ *
+ *   · 盘符栏缩到 `--drives-w-collapsed`，标题栏只剩「盘符」+ 图标；
+ *   · 省出来的宽度**全部**给文件夹树 —— 所以树的宽度写成
+ *     `calc(var(--left-w) + var(--drives-w) - var(--drives-w-collapsed))`，
+ *     而不是另写一个数字（写死的话，上面任何一个宽度一改就会错位）；
+ *   · 中间区与右栏**一条规则都不加**。两个 `transition` 的时长与缓动相同，
+ *     所以过渡期间 `drives + left` 恒等于原值 —— 中间区的宽度一像素都不动，
+ *     画布也就没有尺寸变化，**不需要**重算面积图布局。
+ *
+ * 过渡挂在 `body.drives-animated` 上、由启动流程在首帧之后加上：否则
+ * 「上次退出时是折叠的」会在每次启动时补放一遍收拢动画。
+ */
+body.drives-animated .panel.drives,
+body.drives-animated .panel.left { transition: width .18s cubic-bezier(.4, 0, .2, 1); }
+
+body.drives-collapsed .panel.drives { width: var(--drives-w-collapsed); }
+body.drives-collapsed .panel.left {
+  width: calc(var(--left-w) + var(--drives-w) - var(--drives-w-collapsed));
+}
+
+/* 折叠态的标题栏：只留「盘符」和那个按钮 */
+body.drives-collapsed .panel.drives .block { padding: 8px 6px; }
+body.drives-collapsed .panel.drives .block h2 { gap: 4px; font-size: 10px; letter-spacing: .2px; }
+body.drives-collapsed #refresh-vols { display: none; }
+
+
+/* 折叠态的卷卡片：一根竖条，上面竖排盘符、下面一截「占用水位」。
+   横排的容量文字在 ~52px 里必然被截成省略号，索性藏起来 —— 卡片的
+   `title` 里仍有 `C:　NTFS　卷标`，悬停看得到全部信息。 */
+body.drives-collapsed .vol {
+  min-height: 84px; padding: 9px 0 7px;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: space-between; gap: 7px;
+}
+body.drives-collapsed .vol .top,
+body.drives-collapsed .vol .fs,
+body.drives-collapsed .vol .label,
+body.drives-collapsed .vol .cap,
+body.drives-collapsed .vol .noadmin { display: none; }
+body.drives-collapsed .vol .bar {
+  width: 6px; height: 28px; border-radius: 3px;
+  background: var(--border);   /* 覆盖横条那个近黑的底：6×28 的竖条上纯黑像根黑棍 */
+  display: flex; flex-direction: column-reverse;   /* 水位自下而上 */
+}
+body.drives-collapsed .vol .bar i { width: 100%; height: var(--used, 0%); }
+
+/* 路径框旁边那个「浏览」用图标按钮（`button.pick`）。
+   与折叠按钮（`.icon`）分开成两个类：`.icon` 带 `margin-left:auto`（它要被
+   顶到标题栏最右），而这里的按钮必须紧跟在输入框右侧 —— 共用一个类的话，
+   其中一个迟早会因为"多出来的那点自动外边距"而错位。 */
+button.pick {
+  flex: 0 0 auto; padding: 1px 4px;
+  display: inline-flex; align-items: center;
+}
+button.pick svg {
+  width: 13px; height: 13px; display: block;
+  fill: none; stroke: currentColor; stroke-width: 1.5;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* 折叠按钮（盘符栏标题栏最右）。写在 `button.mini` 之后，好盖掉它的左右留白。 */
+button.icon { margin-left: auto; padding: 1px 3px; display: inline-flex; align-items: center; }
+button.icon svg {
+  width: 11px; height: 11px; display: block;
+  fill: none; stroke: currentColor; stroke-width: 1.9;
+  stroke-linecap: round; stroke-linejoin: round;
+  transition: transform .18s cubic-bezier(.4, 0, .2, 1);
+}
+/* 折叠后整个图标掉头（一份字形同时表示「收起」和「展开」）。
+   选择器必须点名 `drives-toggle`：写宽了会把**别的**折叠按钮一起转过去
+   （预警区那颗就是这么被误伤的，表现是"折叠了盘符，预警的箭头也反了"）。 */
+body.drives-collapsed #drives-toggle svg { transform: rotate(180deg); }
+
+/* 块的高度策略 —— 混着来就会出重叠：
+ *   .grow  吃掉剩余高度；内容超出时由块**内部的**滚动容器负责
+ * 不带类的块留给右栏那三个"全是滚动列表"的：它们的内容高度只是上限、
+ * 没有期望值，所以按权重分（见下面的 `.grow-ext` 等）。
+ * （`.pinned`「按内容定高、不参与压缩」随左下角那块扫描目录一起删了 ——
+ *   现在左栏只有一个可滚动的盘符块，没有"必须一直看得见"的钉住区。）
+ *
+ * 踩过的坑：盘符块与文件夹树块都用默认值（可收缩）→ 窗口一矮两块一起被
+ * 压扁，而盘符卡片本身没法再矮，于是溢出自己的块、盖在下面的树上。
+ * 现在盘符与文件夹树是**两栏**，就算某一栏被压到极限也只是自己滚动。 */
 .block {
-  padding: 8px 10px; border-bottom: 1px solid var(--border);
+  padding: 12px 10px; border-bottom: 1px solid var(--border);
   display: flex; flex-direction: column; min-height: 0;
 }
-.block.grow { flex: 1 1 auto; }
+.block.grow { flex: 1 1 auto; min-height: 96px; }   /* 96px ≈ 表头 + 三行，再矮就没意义了 */
+
+/* 右栏三块按权重分高度。`flex-basis: 0` 是关键：拿内容高度当基准的话，
+   200 行的「最大的文件」会把只有几行的「详情」挤成一条缝。
+   名字按用途取，不用 `:nth-child` —— 那种写法加一个块就会静默错位。 */
+.panel.right .grow-ext    { flex: 3 1 0; }
+.panel.right .grow-top    { flex: 4 1 0; }
+.panel.right .grow-detail { flex: 2 1 0; min-height: 110px; }
+
 .block h2 {
-  margin: 0 0 6px; font-size: 11px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: .6px; color: var(--text-dim);
+  margin: 0 0 10px; font-size: 12px; font-weight: 600;
+  letter-spacing: .2px; color: var(--text);
   display: flex; align-items: center; gap: 8px;
 }
+/* 列标题和页签共用同一高度，内容区的留白不参与表头测量。 */
+.panel.drives > .block.grow, .panel.right > .block { padding-top: 0; }
+.panel.drives > .block.grow > h2, .panel.right > .block > h2 {
+  box-sizing: border-box; height: var(--panel-header-height); min-height: var(--panel-header-height);
+  flex: 0 0 var(--panel-header-height); margin: 0 -10px 10px; padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+body.drives-collapsed .panel.drives > .block.grow { padding-top: 0; }
+body.drives-collapsed .panel.drives > .block.grow > h2 { margin-left: -6px; margin-right: -6px; padding: 0 6px; }
+.tree-summary { padding-right: 10px; white-space: nowrap; flex: 0 0 auto; }
+.pathbar { display: flex; align-items: center; flex: 0 0 30px; min-width: 0; border-bottom: 1px solid var(--border); background: var(--bg-panel); }
+.tree-location { display: flex; gap: 5px; padding-bottom: 10px; }
+.tree-location input { width: 0; flex: 1; min-width: 0; }
+.tree-summary:empty { display: none; }
 .hint { color: var(--text-faint); font-weight: 400; text-transform: none; letter-spacing: 0; }
 
-.volumes { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px; }
+/* 盘符卡片：一列，卡片内从上到下是 盘符 → 卷标 → 占用条 → 容量。
+   `min-height: 0` + `overflow: auto` 是"这块可以被压"的前提 ——
+   少了这两个，块再矮它也不会滚，只会把卡片画到块的外面去。 */
+.volumes {
+  display: flex; flex-direction: column; gap: 6px;
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+}
+.volumes .empty { color: var(--text-dim); padding: 6px 2px; }
 .vol { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 5px;
        padding: 6px 8px; cursor: pointer; }
 .vol:hover { background: var(--bg-hover); border-color: var(--accent-dim); }
-.vol.active { border-color: var(--accent); background: #1d2836; }
-.vol .top { display: flex; justify-content: space-between; align-items: baseline; }
+.vol.active { border-color: var(--accent); background: var(--bg-selected); }
+.vol.disabled { opacity: .45; }
+.vol .top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
 .vol .drive { font-weight: 700; font-size: 13px; }
+/* 竖排用的单个字母只在折叠态出现（展开态显示 `C:` 更清楚，折叠态竖排的
+   冒号看着像标点错了位） */
+.vol .glyph { display: none; }
+body.drives-collapsed .vol .glyph {
+  display: block;
+  writing-mode: vertical-rl; text-orientation: upright;
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+}
 .vol .fs { color: var(--text-faint); font-size: 10px; }
 .vol .label { color: var(--text-dim); font-size: 10px; white-space: nowrap;
               overflow: hidden; text-overflow: ellipsis; margin: 1px 0 4px; }
-.vol .bar { height: 4px; background: #0e1013; border-radius: 2px; overflow: hidden; }
-.vol .bar i { display: block; height: 100%; background: var(--accent); }
-.vol .cap { color: var(--text-dim); font-size: 10px; margin-top: 3px;
-            display: flex; justify-content: space-between; }
+.vol .bar { height: 4px; background: var(--bg-track); border-radius: 2px; overflow: hidden; }
+/* 已用比例走 CSS 变量、不走行内 `width`：**同一个数字横着是宽度、竖着是高度**
+   （折叠态那根水位条），两种形态各自解释它，JS 只管把比例算出来。 */
+.vol .bar i { display: block; height: 100%; width: var(--used, 0%); background: var(--accent); }
+/* 容量拆成两行、值右对齐：窄栏里把 `931.51 GB` 和 `可用 931.51 GB` 塞进
+   一行正好顶满，两个人都会变成省略号 —— 数字被截断比多占一行难受得多。 */
+.vol .cap { color: var(--text-dim); font-size: 10px; margin-top: 2px;
+            display: flex; justify-content: space-between; gap: 6px; }
+.vol .cap .k { color: var(--text-faint); }
+.vol .cap span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vol .noadmin { color: var(--warn); font-size: 10px; }
 
 .row { display: flex; gap: 6px; }
 .row input { flex: 1; min-width: 0; }
+.input-label { color: var(--text-dim); margin-bottom: 6px; }
 .check { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; color: var(--text-dim); }
 .check input { margin-top: 2px; }
 
@@ -135,11 +420,11 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
   cursor: pointer; white-space: nowrap; border-radius: 3px;
 }
 .tr:hover { background: var(--bg-hover); }
-.tr.sel { background: #1d2836; }
+.tr.sel { background: var(--bg-selected); }
 .tr .arrow { color: var(--text-faint); text-align: center; user-select: none; }
 .tr .arrow.open { color: var(--accent); }
 .tr .nm { overflow: hidden; text-overflow: ellipsis; }
-.tr .nm.dir { color: #9dc4ff; }
+.tr .nm.dir { color: var(--text-dir); }
 .tr .sz { color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .tr .cnt { color: var(--text-faint); font-size: 10px; }
 .tr.child { padding-left: 16px; }
@@ -147,7 +432,7 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 .ext { display: grid; grid-template-columns: 1fr 52px 74px; gap: 6px;
        align-items: center; height: var(--row); padding: 0 4px; cursor: pointer; border-radius: 3px; }
 .ext:hover { background: var(--bg-hover); }
-.ext.on { background: #1d2836; }
+.ext.on { background: var(--bg-selected); }
 .ext .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
 .ext .n { color: var(--text-dim); text-align: right; font-variant-numeric: tabular-nums; }
 .ext .s { text-align: right; font-variant-numeric: tabular-nums; }
@@ -165,9 +450,40 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 
 /* ── 中间区 ─────────────────────────────────────────────────────────── */
 
+/* 视图切换条。三个视图各占满整个中间区（而不是并排），所以这里只切显隐。 */
+.viewtabs {
+  flex: 0 0 var(--panel-header-height); height: var(--panel-header-height); min-height: var(--panel-header-height); display: flex; align-items: center; gap: 6px;
+  padding: 0 8px; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+}
+.view { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+
+/* 分析视图的参数条 */
+.tool {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 5px 10px; background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+.tool.thin { padding: 4px 10px; gap: 8px; background: transparent; }
+.tool .f { display: flex; align-items: center; gap: 5px; color: var(--text-dim); font-size: 11px; max-width: 100%; min-width: 0; }
+.tool .f > span:first-child { white-space: nowrap; }
+/* 搜索框吃掉剩余宽度：它是这一行里唯一"越宽越好用"的东西 */
+.tool .f.grow { flex: 1 1 240px; }
+.tool .f.grow input { width: 100%; min-width: 0; }
+/* 数字框窄、路径框宽。分开成两个类而不是靠 :not() —— 后者在两边的
+   选择器权重上很容易踩坑。 */
+.tool input.num { width: 72px; }
+/* 路径框要能伸开：路径本来就长，给 72px 就变成"只能看见盘符" */
+input.path { width: 260px; min-width: 0; max-width: 100%; flex: 0 1 300px; }
+.tool .progress { flex: 1 1 140px; min-width: 80px; height: 5px; }
+/* 「候选 1234 个文件（排除：…）」这类说明可以很长，允许它换行占满整行 */
+.tool .hint { flex: 1 1 100%; min-width: 0; }
+
+/* 通用可滚动列表（重复文件的组、快照对比的行都用它） */
+.list { flex: 1 1 auto; overflow: auto; min-height: 0; }
+
 .breadcrumb {
-  flex: 0 0 auto; height: 30px; display: flex; align-items: center; gap: 4px;
-  padding: 0 10px; border-bottom: 1px solid var(--border);
+  flex: 1 1 auto; min-width: 0; height: 30px; display: flex; align-items: center; gap: 4px;
+  padding: 0 10px;
   overflow-x: auto; white-space: nowrap; background: var(--bg-panel);
 }
 .crumb { cursor: pointer; color: var(--text-dim); padding: 1px 4px; border-radius: 3px; }
@@ -177,12 +493,13 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 
 .canvas-wrap { flex: 1 1 auto; position: relative; min-height: 0; overflow: hidden; }
 #canvas { display: block; width: 100%; height: 100%; }
+#canvas-previous { position: absolute; inset: 0; display: block; width: 100%; height: 100%; pointer-events: none; opacity: 0; }
 
 .tip {
   position: absolute; pointer-events: none; z-index: 5;
-  background: rgba(10,12,15,.95); border: 1px solid var(--border-strong);
+  background: var(--bg-tip); border: 1px solid var(--border-strong);
   border-radius: 4px; padding: 6px 8px; max-width: 460px;
-  box-shadow: 0 6px 18px rgba(0,0,0,.5);
+  box-shadow: var(--shadow);
 }
 .tip .t-name { font-weight: 600; }
 .tip .t-meta { color: var(--text-dim); margin-top: 2px; }
@@ -190,9 +507,12 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 
 .empty-hint {
   position: absolute; inset: 0; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 6px; text-align: center;
+  align-items: center; justify-content: center; gap: 10px; text-align: center; padding: 24px;
+  color: var(--text-dim); overflow: auto;
 }
 .empty-hint p { margin: 0; }
+.empty-mark { font: 40px/1 var(--font); color: var(--accent); }
+.empty-title { font-size: 18px; font-weight: 600; color: var(--text); }
 .dim { color: var(--text-dim); }
 
 .canvas-status {
@@ -204,10 +524,23 @@ main { flex: 1 1 auto; display: flex; min-height: 0; }
 /* ── 状态栏 ─────────────────────────────────────────────────────────── */
 
 .statusbar {
-  flex: 0 0 auto; height: 26px; display: flex; align-items: center; gap: 16px;
+  flex: 0 0 auto; min-height: 30px; display: flex; align-items: center; gap: 12px;
   padding: 0 12px; background: var(--bg-panel); border-top: 1px solid var(--border);
   color: var(--text-dim); font-size: 11px;
 }
+.statusbar > span:not(.spacer) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+#st-paths { max-width: 22vw; }
+/* 盘符容量。它是"这块盘还剩多少"，和 st-size（"扫到的文件加起来多大"）
+   不是一回事，所以给它一点强调，免得被当成重复信息。 */
+#st-space { color: var(--text); }
+
+/* 顶栏的模式选择：与菜单里那些 field 同一套紧凑排版，但它**不进菜单** ——
+   「模式」是常驻状态，藏进菜单就等于没有（用户不会天天去翻菜单看自己在哪个模式）。 */
+.topbar-main .field.mode-field { gap: 6px; white-space: nowrap; }
+.topbar-main .field.mode-field select { width: 92px; }
+/* 开机自启开着的时候要点亮：文字已经写了"开/关"，再加一个描边是为了扫一眼
+   就能看出来，不用去读那两个字。 */
+button.mini.on { color: var(--ok); border-color: var(--ok); }
 
 /* 权限按钮：降级时橙色（提醒"你在慢速通道"），已是管理员时绿色 */
 button.perm { flex: 0 0 auto; padding: 1px 8px; font-size: 11px; color: var(--text-dim); }
@@ -232,7 +565,7 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
 .opt ul { margin: 6px 0 0; padding-left: 18px; }
 .opt li { color: var(--text-dim); margin: 3px 0; }
 .opt code {
-  background: #0e1013; color: #9dc4ff;
+  background: var(--bg-track); color: var(--text-dir);
   padding: 0 4px; border-radius: 3px;
 }
 
@@ -250,85 +583,207 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
 .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
 #admin-wait { margin-top: 8px; text-align: right; }
 
-/* ── F6/F7/F8 实时监控抽屉 ─────────────────────────────────────────── */
-
-.monitor {
-  flex: 0 0 auto; background: var(--bg-panel); border-top: 1px solid var(--border);
-}
-.mon-head { display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 12px; }
-.mon-meta {
-  color: var(--text-dim); font-size: 11px; max-width: 300px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.mon-err { color: var(--crit); font-size: 11px; max-width: 40vw;
-           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.mon-body {
-  display: grid; grid-template-columns: 340px 1fr;
-  height: 250px; border-top: 1px solid var(--border);
-}
-.mon-setup {
-  padding: 8px 10px; border-right: 1px solid var(--border);
-  overflow: auto; display: flex; flex-direction: column; gap: 6px;
-}
-.mon-setup .f {
-  display: grid; grid-template-columns: 66px 1fr; gap: 6px;
-  align-items: center; color: var(--text-dim); font-size: 11px;
-}
-.mon-setup .f > span:first-child { white-space: nowrap; }
+/* 文件夹树与实时监控共用左栏；监控记录在右栏独立滚动。 */
+.navigation-tabs { display: flex; align-items: center; height: var(--panel-header-height); min-height: var(--panel-header-height); flex: 0 0 var(--panel-header-height); gap: 2px; padding: 0 6px; border-bottom: 1px solid var(--border); }
+.navigation-tabs .tab { flex: 1; padding-left: 4px; padding-right: 4px; }
+.monitor { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.monitor-mode { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text-dim); }
+.linked-monitor { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.independent-pane { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
+.independent-pane > p { line-height: 1.7; }
+.independent-pane .mon-setup { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.independent-pane .row { flex-wrap: wrap; gap: 5px; }
+.ind-target { padding: 12px 0; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 7px; }
+.ind-title { color: var(--accent); font-size: 11px; }
+.ind-path { overflow-wrap: anywhere; line-height: 1.5; }
+#rule-help-dialog { max-width: 580px; width: calc(100% - 50px); max-height: 85vh; overflow: auto; color: var(--text); background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 8px; padding: 24px; line-height: 1.8; }
+#rule-help-dialog::backdrop { background: #0006; }
+#rule-help-dialog h3 { margin-top: 0; }
+#rule-help-dialog form { text-align: right; }
+.mon-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px; border-bottom: 1px solid var(--border); }
+.mon-head > .badge { order: 0; }
+.mon-head > button { order: 1; margin-left: auto; }
+.mon-head > .spacer { display: none; }
+.mon-meta, .mon-err { flex: 1 0 100%; min-width: 0; font-size: 11px; overflow-wrap: anywhere; color: var(--text-dim); }
+.mon-meta { order: 2; }
+.mon-err { order: 3; color: var(--crit); }
+.mon-body { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.mon-setup { display: flex; flex-direction: column; gap: 12px; padding: 12px; }
+.mon-setup .f { display: flex; flex-direction: column; align-items: stretch; gap: 6px; color: var(--text-dim); font-size: 11px; }
+.mon-setup .row { flex-wrap: wrap; gap: 5px; }
+.mon-setup .check { align-items: flex-start; line-height: 1.6; }
 .mon-setup textarea, .mon-setup input[type=text] {
-  background: var(--bg-raised); color: var(--text);
-  border: 1px solid var(--border); border-radius: 4px;
-  padding: 3px 6px; font: inherit; width: 100%; min-width: 0;
-  resize: vertical;
+  background: var(--bg-raised); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 5px 6px; font: inherit; width: 100%; min-width: 0; resize: vertical;
 }
+.mon-setup #mon-interval { width: 86px; }
 .mon-setup textarea:focus, .mon-setup input:focus { outline: 1px solid var(--accent); }
-
-.mon-lists { display: flex; flex-direction: column; min-width: 0; }
-.mon-tabs {
-  display: flex; align-items: center; gap: 6px; height: 28px;
-  padding: 0 8px; border-bottom: 1px solid var(--border); flex: 0 0 auto;
-}
+.panel.right .grow-changes { flex: 4 1 0; }
+.panel.right .grow-alerts { flex: 3 1 0; }
+/* 预警区折叠：退出按权重分配、只留标题栏，省下的高度全归变更流水。
+   所以这里**不需要**给 grow-changes 改数字 —— 那会把"预警能占多少"这个
+   决定写死在两处（改一处忘另一处的结果是一块空白）。 */
+#monitor-alerts.collapsed { flex: 0 0 auto; }
+#monitor-alerts.collapsed .mon-list { display: none; }
+#monitor-alerts.collapsed #alerts-toggle svg { transform: rotate(180deg); }
+.monitor-filter { display: flex; margin-bottom: 8px; }
+.monitor-filter select { width: 100%; }
+:root[data-layout="focus"] body.monitor-active .panel.right { display: flex; }
 .tab {
   background: transparent; border: 1px solid transparent; border-radius: 4px;
-  padding: 1px 8px; font-size: 11px; color: var(--text-dim);
+  padding: 5px 10px; font-size: 12px; color: var(--text-dim);
+  white-space: nowrap;   /* 窄窗口时「面积图」折成两行比被裁掉更难看 */
 }
 .tab:hover { background: var(--bg-hover); }
-.tab.on { background: var(--bg-raised); border-color: var(--border-strong); color: var(--text); }
+.tab.on { background: var(--bg-selected); border-color: var(--border-strong); color: var(--accent); }
 .mon-list { overflow: auto; flex: 1 1 auto; min-height: 0; }
-
-/* 变更行：时间 / 类型 / 体积 / 路径 / 附注 */
-.mrow {
-  display: grid; grid-template-columns: 64px 56px 84px minmax(0, 1fr) auto;
-  gap: 8px; align-items: center; height: var(--row); padding: 0 8px;
-  white-space: nowrap; border-radius: 3px;
+/* 页签条右侧的提示：空间不够时自己截断，别把页签挤变形 */
+.viewtabs .hint {
+  flex: 0 1 auto; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
 }
-.mrow:hover { background: var(--bg-hover); }
-.mrow .t { color: var(--text-faint); font-variant-numeric: tabular-nums; }
-.mrow .k { color: var(--text-dim); }
+
+/* 右侧流水卡片：时间/类型/体积一行，路径另起一行。 */
+.mrow, .arow {
+  display: grid; grid-template-columns: 1fr auto; gap: 5px 8px; align-items: center;
+  padding: 9px 5px; border-bottom: 1px solid var(--border); font-size: 11px;
+}
+.mrow:hover, .arow:hover { background: var(--bg-hover); }
+.mrow .t, .arow .t { grid-column: 1 / -1; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.mrow .k, .arow .k { color: var(--text-dim); }
 .mrow .k.created { color: var(--ok); }
 .mrow .k.deleted { color: var(--crit); }
 .mrow .k.renamed { color: var(--accent); }
-.mrow .k.modified { color: var(--warn); }
-.mrow .p { overflow: hidden; text-overflow: ellipsis; }
-.mrow .p.dir { color: #9dc4ff; }
-.mrow .s { color: var(--text-dim); font-variant-numeric: tabular-nums; text-align: right; }
-.mrow .x { color: var(--text-faint); font-size: 10px; }
-
-/* 预警行 */
-.arow {
-  display: grid; grid-template-columns: 64px 84px minmax(0, 1fr) auto;
-  gap: 8px; align-items: center; height: var(--row); padding: 0 8px;
-  white-space: nowrap; border-radius: 3px;
-}
-.arow:hover { background: var(--bg-hover); }
-.arow .t { color: var(--text-faint); font-variant-numeric: tabular-nums; }
-.arow .k { color: var(--warn); }
-.arow .k.rate { color: var(--crit); }
-.arow .p { overflow: hidden; text-overflow: ellipsis; }
-.arow .s { color: var(--text-dim); font-variant-numeric: tabular-nums; text-align: right; }
+.mrow .k.modified, .arow .k { color: var(--warn); }
+.mrow .p, .arow .p { grid-column: 1 / -1; overflow-wrap: anywhere; line-height: 1.5; }
+.mrow .p.dir { color: var(--text-dir); }
+.mrow .s, .arow .s { text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.arow .s { grid-column: 1 / -1; text-align: left; }
+.mrow .x { grid-column: 1 / -1; color: var(--text-faint); overflow-wrap: anywhere; }
+.mrow .x:empty { display: none; }
+:root[data-density="compact"] .mrow, :root[data-density="compact"] .arow { padding-top: 5px; padding-bottom: 5px; }
 
 .mon-empty { padding: 10px; color: var(--text-dim); }
+
+/* ── F12 重复文件 / F11 快照对比 ───────────────────────────────────── */
+
+/* 一组重复文件：组头 + 组内文件。组头吸顶，滚动时知道自己在看哪一组。 */
+.dgroup { border-bottom: 1px solid var(--border); }
+.dgroup .dgh {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 4px 10px; background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 1;
+}
+.dgroup .dgh .idx { color: var(--text-faint); }
+.dgroup .dgh .sz { font-weight: 600; }
+.dgroup .dgh .n { color: var(--text-dim); }
+/* 「删到只剩一份能回收多少」是这一屏真正想让用户看到的数字 */
+.dgroup .dgh .w { color: var(--warn); }
+
+.dfile {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px; align-items: center; height: var(--row); padding: 0 10px 0 24px;
+  white-space: nowrap;
+}
+.dfile:hover { background: var(--bg-hover); }
+.dfile .p { overflow: hidden; text-overflow: ellipsis; }
+.dfile .d { color: var(--text-faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+
+/* 差异行：类型 / 变化（增量 + 前后大小）/ 文件名 / 修改时间 / 创建时间 / 所在目录
+ *
+ * 六列在窄窗口下放不下，所以**允许横向滚动**（容器是 .list，
+ * `overflow:auto` 两个方向都滚）：把时间或文件名压成省略号，等于把这张表
+ * 要回答的问题抹掉了。文件名另外还做「中间省略」，见 view-rule.js。 */
+.dhead, .drow {
+  display: grid;
+  grid-template-columns: 52px 132px minmax(120px, 1.5fr) 108px 108px minmax(90px, 1.1fr);
+  gap: 10px; align-items: center; padding: 0 10px; white-space: nowrap;
+  min-width: 760px;
+}
+.dhead {
+  position: sticky; top: 0; z-index: 1; height: 26px;
+  color: var(--text-faint); font-size: 11px;
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+}
+.dhead .d { text-align: right; }
+.drow {
+  min-height: var(--row); padding-top: 3px; padding-bottom: 3px;
+  border-radius: 3px;
+}
+.drow:hover { background: var(--bg-hover); }
+.drow .k { color: var(--text-dim); }
+/* 与监控流水同一套语义色：新增=绿、删除=红、变大=橙、变小=蓝。
+   注意这里说的是"文件变多了/变少了"，不是股价，所以不套用红涨绿跌。 */
+.drow .k.added { color: var(--ok); }
+.drow .k.removed { color: var(--crit); }
+.drow .k.grew { color: var(--warn); }
+.drow .k.shrank { color: var(--accent); }
+/* 「变化」列：第一行是增量（带正负号），第二行是尺寸前后对比 */
+.drow .d {
+  display: flex; flex-direction: column; align-items: flex-end;
+  text-align: right; font-variant-numeric: tabular-nums; line-height: 1.25;
+}
+.drow .d small { color: var(--text-faint); font-size: 10px; }
+.drow .n { overflow: hidden; text-overflow: ellipsis; }
+.drow .t { color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums;
+           overflow: hidden; text-overflow: ellipsis; }
+.drow .p { overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
+.drow .p.dir { color: var(--text-dir); }
+
+/* 搜索结果：类型 / 文件名 / 大小 / 修改时间 / 所在目录（五列，比差异行少一列） */
+.shead, .srow {
+  display: grid;
+  grid-template-columns: 60px minmax(140px, 1.6fr) 92px 108px minmax(100px, 1.2fr);
+  gap: 10px; align-items: center; padding: 0 10px; white-space: nowrap;
+  min-width: 620px;
+}
+.shead {
+  position: sticky; top: 0; z-index: 1; height: 26px;
+  color: var(--text-faint); font-size: 11px;
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+}
+.shead .d, .srow .d { text-align: right; }
+.srow { height: var(--row); border-radius: 3px; }
+.srow:hover { background: var(--bg-hover); }
+.srow .k { color: var(--text-dim); font-size: 11px; }
+.srow .k.dir { color: var(--text-dir); }
+.srow .n { overflow: hidden; text-overflow: ellipsis; }
+.srow .d, .srow .t { font-variant-numeric: tabular-nums; }
+.srow .t { color: var(--text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+.srow .p { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }
+
+/* 内容搜索结果：文件名 / 命中行（可能三行）/ 大小 / 修改时间。
+   行高不定 —— 命中行有几条就多高，所以这里让内容决定高度，不写死 var(--row)。 */
+.chead, .crow {
+  display: grid;
+  grid-template-columns: minmax(120px, 200px) minmax(220px, 2fr) 88px 108px;
+  gap: 10px; align-items: start; padding: 6px 10px; white-space: nowrap;
+  min-width: 680px;
+}
+.chead {
+  position: sticky; top: 0; z-index: 1; height: 26px; align-items: center;
+  color: var(--text-faint); font-size: 11px;
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+}
+.chead .d, .crow .d { text-align: right; }
+.crow { border-radius: 3px; }
+.crow:hover { background: var(--bg-hover); }
+.crow .n { overflow: hidden; text-overflow: ellipsis; }
+.crow .hits { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* 命中行：行号是锚点（等宽数字），正文超长时尾部省略 —— 这里不中间省略，
+   因为用户看的是"这句话里有没有我要的词"，尾部省略更符合阅读习惯。 */
+.crow .ln {
+  color: var(--text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.crow .ln b { color: var(--text-faint); font-weight: 500; }
+.crow .d { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.crow .t { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+
+/* 两条不同方向的提示要一眼分得开：警告是橙的，说明是灰的 */
+.note-warn { color: var(--warn); }
+.note-dim { color: var(--text-dim); }
 
 /* ── 遮罩 / 提示 ────────────────────────────────────────────────────── */
 
@@ -338,11 +793,13 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
 }
 .overlay .card {
   background: var(--bg-panel); border: 1px solid var(--border-strong);
-  border-radius: 8px; padding: 20px 24px; width: 460px;
+  border-radius: 12px; padding: 24px; width: 460px;
+  max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); overflow: auto;
+  box-shadow: var(--shadow);
 }
 .overlay h3 { margin: 0 0 12px; font-size: 14px; }
-.progress { height: 6px; background: #0e1013; border-radius: 3px; overflow: hidden; }
-.progress i, #progress-bar { display: block; height: 100%; width: 0%;
+.progress { height: 6px; background: var(--bg-track); border-radius: 3px; overflow: hidden; }
+.progress i, #progress-bar, #dup-bar, #diff-bar, #content-bar { display: block; height: 100%; width: 0%;
   background: linear-gradient(90deg, var(--accent-dim), var(--accent)); transition: width .2s; }
 #progress-text { margin-top: 8px; }
 
@@ -351,6 +808,41 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
   background: var(--bg-raised); border: 1px solid var(--border-strong);
   border-radius: 6px; padding: 8px 14px; z-index: 60; max-width: 70vw;
 }
-.toast.err { border-color: var(--crit); color: #ffd9d9; }
+.toast.err { border-color: var(--crit); color: var(--text-error); }
+
+/* 信息密度与布局独立：切换后只改变间距，不改变监控或扫描设置。 */
+:root[data-density="compact"] .block { padding-top: 8px; padding-bottom: 8px; }
+:root[data-density="compact"] { --panel-header-height: 36px; }
+:root[data-density="compact"] .panel.drives > .block.grow,
+:root[data-density="compact"] .panel.right > .block { padding-top: 0; }
+:root[data-density="compact"] .topbar-main { min-height: 44px; padding-top: 6px; padding-bottom: 6px; }
+:root[data-density="compact"] .tab { padding-top: 2px; padding-bottom: 2px; }
+
+/* 窗口变窄时让次要信息截断，操作控件仍可用；表格保留可横向滚动的列。 */
+
+
+.drow { min-width: 480px; }
+.mon-meta { min-width: 0; }
+@media (max-width: 1080px) {
+  .brand-caption { display: none; }
+  .topbar-main { gap: 10px; padding-left: 12px; padding-right: 12px; }
+  .mon-head { gap: 7px; }
+  .statusbar { gap: 8px; }
+}
+@media (max-height: 700px) {
+  .empty-hint { gap: 6px; padding: 14px; }
+  .empty-mark { display: none; }
+  .panel.right .grow-detail { min-height: 85px; }
+}
+@media (max-width: 760px) {
+  .topbar-main { flex-wrap: wrap; }
+  main { overflow-x: auto; }
+  .panel.center { min-width: 320px; }
+  .mon-head { flex-wrap: wrap; }
+  .compare { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
 
 .hidden { display: none !important; }

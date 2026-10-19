@@ -389,6 +389,11 @@ impl Session {
             return inc.poll(&mut self.engine, &mut self.tree, now_ms);
         }
         if let Some(w) = self.watch.as_mut() {
+            let code = w.watcher.exit_error();
+            if code != 0 {
+                return Err(io::Error::new(io::ErrorKind::Other,
+                    format!("目录监视已中断（Windows 错误 {code}），请重新扫描后再开始监控")));
+            }
             return Ok(w.poll(&mut self.tree, &mut self.engine, now_ms));
         }
         Ok(self.engine.tick(&mut self.tree, now_ms, |_| None))
@@ -425,8 +430,8 @@ impl Session {
             }
             None => match self.watch.as_mut() {
                 Some(w) => {
-                    let out = w.flush(&mut self.tree, &mut self.engine, now_ms);
                     w.shutdown();
+                    let out = w.flush(&mut self.tree, &mut self.engine, now_ms);
                     Ok(out)
                 }
                 None => {
@@ -555,8 +560,8 @@ mod tests {
 
     #[test]
     fn force_traverse_skips_mft_even_with_volume_handle() {
-        let base = std::env::temp_dir().join(format!("fw_force_trav_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-force-trav").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("only.txt"), b"abc").unwrap();
 
@@ -571,13 +576,12 @@ mod tests {
         assert!(s.warnings.iter().any(|w| w.contains("跳过 MFT")));
         assert_eq!(s.tree.file_count, 1);
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn traverse_session_on_temp_dir() {
-        let base = std::env::temp_dir().join(format!("fw_session_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-session").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(base.join("docs")).unwrap();
         std::fs::write(base.join("docs").join("readme.md"), b"hello world").unwrap();
         std::fs::write(base.join("data.bin"), vec![0u8; 2048]).unwrap();
@@ -602,13 +606,12 @@ mod tests {
         let line = s.status_line();
         assert!(line.contains("降级"));
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn find_node_by_path_works() {
-        let base = std::env::temp_dir().join(format!("fw_session_find_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-session-find").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(base.join("level1")).unwrap();
         std::fs::write(base.join("level1").join("f.txt"), b"x").unwrap();
 
@@ -628,7 +631,6 @@ mod tests {
         assert!(r.is_some());
         assert_eq!(s.engine.rules.len(), 1);
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 端到端：降级模式 + 实时增量（`ReadDirectoryChangesW`）。
@@ -637,8 +639,8 @@ mod tests {
     /// 「扫描 → 事件 → 增量更新索引 → 体积上传」全流程验证。
     #[test]
     fn degraded_mode_tracks_changes_live() {
-        let base = std::env::temp_dir().join(format!("fw_live_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-live").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(base.join("inbox")).unwrap();
         std::fs::write(base.join("inbox").join("seed.txt"), vec![b'a'; 1000]).unwrap();
 
@@ -653,7 +655,6 @@ mod tests {
         if s.watch.is_none() {
             // 极端受限环境下连目录句柄都拿不到，跳过而不是误报
             eprintln!("跳过：目录监视不可用（{}）", s.warnings.join(" / "));
-            let _ = std::fs::remove_dir_all(&base);
             return;
         }
 
@@ -728,7 +729,7 @@ mod tests {
         );
 
         // ⑥ 删除它，验证负向 delta
-        std::fs::remove_file(base.join("inbox").join("sub").join("deep.bin")).unwrap();
+        owned.remove_file("inbox/sub/deep.bin").unwrap();
         for i in 0..60u64 {
             let now = 20_000 + i * 100;
             let _ = s.poll(now).unwrap();
@@ -747,13 +748,12 @@ mod tests {
         assert!(s.status_line().contains("监视"));
 
         let _ = s.shutdown(30_000);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn watch_can_be_disabled() {
-        let base = std::env::temp_dir().join(format!("fw_nowatch_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let owned = core_io::test_dir::TestDir::new("fw-nowatch").unwrap();
+        let base = owned.path().to_path_buf();
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("x.txt"), b"1").unwrap();
 
@@ -768,6 +768,5 @@ mod tests {
         assert!(s.warnings.iter().any(|w| w.contains("按配置关闭")));
         assert!(s.status_line().contains("不可用"));
 
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

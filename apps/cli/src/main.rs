@@ -11,6 +11,8 @@
 //! | `scan` | 全量扫描、Top-N、扩展名统计、面积图布局 | M1 / M4 预览 |
 //! | `top` | 恒定内存找最大文件（不建树） | §5.1 |
 //! | `monitor` | 实时增量 + 阈值预警 | M2 / M3 |
+//! | `dupes` | 重复文件三级去重（体积 → 部分哈希 → 全哈希）+ 逐字节复核 | F12 |
+//! | `snapshot` / `diff` | 快照落盘 与 「这一周谁变大了」 | F11 |
 //! | `selftest` | 免管理员的全链路自检 | 全部 |
 //!
 //! ## 设计约束
@@ -25,21 +27,26 @@ mod args;
 mod render;
 mod selftest;
 
-use args::{parse_ms, parse_rule, rule_label, Args};
+use args::{parse_ms, parse_rule, parse_size, rule_label, Args};
 use core_index::aggregate::{top_files, SizeMode};
 use core_index::hardlink::build_report;
 use core_index::tree::ChildIndex;
 use core_index::{ExtensionTable, Tree, RECNO_MASK};
-use core_io::util::human_size;
+use core_io::hash::PARTIAL_BLOCK;
+use core_io::util::{human_size, unix_ms, unix_secs};
 use core_monitor::debounce::PendingEvent;
 use core_monitor::rules::Alert;
 use core_monitor::{PathRemap, Rule, RuleKind, TickOutcome};
-use core_scan::{ScanBackend, ScanPhase, Session, SessionConfig};
+use core_scan::{
+    collect_candidates, find_duplicates, groups_to_csv, rows_to_csv, signed_size, DiffOptions,
+    DiffOrder, DupOptions, DupProgress, DupReport, DupStage, FsSource, ScanBackend, ScanPhase,
+    Session, SessionConfig, Snapshot, SnapshotOptions,
+};
 use core_usn::journal;
 use core_viz::{compute_layout, LayoutOptions, LodPolicy, Rect, ShadingMode};
 use render::{
-    fmt_offset_ms, fmt_unix_utc, pad_left, pad_right, render_ascii, render_legend, rule_line,
-    truncate, truncate_keep_tail,
+    fmt_offset_ms, fmt_unix_stamp, fmt_unix_utc, pad_left, pad_right, render_ascii, render_legend,
+    rule_line, truncate, truncate_keep_tail,
 };
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +67,9 @@ fn main() {
         "scan" => cmd_scan(&a),
         "top" => cmd_top(&a),
         "monitor" | "watch" => cmd_monitor(&a),
+        "dupes" | "dup" => cmd_dupes(&a),
+        "snapshot" | "snap" => cmd_snapshot(&a),
+        "diff" => cmd_diff(&a),
         "selftest" | "self-test" | "check" => cmd_selftest(&a),
         "" | "help" | "-h" | "--help" => {
             print_help();
@@ -94,6 +104,9 @@ fn print_help() {
   scan <盘符> [选项]          全量扫描并输出统计（M1 验收）
   top <盘符> [选项]           恒定内存找最大的 N 个文件（不建树）
   monitor <路径> [选项]       实时监控 + 阈值预警（M2/M3 验收）
+  dupes <盘符|目录> [选项]    查找内容相同的重复文件（F12）
+  snapshot <盘符|目录> [选项] 建立快照，供以后对比（F11）
+  diff <旧快照> <新快照>      对比两次快照，看这段时间谁变大了（F11）
   selftest [--verbose]        免管理员的全链路自检
   help / version
 
@@ -133,12 +146,37 @@ journal 选项：
   --journal-size=32M     创建时的最大容量
   --journal-delta=4M     创建时的分配增量
 
+dupes 选项：
+  --min-size=1M          小于这个体积的文件不参与（默认 0 = 只排除空文件）
+  --top=N                最多显示多少组（默认 200）
+  --block=4K             部分哈希读首尾各多少字节（默认 4K）
+  --max-per-group=N      每组最多列出几个文件（默认 50，总量仍如实统计）
+  --max-candidates=N     候选上限，防内存失控（默认 0 = 不限）
+  --csv=FILE             把结果写成 CSV
+  --json                 以 JSON 输出
+  --force-traverse       不碰裸设备，强制走目录遍历
+
+snapshot 选项：
+  --out=FILE             输出路径（默认 snapshot-<UTC 时间戳>.tsv）
+  --max-entries=N        最多记录多少个文件（默认 0 = 不限）
+  --force-traverse       不碰裸设备，强制走目录遍历
+
+diff 选项：
+  --top=N                最多输出多少行（默认 50）
+  --min-delta=1K         忽略增量小于此值的改动，默认 0
+  --by-abs               按变化幅度排序（默认按增量降序，即"谁变大了"）
+  --by-path              按路径排序
+  --csv=FILE             把差异行写成 CSV
+
 示例：
   filewatch volumes
   filewatch probe C:
   filewatch scan C: --top=10 --exts=10 --layout=110x32
   filewatch scan D: --root=D:\projects --json
   filewatch monitor D:\projects --rule=abs=1G --rule=rate=5M/1m --duration=5m
+  filewatch dupes D:\photos --min-size=1M --csv=dupes.csv
+  filewatch snapshot D:\projects --out=proj-1014.tsv
+  filewatch diff proj-1007.tsv proj-1014.tsv --top=30
   filewatch selftest --verbose
 "#
     );
@@ -662,7 +700,7 @@ fn print_layout(tree: &Tree, w: usize, h: usize) {
         policy: LodPolicy::wide(),
         mode: SizeMode::Logical,
         shading: ShadingMode::ByExtension,
-        now_unix: unix_now(),
+        now_unix: unix_secs(),
     };
     let res = compute_layout(tree, &children, &ext_id, tree.root, viewport, &opts);
     let (total, area, worst) = render::layout_audit(&res, &viewport);
@@ -882,7 +920,7 @@ fn warn_if_changelog_inside(root: &str, changelog: Option<&str>) -> Option<Strin
 }
 
 fn cmd_monitor(a: &Args) -> i32 {
-    let mut raw = match a.positional.first() {
+    let raw = match a.positional.first() {
         Some(p) => p.clone(),
         None => {
             eprintln!("用法：filewatch monitor <路径> [--rule=abs=1G] [--duration=60s]");
@@ -890,20 +928,15 @@ fn cmd_monitor(a: &Args) -> i32 {
             return 2;
         }
     };
-    // 分隔符归一：Windows 两种都认，但 `C:/a\b` 这种混合形态只是难读，
-    // 而且会一路带进横幅、变更行、预警行与落盘日志。调用方的 shell 可能已经
-    // 换过一次分隔符（实测 git-bash 会把 `--root=C:\x` 传成 `C:/x`），
-    // 所以在入口统一，后面就不必到处判断。
-    raw = raw.replace('/', "\\");
-
-    // 从路径里拆出盘符：D:\projects → ("D:", Some("D:\projects"))
-    let drive = drive_of(&raw);
-    let is_bare_drive = raw.len() <= 3 && raw.ends_with(':');
-    let scan_root = if is_bare_drive {
-        None
-    } else {
-        Some(std::path::PathBuf::from(&raw))
+    // 「这个字符串指的是整卷还是某个子目录」只有一处解释（见 `split_target`）。
+    let (drive, scan_root) = match split_target(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
     };
+    let raw = raw.replace('/', "\\");
 
     let mut cfg = match build_scan_config(a, &drive, !a.has("no-watch")) {
         Ok(c) => c,
@@ -912,7 +945,7 @@ fn cmd_monitor(a: &Args) -> i32 {
             return 2;
         }
     };
-    cfg.scan_root = scan_root;
+    cfg.scan_root = scan_root.clone();
     cfg.engine.collect_events = true;
     if a.has("no-journal") || a.has("force-traverse") {
         // 完全不碰裸设备句柄，强制走目录遍历 + ReadDirectoryChangesW。
@@ -944,7 +977,7 @@ fn cmd_monitor(a: &Args) -> i32 {
     let show_status = a.get("tree").map(|v| v != "0").unwrap_or(true);
 
     println!("═══ FileWatch 监控 ═══");
-    println!("开始时间 : {}", fmt_unix_utc(unix_now()));
+    println!("开始时间 : {}", fmt_unix_utc(unix_secs()));
     println!("监视路径 : {}", raw);
     println!(
         "规则     : {}",
@@ -994,7 +1027,9 @@ fn cmd_monitor(a: &Args) -> i32 {
         println!("提示：未提供 --rule，本次只输出变更日志，不做阈值预警。");
     } else {
         let mut targets: Vec<String> = Vec::new();
-        if is_bare_drive {
+        // 整卷监视时要把目标写成 `C:\`（带尾反斜杠）—— `C:` 在 Windows 上的
+        // 语义是「C 盘的当前目录」，不是同一个东西（设计规则第 10 条）。
+        if scan_root.is_none() {
             targets.push(format!("{}\\", drive));
         } else {
             targets.push(raw.clone());
@@ -1048,7 +1083,7 @@ fn cmd_monitor(a: &Args) -> i32 {
         if duration > 0 && elapsed_ms >= duration {
             break;
         }
-        let now = base_ms() + elapsed_ms;
+        let now = unix_ms() + elapsed_ms;
 
         match session.poll(now) {
             Ok(out) => {
@@ -1071,7 +1106,7 @@ fn cmd_monitor(a: &Args) -> i32 {
 
     // 收尾
     let elapsed_ms = t0.elapsed().as_millis() as u64;
-    match session.shutdown(base_ms() + elapsed_ms) {
+    match session.shutdown(unix_ms() + elapsed_ms) {
         Ok(out) => {
             total_events += out.applied;
             total_alerts += out.alerts.len();
@@ -1171,30 +1206,529 @@ fn render_alert(a: &Alert, elapsed_ms: u64) -> String {
     )
 }
 
-/// 从任意路径里取出盘符（`D:\x\y` → `D:`；`\\?\C:\x` → `C:`）。
-fn drive_of(p: &str) -> String {
-    let bytes: Vec<char> = p.chars().collect();
-    for i in 0..bytes.len() {
-        if bytes[i] == ':' && i >= 1 {
-            let c = bytes[i - 1];
-            if c.is_ascii_alphabetic() {
-                return format!("{}:", c.to_ascii_uppercase());
+/// 位置参数 → `(盘符, 扫描根)`。
+///
+/// * `C:` / `D:\` → `("C:", None)`：整卷，可以走 `$MFT` 直读（快得多）
+/// * `D:\projects` → `("D:", Some(D:\projects))`：子目录，只能走遍历
+///
+/// 这是「用户给的那个字符串到底指什么」的**唯一**解释处：`monitor` / `dupes` /
+/// `snapshot` 都用它。各写一份的话，迟早出现「monitor 认 `C:` 是整卷、
+/// dupes 却当成子目录」这种谁都没注意到的分叉。
+///
+/// 顺手把 `/` 归一成 `\`：调用方的 shell 未必守规矩（实测 git-bash 会把
+/// `D:\x` 传成 `D:/x`），不归一后面每一处显示都要防一次。
+fn split_target(raw: &str) -> Result<(String, Option<std::path::PathBuf>), String> {
+    let norm = raw.replace('/', "\\");
+    let trimmed = norm.trim();
+    if trimmed.is_empty() {
+        return Err("路径为空".to_string());
+    }
+    // 盘符必须**显式**给出。这里的旧实现是一个「从任意字符里找 C~Z 后面的冒号、
+    // 找不到就兜底成 C:」的函数 —— 那个兜底会把 `/home/user` 静默地变成
+    // 「扫描整个 C 盘」。宁可报错。
+    let bytes: Vec<char> = trimmed.chars().collect();
+    let letter = match bytes.first() {
+        Some(c) if c.is_ascii_alphabetic() => *c,
+        _ => {
+            return Err(format!(
+                "无法从「{raw}」认出盘符：应当形如 C: 或 D:\\目录（本工具只支持 Windows 盘符路径）"
+            ))
+        }
+    };
+    if bytes.get(1) != Some(&':') {
+        return Err(format!(
+            "无法从「{raw}」认出盘符：{} 后面应当紧跟冒号，例如 {}:\\",
+            letter, letter
+        ));
+    }
+    let (drive, _) = core_io::normalize_drive(&format!("{letter}:"))
+        .map_err(|e| format!("盘符无效：{e}"))?;
+    let is_bare = trimmed.len() <= 3; // `C:` 或 `C:\`
+    let scan_root = if is_bare {
+        None
+    } else {
+        Some(std::path::PathBuf::from(trimmed))
+    };
+    Ok((drive, scan_root))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dupes（F12：重复文件三级去重）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 进度节流间隔。哈希可能要读几十 GB，每读一个文件刷一次行会把终端写崩。
+const DUP_PROGRESS_GAP_MS: u64 = 150;
+
+fn dup_options(a: &Args) -> Result<DupOptions, String> {
+    let mut o = DupOptions::default();
+    o.min_size = match a.get("min-size") {
+        Some(s) => parse_size(s).ok_or_else(|| format!("--min-size 需要体积，如 1M / 512K，收到「{s}」"))?,
+        None => 0,
+    };
+    o.block = match a.get("block") {
+        Some(s) => {
+            let v = parse_size(s).ok_or_else(|| format!("--block 需要体积，如 4K，收到「{s}」"))?;
+            // 0 会让部分哈希退化成"什么都不读"，那时所有同体积文件都要走整文件哈希
+            (v.max(1)) as usize
+        }
+        None => PARTIAL_BLOCK,
+    };
+    o.max_per_group = a.num("max-per-group", 50)?;
+    o.max_groups = a.num("top", 200)?;
+    o.max_candidates = a.num("max-candidates", 0)?;
+    Ok(o)
+}
+
+fn cmd_dupes(a: &Args) -> i32 {
+    let raw = match a.positional.first() {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("用法：filewatch dupes <盘符|目录> [--min-size=1M] [--top=50] [--csv=FILE] [--json]");
+            eprintln!("  盘符（C:）走 $MFT 直读，需要管理员权限；目录走遍历，普通权限即可");
+            eprintln!("  示例：filewatch dupes D:\\photos --min-size=1M");
+            return 2;
+        }
+    };
+    let (drive, scan_root) = match split_target(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+    let opts = match dup_options(a) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+
+    let mut cfg = match build_scan_config(a, &drive, false) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("参数错误：{}", e);
+            return 2;
+        }
+    };
+    // 子目录只能走遍历（$MFT 是整卷粒度的）；整卷则可以直读 MFT ——
+    // 这正是去重最需要的能力：先拿到全部文件的体积，才能把"体积唯一"的文件
+    // 直接排除掉，一个字节都不用读。
+    let sub = scan_root.is_some();
+    cfg.force_traverse = a.has("force-traverse") || cfg.scan_root.is_some() || sub;
+    cfg.allow_create_journal = a.has("create-journal");
+    cfg.scan_root = scan_root.clone();
+    // 去重会自己去读文件内容，不需要监控引擎收集事件
+    cfg.engine.collect_events = false;
+    cfg.allow_traverse_watch = false;
+
+    println!("═══ FileWatch 重复文件查找 ═══");
+    // 显示时统一成反斜杠：调用方的 shell 可能传进来 `D:/photos`，
+    // 而下面每一行都跟着它走（只有一处归一，别让用户看到两种写法）。
+    println!("查找范围 : {}", raw.replace('/', "\\"));
+    println!(
+        "最小体积 : {}",
+        if opts.min_size == 0 {
+            "1 字节（0 字节文件不参与）".to_string()
+        } else {
+            human_size(opts.min_size)
+        }
+    );
+    println!();
+    println!("① 建立文件清单…");
+
+    let t0 = Instant::now();
+    let session = match Session::open(cfg, progress_to_stderr) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!();
+            eprintln!("扫描失败：{}", e);
+            if e.raw_os_error() == Some(5) {
+                print_access_error(&drive, &e);
             }
+            return 1;
+        }
+    };
+    eprintln!();
+    for w in &session.warnings {
+        println!("· {}", w);
+    }
+    let remap = session.path_remap();
+    let set = collect_candidates(&session.tree, remap.as_ref(), &opts);
+    println!(
+        "   候选 {} 个文件（排除：{} 个小于下限、{} 个空文件、{} 个符号链接{}）",
+        set.items.len(),
+        set.skipped_small,
+        set.skipped_empty,
+        set.skipped_reparse,
+        if set.truncated > 0 {
+            format!("；因超过 --max-candidates 截断 {} 个", set.truncated)
+        } else {
+            String::new()
+        }
+    );
+    println!("   清单耗时 {} ms", t0.elapsed().as_millis());
+
+    // ── 三级筛选（读盘部分） ──
+    println!();
+    println!("② 体积 → 部分哈希 → 完整哈希 → 逐字节复核");
+    let mut last = Instant::now();
+    let mut last_stage: Option<DupStage> = None;
+    let rep = find_duplicates(&set.items, &opts, &FsSource, &mut |p: DupProgress| {
+        let now = Instant::now();
+        let stage_changed = last_stage != Some(p.stage);
+        // 每一级的**首行**与**走满那一行**都要打：否则快速跑完时终端上只会留下
+        // 「部分哈希 14.3% 1/7」这种像是卡住了的残影。
+        let finished = p.done == p.total;
+        if !stage_changed && !finished && now.duration_since(last).as_millis() < DUP_PROGRESS_GAP_MS as u128 {
+            return;
+        }
+        last = now;
+        if stage_changed {
+            last_stage = Some(p.stage);
+            eprintln!();
+        }
+        let mut e = std::io::stderr();
+        let _ = write!(
+            e,
+            "\r   {} {:>5.1}%  {}/{}          ",
+            p.stage.label_cn(),
+            if p.total == 0 { 100.0 } else { p.done as f64 / p.total as f64 * 100.0 },
+            p.done,
+            p.total
+        );
+        let _ = e.flush();
+    });
+    eprintln!();
+
+    // ── 输出 ──
+    println!();
+    println!("{}", core_scan::dedup::summary_cn(&rep));
+    println!(
+        "   实际读取 {}（只读候选文件；体积唯一的文件一个字节都没读）",
+        human_size(rep.bytes_hashed)
+    );
+    if rep.unreadable > 0 {
+        println!(
+            "   有 {} 个文件读不到（权限/被占用/中途被删），没有计入任何一组",
+            rep.unreadable
+        );
+    }
+    if let Some(path) = a.get("csv") {
+        match std::fs::write(path, groups_to_csv(&rep.groups)) {
+            Ok(_) => println!("   CSV 已写入 {}", path),
+            Err(e) => eprintln!("写 CSV 失败：{}", e),
         }
     }
-    "C:".to_string()
+    if a.has("json") {
+        println!();
+        println!("{}", dup_json(&rep));
+        return 0;
+    }
+
+    print_dups(&rep);
+    0
 }
 
-/// `C:\docs` + `a.txt` → `C:\docs\a.txt`（`path_of` 对根返回 `C:\`，不能再补一个杠）。
-fn base_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+fn print_dups(rep: &DupReport) {
+    if rep.groups.is_empty() {
+        println!();
+        println!("没有发现内容相同的重复文件。");
+        return;
+    }
+    println!();
+    println!("重复文件组（按可回收空间降序，最多 {} 组）", rep.groups.len());
+    println!("{}", rule_line(104));
+    for (i, g) in rep.groups.iter().enumerate() {
+        println!(
+            "{:>3}. 每组 {} × {} = 可回收 {}",
+            i + 1,
+            human_size(g.size),
+            g.count,
+            human_size(g.wasted)
+        );
+        for f in &g.files {
+            print!("      ");
+            print!("{}", truncate_keep_tail(&f.path, 96));
+            println!();
+        }
+        if g.truncated {
+            println!("      ……（还有 {} 个同样的文件未列出）", g.count - g.files.len() as u64);
+        }
+    }
+    println!("{}", rule_line(104));
+    if rep.group_count > rep.groups.len() as u64 {
+        println!(
+            "共 {} 组，此处只显示前 {} 组（用 --top=N 调整）。",
+            rep.group_count,
+            rep.groups.len()
+        );
+    }
+    println!(
+        "提示：删除前请自行确认 —— 内容相同不代表可以删（快捷方式、字体、\
+         程序数据目录里的同名文件都可能各自必需）。本工具只做查找，不删任何文件。"
+    );
 }
 
-fn unix_now() -> i64 {
-    (base_ms() / 1000) as i64
+fn dup_json(rep: &DupReport) -> String {
+    use core_io::jsonlite::quote;
+    let mut o = String::from("{");
+    o.push_str(&format!("\"considered\":{},", rep.same_size_files));
+    o.push_str(&format!("\"same_size_groups\":{},", rep.same_size_groups));
+    o.push_str(&format!("\"partial_pass\":{},", rep.partial_files));
+    o.push_str(&format!("\"full_pass\":{},", rep.full_files));
+    o.push_str(&format!("\"unreadable\":{},", rep.unreadable));
+    o.push_str(&format!("\"bytes_hashed\":{},", rep.bytes_hashed));
+    o.push_str(&format!("\"groups\":{},", rep.group_count));
+    o.push_str(&format!("\"total_wasted\":{},", rep.total_wasted));
+    let arr: Vec<String> = rep
+        .groups
+        .iter()
+        .map(|g| {
+            let files: Vec<String> = g.files.iter().map(|f| quote(&f.path)).collect();
+            format!(
+                "{{\"size\":{},\"count\":{},\"wasted\":{},\"files\":[{}]}}",
+                g.size,
+                g.count,
+                g.wasted,
+                files.join(",")
+            )
+        })
+        .collect();
+    o.push_str(&format!("\"items\":[{}]", arr.join(",")));
+    o.push('}');
+    o
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// snapshot / diff（F11：快照与对比）
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmd_snapshot(a: &Args) -> i32 {
+    let raw = match a.positional.first() {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("用法：filewatch snapshot <盘符|目录> [--out=快照.tsv] [--max-entries=N]");
+            eprintln!("  建立的快照用于以后 `filewatch diff 旧.tsv 新.tsv`");
+            return 2;
+        }
+    };
+    let (drive, scan_root) = match split_target(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+    let created = unix_secs();
+    let out: std::path::PathBuf = match a.get("out") {
+        Some(p) => std::path::PathBuf::from(p),
+        // 默认文件名带时间戳：连拍几次不会互相覆盖，而且按名字排序就是时间顺序
+        None => std::path::PathBuf::from(format!("snapshot-{}.tsv", fmt_unix_stamp(created))),
+    };
+    let snap_opts = SnapshotOptions {
+        max_entries: match a.get("max-entries") {
+            Some(s) => parse_size(s)
+                .ok_or_else(|| format!("--max-entries 需要数字，收到「{s}」"))
+                .unwrap_or(0) as usize,
+            None => 0,
+        },
+    };
+
+    let mut cfg = match build_scan_config(a, &drive, false) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("参数错误：{}", e);
+            return 2;
+        }
+    };
+    cfg.force_traverse = a.has("force-traverse") || cfg.scan_root.is_some() || scan_root.is_some();
+    cfg.allow_create_journal = a.has("create-journal");
+    cfg.scan_root = scan_root;
+    cfg.engine.collect_events = false;
+    cfg.allow_traverse_watch = false;
+
+    println!("═══ FileWatch 建立快照 ═══");
+    println!("扫描范围 : {}", raw.replace('/', "\\"));
+    let t0 = Instant::now();
+    let session = match Session::open(cfg, progress_to_stderr) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!();
+            eprintln!("扫描失败：{}", e);
+            if e.raw_os_error() == Some(5) {
+                print_access_error(&drive, &e);
+            }
+            return 1;
+        }
+    };
+    eprintln!();
+    for w in &session.warnings {
+        println!("· {}", w);
+    }
+    let remap = session.path_remap();
+    let display_root = raw.replace('/', "\\");
+    let snap = Snapshot::capture(&session.tree, remap.as_ref(), &display_root, created, &snap_opts);
+    match snap.save(&out) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("写快照失败：{}", e);
+            return 1;
+        }
+    }
+    println!();
+    println!(
+        "已写入 {}：{} 个文件，共 {}，耗时 {} ms",
+        out.display(),
+        snap.len(),
+        human_size(session.tree.total_size),
+        t0.elapsed().as_millis()
+    );
+    // 明确标 UTC：引擎里所有时间都是 Unix 秒（UTC），本地时区换算会引入
+    // 一个「显示 13:41、文件名 05:41」的不一致，不如一开始就说清楚。
+    println!("时间戳   : {}（UTC）", fmt_unix_utc(created));
+    if snap.truncated > 0 {
+        println!(
+            "注意     : 有 {} 个文件因 --max-entries 没记进去，用它对比会得到不完整的结论",
+            snap.truncated
+        );
+    }
+    println!();
+    println!("以后用 `filewatch diff {} <更晚的快照>` 就能看到这一段时间里谁变大了。", out.display());
+    0
+}
+
+fn cmd_diff(a: &Args) -> i32 {
+    let (old_p, new_p) = match (a.positional.first(), a.positional.get(1)) {
+        (Some(o), Some(n)) => (o.clone(), n.clone()),
+        _ => {
+            eprintln!("用法：filewatch diff <旧快照> <新快照> [--top=N] [--min-delta=1K] [--by-abs] [--by-path] [--csv=FILE]");
+            eprintln!("  快照由 `filewatch snapshot <盘符> --out=...` 建立");
+            return 2;
+        }
+    };
+    let old = match Snapshot::load(std::path::Path::new(&old_p)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+    let new = match Snapshot::load(std::path::Path::new(&new_p)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+
+    let min_delta = match a.get("min-delta") {
+        Some(s) => match parse_size(s) {
+            Some(v) => v,
+            None => {
+                eprintln!("--min-delta 需要体积，如 1K，收到「{s}」");
+                return 2;
+            }
+        },
+        None => 0,
+    };
+    let opts = DiffOptions {
+        min_delta,
+        top: match a.num("top", 50) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("{}", e);
+                return 2;
+            }
+        },
+        order: if a.has("by-path") {
+            DiffOrder::ByPath
+        } else if a.has("by-abs") {
+            DiffOrder::ByAbsChange
+        } else {
+            DiffOrder::ByGrowth
+        },
+    };
+    let rep = core_scan::diff(&old, &new, &opts);
+
+    println!("═══ FileWatch 快照对比 ═══");
+    println!(
+        "  旧 : {}  {}（{} 条）",
+        fmt_unix_utc(old.created_unix),
+        old.root,
+        old.len()
+    );
+    println!(
+        "  新 : {}  {}（{} 条）",
+        fmt_unix_utc(new.created_unix),
+        new.root,
+        new.len()
+    );
+    // 根不同通常是拿错文件了。不报错（用户可能确实换了挂载点），但必须说一句 ——
+    // 否则「整盘少了一半」这种结论会被当成真的。
+    if !old.root.is_empty() && !new.root.is_empty() && old.root != new.root {
+        println!(
+            "  ⚠ 两份快照的扫描根不同（{} ↔ {}），对比结果可能没有意义",
+            old.root, new.root
+        );
+    }
+    println!();
+    println!("{}", core_scan::snapshot::summary_cn(&rep));
+    if rep.same > 0 {
+        println!("   （另有 {} 个文件完全没变，未列出）", rep.same);
+    }
+    if let Some(path) = a.get("csv") {
+        match std::fs::write(path, rows_to_csv(&rep.rows)) {
+            Ok(_) => println!("   CSV 已写入 {}（{} 行）", path, rep.rows.len()),
+            Err(e) => eprintln!("写 CSV 失败：{}", e),
+        }
+    }
+
+    if rep.rows.is_empty() {
+        println!();
+        println!("没有符合条件的差异行。");
+        return 0;
+    }
+    println!();
+    let order_cn = match opts.order {
+        DiffOrder::ByGrowth => "按增量降序",
+        DiffOrder::ByAbsChange => "按变化幅度降序",
+        DiffOrder::ByPath => "按路径升序",
+    };
+    println!("差异明细（{}，最多 {} 行）", order_cn, rep.rows.len());
+    println!("{}", rule_line(104));
+    println!(
+        "{} {} {} {}",
+        pad_right("类型", 6),
+        pad_left("增量", 12),
+        pad_left("新大小", 12),
+        "路径"
+    );
+    println!("{}", rule_line(104));
+    for r in &rep.rows {
+        println!(
+            "{} {} {} {}",
+            pad_right(r.kind.label_cn(), 6),
+            pad_left(&signed_size(r.delta), 12),
+            pad_left(&human_size(r.new_size), 12),
+            truncate_keep_tail(&r.path, 68)
+        );
+    }
+    println!("{}", rule_line(104));
+    if rep.rows_total > rep.rows.len() as u64 {
+        println!(
+            "共 {} 行差异，此处显示 {} 行（用 --top=N 调整，--min-delta=1K 过滤小改动）。",
+            rep.rows_total,
+            rep.rows.len()
+        );
+    }
+    if rep.old_truncated > 0 || rep.new_truncated > 0 {
+        println!(
+            "注意：快照被截断过（旧缺 {} / 新缺 {} 个文件），对比结果不完整。",
+            rep.old_truncated, rep.new_truncated
+        );
+    }
+    0
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1214,13 +1748,28 @@ fn cmd_selftest(a: &Args) -> i32 {
 mod tests {
     use super::*;
 
+    /// `split_target` 是「用户给的字符串指什么」的唯一解释处，
+    /// 所以边界要逐条钉住：整卷 vs 子目录、反斜杠归一、以及**不能瞎兜底**。
     #[test]
-    fn drive_of_extracts_letter() {
-        assert_eq!(drive_of("C:"), "C:");
-        assert_eq!(drive_of(r"D:\projects\a"), "D:");
-        assert_eq!(drive_of(r"\\?\C:\x"), "C:");
-        assert_eq!(drive_of("no-drive-here"), "C:");
-        assert_eq!(drive_of("e:\\"), "E:");
+    fn split_target_separates_drive_from_root() {
+        // 整卷：没有扫描根 → 可以走 $MFT
+        assert_eq!(split_target("C:").unwrap(), ("C:".to_string(), None));
+        assert_eq!(split_target("c:").unwrap(), ("C:".to_string(), None), "盘符要归一成大写");
+        assert_eq!(split_target("d:\\").unwrap(), ("D:".to_string(), None), "带尾杠也算整卷");
+
+        // 子目录：必须给出扫描根，而且分隔符要归一
+        let (d, r) = split_target(r"D:\projects\a").unwrap();
+        assert_eq!(d, "D:");
+        assert_eq!(r.unwrap().to_string_lossy(), r"D:\projects\a");
+        let (_, r) = split_target("D:/projects/a").unwrap();
+        assert_eq!(r.unwrap().to_string_lossy(), r"D:\projects\a", "/ 要归一成 \\");
+
+        // **不能兜底**：以前 `drive_of` 认不出盘符时会静默当 C 盘 ——
+        // 那会把一个 UNIX 风格路径变成"扫描整个 C 盘"。
+        assert!(split_target("").is_err());
+        assert!(split_target("/home/user").is_err());
+        assert!(split_target("no-drive-here").is_err());
+        assert!(split_target("C").is_err(), "只有字母没有冒号不算盘符");
     }
 
     #[test]

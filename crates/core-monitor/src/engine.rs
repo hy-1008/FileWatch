@@ -26,9 +26,9 @@ use crate::debounce::{DebounceConfig, Debouncer, PendingEvent, RawEvent};
 use crate::pathremap::PathRemap;
 use crate::queue::RingQueue;
 use crate::rules::{Alert, Rule, RuleConfig, RuleEngine};
-use core_index::aggregate::{propagate_delta, propagate_from_parent};
-use core_index::arena::INVALID_PARENT;
-use core_index::Tree;
+use core_index::aggregate::{propagate_delta, propagate_from_parent, MAX_TREE_DEPTH};
+use core_index::arena::{Node, INVALID_PARENT};
+use core_index::{ChildIndex, Tree};
 use core_usn::normalize::EventKind;
 
 /// 文档 §9：增量事件延迟 ≤ 1.5 s（轮询 500 ms + 处理）。
@@ -218,7 +218,7 @@ impl MonitorEngine {
         // ① 有界队列 → debouncer
         if !self.queue.is_empty() {
             let mut tmp: Vec<RawEvent> = Vec::with_capacity(1024);
-            self.queue.drain_into(&mut tmp, 65_536);
+            self.queue.drain_into(&mut tmp, if force { usize::MAX } else { 65_536 });
             for e in tmp {
                 self.debouncer.offer(e, now_ms);
             }
@@ -233,18 +233,20 @@ impl MonitorEngine {
         if force {
             self.debouncer.flush_all(&mut events);
         } else {
-            self.debouncer.drain_matured(now_ms, &mut events);
-        }
-        let truncated = events.len() > self.cfg.max_events_per_tick;
-        if truncated {
-            events.truncate(self.cfg.max_events_per_tick);
+            self.debouncer.drain_matured_limited(
+                now_ms,
+                self.cfg.max_events_per_tick.max(1),
+                &mut events,
+            );
         }
 
         let mut outcome = TickOutcome {
-            backpressure: truncated || dropped > 0,
+            backpressure: dropped > 0,
             ..Default::default()
         };
         let mut candidates: Vec<Alert> = Vec::new();
+        // 同批目录删除共享一次子索引；创建/移动后才失效，避免删除风暴 O(n²)。
+        let mut deletion_children: Option<ChildIndex> = None;
 
         // ③ 逐条应用
         for ev in events.iter_mut() {
@@ -261,7 +263,11 @@ impl MonitorEngine {
                 now_ms,
                 &mut probe,
                 &mut candidates,
+                &mut deletion_children,
             );
+            if matches!(ev.kind, EventKind::Created | EventKind::Renamed) {
+                deletion_children = None;
+            }
 
             if self.cfg.write_changelog {
                 if let Some(log) = self.changelog.as_mut() {
@@ -321,29 +327,48 @@ impl MonitorEngine {
         now_ms: u64,
         probe: &mut S,
         candidates: &mut Vec<Alert>,
+        deletion_children: &mut Option<ChildIndex>,
     ) where
         S: FnMut(u64) -> Option<(u64, u64, i64)>,
     {
         let recno = recno_of(ev.frn);
         let parent_recno = recno_of(ev.parent_frn);
         let seq = seq_of(ev.frn);
+        let before = tree.node(recno).copied().filter(|n| n.in_use());
+        // 过期的 USN 删除/修改不能作用于已经复用该记录号的新文件。
+        if ev.kind != EventKind::Created && before.map(|n| n.seq != seq).unwrap_or(false) {
+            return;
+        }
+        let before_files = before.map(|n| {
+            if n.is_dir() { tree.dir_file_count(recno) as i64 } else { 1 }
+        }).unwrap_or(0);
 
         match ev.kind {
             // ── 新增 ────────────────────────────────────────────────────────
             EventKind::Created => {
-                let (size, alloc, mtime) = match probe(ev.frn) {
+                let (mut size, mut alloc, mut mtime) = match if ev.is_dir { None } else { probe(ev.frn) } {
                     Some(v) => {
                         stats.size_rereads += 1;
                         v
                     }
                     None => (0, 0, 0),
                 };
-                ev.new_size = size;
-                ev.new_alloc = alloc;
-
                 // 同一记录号上已有节点：可能是 FRN 复用（序列号变了）
                 if let Some(old) = tree.arena.get(recno).copied() {
                     if old.in_use() {
+                        // 降级监视会提前物化父目录；子文件可能先成熟并已计入它。
+                        // 创建事件随后到达时必须保留这些聚合值，不能重置为零。
+                        if ev.is_dir && old.is_dir() && old.seq == seq {
+                            size = old.size;
+                            alloc = old.alloc;
+                            mtime = old.mtime;
+                        } else if old.is_dir() {
+                            // 目录记录被复用时，旧目录的后代也不再属于新记录。
+                            Self::remove_descendants(tree, recno, deletion_children);
+                            if let Some(count) = tree.dir_file_counts.get_mut(recno as usize) {
+                                *count = 0;
+                            }
+                        }
                         let old_parent = old.parent;
                         let (os, oa) = (old.size, old.alloc);
                         // 先把旧内容从父链上扣掉，避免重复计入
@@ -356,6 +381,8 @@ impl MonitorEngine {
                         });
                     }
                 }
+                ev.new_size = size;
+                ev.new_alloc = alloc;
 
                 tree.upsert_incremental(
                     recno,
@@ -367,8 +394,15 @@ impl MonitorEngine {
                     mtime,
                     &ev.name,
                 );
+                // upsert 对目录默认清零；恢复的是此前聚合值，不是目录自身元数据大小。
+                if ev.is_dir {
+                    if let Some(node) = tree.arena.get_mut(recno) {
+                        node.size = size;
+                        node.alloc = alloc;
+                    }
+                }
 
-                if !ev.is_dir && (size > 0 || alloc > 0) {
+                if size > 0 || alloc > 0 {
                     ev.size_delta = size as i64;
                     ev.alloc_delta = alloc as i64;
                     propagate_delta(tree, recno, size as i64, alloc as i64, |t, anc| {
@@ -383,6 +417,11 @@ impl MonitorEngine {
 
             // ── 删除 ────────────────────────────────────────────────────────
             EventKind::Deleted => {
+                if before.map(|n| n.is_dir()).unwrap_or(false) {
+                    // 目录整体移出监视范围可能只有目录通知。同步摘除后代，
+                    // 否则 Top-N 和全局文件数会保留无法再定位的幽灵文件。
+                    Self::remove_descendants(tree, recno, deletion_children);
+                }
                 if let Some((os, oa)) = tree.remove_node(recno) {
                     ev.new_size = 0;
                     ev.new_alloc = 0;
@@ -428,54 +467,21 @@ impl MonitorEngine {
                         });
                     }
                 }
+                // 同一窗口的修改会合并进重命名；迁移旧大小之后再回读最终大小。
+                if let Some((ds, da)) = Self::refresh_file_size(tree, stats, ev, probe) {
+                    propagate_delta(tree, recno, ds, da, |t, anc| {
+                        stats.ancestors_touched += 1;
+                        let total = t.arena.get(anc).map(|n| n.size).unwrap_or(0);
+                        if let Some(a) = rules.evaluate(anc, total, now_ms) {
+                            candidates.push(a);
+                        }
+                    });
+                }
             }
 
             // ── 修改 ────────────────────────────────────────────────────────
             EventKind::Modified | EventKind::SizeSemanticsChanged => {
-                // 索引里没有这个节点 → 无从计算 delta，直接忽略
-                // （常见于「监控开始前就已存在、且不在本次扫描范围内」的文件）
-                if !tree
-                    .arena
-                    .get(recno)
-                    .map(|n| n.in_use())
-                    .unwrap_or(false)
-                {
-                    return;
-                }
-                // 目录的大小是聚合值，绝不能被单条事件覆写
-                let is_dir = tree
-                    .arena
-                    .get(recno)
-                    .map(|n| n.is_dir())
-                    .unwrap_or(ev.is_dir);
-                if is_dir {
-                    return;
-                }
-                let (size, alloc, mtime) = match probe(ev.frn) {
-                    Some(v) => {
-                        stats.size_rereads += 1;
-                        v
-                    }
-                    None => return,
-                };
-                let (old_size, old_alloc) = tree.size_of(recno).unwrap_or((0, 0));
-                let ds = size as i64 - old_size as i64;
-                let da = alloc as i64 - old_alloc as i64;
-
-                ev.new_size = size;
-                ev.new_alloc = alloc;
-                ev.size_delta = ds;
-                ev.alloc_delta = da;
-
-                if let Some(n) = tree.arena.get_mut(recno) {
-                    n.size = size;
-                    n.alloc = alloc;
-                    if mtime > 0 {
-                        n.mtime = mtime;
-                    }
-                }
-
-                if ds != 0 || da != 0 {
+                if let Some((ds, da)) = Self::refresh_file_size(tree, stats, ev, probe) {
                     propagate_delta(tree, recno, ds, da, |t, anc| {
                         stats.ancestors_touched += 1;
                         let total = t.arena.get(anc).map(|n| n.size).unwrap_or(0);
@@ -489,6 +495,110 @@ impl MonitorEngine {
             // 属性/硬链接变更不影响大小聚合（文档 §5.2）
             EventKind::AttrChanged | EventKind::HardLinkChanged | EventKind::Unknown => {}
         }
+        let after = tree.node(recno).copied().filter(|n| n.in_use());
+        Self::account_globals(tree, before, after);
+        let after_files = after.map(|n| {
+            if n.is_dir() { tree.dir_file_count(recno) as i64 } else { 1 }
+        }).unwrap_or(0);
+        if before.map(|n| n.parent) != after.map(|n| n.parent) || before_files != after_files {
+            if let Some(old) = before {
+                Self::adjust_file_counts(tree, old.parent, -before_files);
+            }
+            if let Some(new) = after {
+                Self::adjust_file_counts(tree, new.parent, after_files);
+            }
+        }
+        if after.is_none() {
+            if let Some(count) = tree.dir_file_counts.get_mut(recno as usize) {
+                *count = 0;
+            }
+        }
+    }
+
+    /// 与全量 aggregate 的口径一致：总大小只计文件，不能再加目录聚合值。
+    fn account_globals(tree: &mut Tree, before: Option<Node>, after: Option<Node>) {
+        if let Some(old) = before {
+            if old.is_dir() {
+                tree.dir_count = tree.dir_count.saturating_sub(1);
+            } else {
+                tree.file_count = tree.file_count.saturating_sub(1);
+                tree.total_size = tree.total_size.saturating_sub(old.size);
+                tree.total_alloc = tree.total_alloc.saturating_sub(old.alloc);
+            }
+        }
+        if let Some(new) = after {
+            if new.is_dir() {
+                tree.dir_count = tree.dir_count.saturating_add(1);
+            } else {
+                tree.file_count = tree.file_count.saturating_add(1);
+                tree.total_size = tree.total_size.saturating_add(new.size);
+                tree.total_alloc = tree.total_alloc.saturating_add(new.alloc);
+            }
+        }
+    }
+
+    fn adjust_file_counts(tree: &mut Tree, mut parent: u32, delta: i64) {
+        if delta == 0 { return; }
+        for _ in 0..MAX_TREE_DEPTH {
+            let Some(node) = tree.node(parent).copied().filter(|n| n.in_use()) else { break; };
+            if let Some(count) = tree.dir_file_counts.get_mut(parent as usize) {
+                *count = if delta > 0 {
+                    count.saturating_add(delta as u32)
+                } else {
+                    count.saturating_sub(delta.unsigned_abs() as u32)
+                };
+            }
+            if node.parent == parent { break; }
+            parent = node.parent;
+        }
+    }
+
+    /// 仅修改内存索引。普通文件事件仍是 O(树深)，目录整体删除时才构建子索引。
+    fn remove_descendants(tree: &mut Tree, root: u32, cache: &mut Option<ChildIndex>) {
+        let children = cache.get_or_insert_with(|| ChildIndex::build(tree));
+        let mut pending = children.children(root).to_vec();
+        while let Some(idx) = pending.pop() {
+            if idx == root { continue; }
+            let Some(node) = tree.node(idx).copied().filter(|n| n.in_use()) else { continue; };
+            pending.extend_from_slice(children.children(idx));
+            tree.remove_node(idx);
+            Self::account_globals(tree, Some(node), None);
+            if let Some(count) = tree.dir_file_counts.get_mut(idx as usize) {
+                *count = 0;
+            }
+        }
+    }
+
+    fn refresh_file_size<S>(
+        tree: &mut Tree,
+        stats: &mut EngineStats,
+        ev: &mut PendingEvent,
+        probe: &mut S,
+    ) -> Option<(i64, i64)>
+    where
+        S: FnMut(u64) -> Option<(u64, u64, i64)>,
+    {
+        let node = tree.arena.get_mut(recno_of(ev.frn))?;
+        if !node.in_use() || node.is_dir() {
+            return None;
+        }
+        // 即使回读失败，纯重命名也应报告原来的大小。
+        ev.new_size = node.size;
+        ev.new_alloc = node.alloc;
+        let (size, alloc, mtime) = probe(ev.frn)?;
+        stats.size_rereads += 1;
+        let ds = size as i64 - node.size as i64;
+        let da = alloc as i64 - node.alloc as i64;
+        ev.new_size = size;
+        ev.new_alloc = alloc;
+        ev.size_delta = ds;
+        ev.alloc_delta = da;
+        node.size = size;
+        node.alloc = alloc;
+        if mtime > 0 {
+            node.mtime = mtime;
+        }
+        (ds != 0 || da != 0).then_some((ds, da))
     }
 }
 
@@ -532,6 +642,7 @@ mod tests {
         set(&mut t, 5, 5, ".", true, 0);
         set(&mut t, 10, 5, "logs", true, 0);
         set(&mut t, 11, 10, "existing.log", false, 5 * MB);
+        t.dir_file_counts.resize(t.arena.nodes.len(), 0);
         aggregate(&mut t);
         t
     }
@@ -583,6 +694,165 @@ mod tests {
         assert_eq!(t.arena.get(10).unwrap().size, 7 * MB);
         assert_eq!(t.arena.get(5).unwrap().size, 7 * MB);
         assert!(out.alerts.is_empty(), "远未到阈值");
+    }
+
+    #[test]
+    fn regression_tick_budget_never_discards_mature_events() {
+        let mut t = sample_tree();
+        let mut e = engine(vec![]);
+        e.cfg.max_events_per_tick = 2;
+        for id in 20..25 {
+            e.ingest(raw(frn(id, 1), frn(10, 1), USN_REASON_FILE_CREATE, "new.log", ATTR_FILE), 1000);
+        }
+        let first = e.tick(&mut t, 2000, |_| Some((MB, MB, 0)));
+        assert_eq!((first.applied, first.still_pending), (2, 3));
+        assert!(!first.backpressure, "保留的积压不代表事件丢失");
+        let second = e.tick(&mut t, 2100, |_| Some((MB, MB, 0)));
+        let third = e.tick(&mut t, 2200, |_| Some((MB, MB, 0)));
+        assert_eq!((second.applied, third.applied, third.still_pending), (2, 1, 0));
+        assert_eq!(t.size_of(10).unwrap().0, 10 * MB);
+    }
+
+    #[test]
+    fn regression_flush_bypasses_tick_budget() {
+        let mut t = sample_tree();
+        let mut e = engine(vec![]);
+        e.cfg.max_events_per_tick = 1;
+        for id in 20..24 {
+            e.ingest(raw(frn(id, 1), frn(10, 1), USN_REASON_FILE_CREATE, "new.log", ATTR_FILE), 1000);
+        }
+        let out = e.flush(&mut t, 1001, |_| Some((MB, MB, 0)));
+        assert_eq!((out.applied, out.still_pending), (4, 0));
+        assert_eq!(t.size_of(10).unwrap().0, 9 * MB);
+    }
+
+    #[test]
+    fn regression_created_then_renamed_file_is_materialized() {
+        let mut t = sample_tree();
+        let mut e = engine(vec![]);
+        e.ingest(raw(frn(20, 1), frn(10, 1), USN_REASON_FILE_CREATE, "draft.log", ATTR_FILE), 1000);
+        e.ingest(raw(frn(20, 1), frn(10, 1), USN_REASON_RENAME_OLD_NAME, "draft.log", ATTR_FILE), 1010);
+        e.ingest(raw(frn(20, 1), frn(10, 1), USN_REASON_RENAME_NEW_NAME, "saved.log", ATTR_FILE), 1020);
+        e.tick(&mut t, 2000, |_| Some((MB, MB, 0)));
+        assert_eq!(t.name(20), "saved.log");
+        assert_eq!(t.size_of(10).unwrap().0, 6 * MB);
+    }
+
+    #[test]
+    fn regression_rename_and_modify_updates_size_in_new_parent() {
+        let mut t = sample_tree();
+        t.upsert_incremental(12, 5, 1, true, 0, 0, 0, "archive");
+        let mut e = engine(vec![]);
+        e.ingest(raw(frn(11, 1), frn(10, 1), USN_REASON_RENAME_OLD_NAME, "existing.log", ATTR_FILE), 1000);
+        e.ingest(raw(frn(11, 1), frn(12, 1), USN_REASON_RENAME_NEW_NAME, "new.log", ATTR_FILE), 1010);
+        e.ingest(raw(frn(11, 1), frn(12, 1), USN_REASON_DATA_EXTEND, "new.log", ATTR_FILE), 1020);
+        e.tick(&mut t, 2000, |_| Some((7 * MB, 7 * MB, 0)));
+        assert_eq!(t.size_of(10).unwrap().0, 0);
+        assert_eq!(t.size_of(12).unwrap().0, 7 * MB);
+        assert_eq!(t.size_of(5).unwrap().0, 7 * MB);
+    }
+
+    #[test]
+    fn regression_directory_create_preserves_placeholder_children() {
+        let mut t = sample_tree();
+        t.upsert_incremental(12, 5, 0, true, 0, 0, 0, "pending");
+        t.upsert_incremental(20, 12, 0, false, MB, MB, 0, "child.log");
+        aggregate(&mut t);
+        let mut e = engine(vec![]);
+        e.ingest(raw(frn(12, 0), frn(5, 1), USN_REASON_FILE_CREATE, "pending", ATTR_DIR), 1000);
+        e.tick(&mut t, 2000, |_| None);
+        assert_eq!(t.size_of(12).unwrap().0, MB);
+        assert_eq!(t.size_of(5).unwrap().0, 6 * MB);
+    }
+
+    /// 全量聚合作为独立对照；此处只在测试里扫描整棵树。
+    fn assert_live_totals(tree: &Tree) {
+        let mut rebuilt = tree.clone();
+        aggregate(&mut rebuilt);
+        assert_eq!((tree.file_count, tree.dir_count, tree.total_size, tree.total_alloc),
+            (rebuilt.file_count, rebuilt.dir_count, rebuilt.total_size, rebuilt.total_alloc));
+        for (idx, node) in tree.arena.nodes.iter().enumerate() {
+            if node.in_use() && node.is_dir() {
+                assert_eq!(tree.dir_file_count(idx as u32), rebuilt.dir_file_count(idx as u32),
+                    "directory {idx} file count");
+                assert_eq!((node.size, node.alloc),
+                    (rebuilt.arena.nodes[idx].size, rebuilt.arena.nodes[idx].alloc),
+                    "directory {idx} aggregate");
+            }
+        }
+    }
+
+    #[test]
+    fn regression_global_totals_follow_create_resize_reuse_and_delete() {
+        let mut tree = sample_tree();
+        let mut engine = engine(vec![]);
+        for (seq, reason, size, alloc) in [
+            (1, USN_REASON_FILE_CREATE, 2 * MB, 3 * MB),
+            (1, USN_REASON_DATA_EXTEND, 4 * MB, 6 * MB),
+            (1, USN_REASON_DATA_TRUNCATION, MB, 2 * MB),
+            (2, USN_REASON_FILE_CREATE, 3 * MB, 4 * MB),
+        ] {
+            engine.ingest(raw(frn(20, seq), frn(10, 1), reason, "live.bin", ATTR_FILE), 1000);
+            engine.flush(&mut tree, 1100, |_| Some((size, alloc, 0)));
+            assert_live_totals(&tree);
+            assert_eq!(tree.file_count, 2);
+            assert_eq!(tree.total_size, 5 * MB + size);
+        }
+        // 旧序列号的迟到删除不允许删掉复用后的文件。
+        engine.ingest(raw(frn(20, 1), frn(10, 1), USN_REASON_FILE_DELETE, "old.bin", ATTR_FILE), 2000);
+        engine.flush(&mut tree, 2100, |_| None);
+        assert_eq!(tree.file_count, 2);
+        assert_eq!(tree.total_size, 8 * MB);
+        assert_live_totals(&tree);
+        for _ in 0..2 {
+            engine.ingest(raw(frn(20, 2), frn(10, 1), USN_REASON_FILE_DELETE, "live.bin", ATTR_FILE), 3000);
+            engine.flush(&mut tree, 3100, |_| None);
+            assert_eq!(tree.file_count, 1);
+            assert_live_totals(&tree);
+        }
+    }
+
+    #[test]
+    fn regression_directory_move_and_delete_update_all_totals() {
+        let mut tree = sample_tree();
+        tree.upsert_incremental(12, 5, 1, true, 0, 0, 0, "archive");
+        tree.upsert_incremental(13, 10, 1, true, 0, 0, 0, "nested");
+        tree.upsert_incremental(20, 13, 1, false, MB, 2 * MB, 0, "nested.bin");
+        aggregate(&mut tree);
+        let mut engine = engine(vec![]);
+        engine.ingest(raw(frn(10, 1), frn(12, 1), USN_REASON_RENAME_NEW_NAME, "moved", ATTR_DIR), 1000);
+        engine.flush(&mut tree, 1100, |_| None);
+        assert_live_totals(&tree);
+        assert_eq!((tree.file_count, tree.dir_count), (2, 4));
+        assert_eq!(tree.dir_file_count(12), 2);
+        // 单条目录通知必须移除内存子树；后到的逐文件通知不能再减一次。
+        engine.ingest(raw(frn(10, 1), frn(12, 1), USN_REASON_FILE_DELETE, "moved", ATTR_DIR), 2000);
+        engine.flush(&mut tree, 2100, |_| None);
+        assert_live_totals(&tree);
+        assert_eq!((tree.file_count, tree.dir_count, tree.total_size, tree.total_alloc), (0, 2, 0, 0));
+        for id in [11, 13, 20] { assert!(!tree.node(id).unwrap().in_use()); }
+        engine.ingest(raw(frn(20, 1), frn(13, 1), USN_REASON_FILE_DELETE, "nested.bin", ATTR_FILE), 3000);
+        engine.flush(&mut tree, 3100, |_| None);
+        assert_live_totals(&tree);
+    }
+
+    #[test]
+    fn regression_placeholder_is_counted_once_when_create_matures() {
+        let mut tree = sample_tree();
+        // 与 WatcherSession 提前物化目录采用同一记账方式。
+        tree.upsert_incremental(12, 5, 0, true, 0, 0, 0, "pending");
+        tree.dir_count += 1;
+        let mut engine = engine(vec![]);
+        engine.ingest(raw(frn(20, 0), frn(12, 0), USN_REASON_FILE_CREATE, "child.bin", ATTR_FILE), 1000);
+        engine.flush(&mut tree, 1100, |_| Some((MB, 2 * MB, 0)));
+        engine.ingest(raw(frn(12, 0), frn(5, 1), USN_REASON_FILE_CREATE, "pending", ATTR_DIR), 1200);
+        engine.flush(&mut tree, 1300, |_| None);
+        assert_live_totals(&tree);
+        assert_eq!((tree.file_count, tree.dir_count), (2, 3));
+        engine.ingest(raw(frn(12, 0), frn(5, 1), USN_REASON_FILE_DELETE, "pending", ATTR_DIR), 1400);
+        engine.flush(&mut tree, 1500, |_| None);
+        assert_live_totals(&tree);
+        assert_eq!((tree.file_count, tree.dir_count), (1, 2));
     }
 
     #[test]
@@ -802,8 +1072,8 @@ mod tests {
     #[test]
     fn changelog_records_are_written() {
         use crate::changelog::ChangeLog;
-        let dir = std::env::temp_dir().join(format!("fw_engine_log_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("engine_log").unwrap();
+        let dir = owned.path().to_path_buf();
         let path = dir.join("log.jsonl");
 
         let mut t = sample_tree();
@@ -826,7 +1096,6 @@ mod tests {
         let obj = core_io::jsonlite::parse_flat_object(line);
         let p = core_io::jsonlite::get(&obj, "path").unwrap_or_default();
         assert!(p.contains(r"C:\logs"), "解码后的 path 不对：{}", p);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 回归：降级模式指定深目录做扫描根时，**变更流水落盘的也必须是真实路径**。
@@ -838,8 +1107,8 @@ mod tests {
     #[test]
     fn changelog_paths_are_remapped_to_real_scan_root() {
         use crate::changelog::ChangeLog;
-        let dir = std::env::temp_dir().join(format!("fw_engine_remap_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let owned = core_io::test_dir::TestDir::new("engine_remap").unwrap();
+        let dir = owned.path().to_path_buf();
         let path = dir.join("log.jsonl");
 
         let mut t = sample_tree();
@@ -878,7 +1147,6 @@ mod tests {
             "日志里不该再出现合成路径，实际 {}",
             p
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

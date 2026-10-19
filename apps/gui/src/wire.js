@@ -100,14 +100,47 @@ const FW_PALETTE = [
   '#7b6bd6', '#4fa3b8', '#b8a84a', '#c05f8e',
 ];
 
-/** 槽位 + 强度 → CSS 颜色。强度用于同色系内区分（热力图/深度）。 */
+/** 槽位 + 强度 → CSS 颜色。强度用于同色系内区分（深度）。 */
 function fwColor(slot, t) {
   const hex = FW_PALETTE[slot % FW_PALETTE.length];
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  // t 在 0..1：把亮度在 45%~115% 之间线性拉伸，保持色相不变
-  const k = 0.45 + Math.max(0, Math.min(1, t)) * 0.7;
-  const c = (v) => Math.max(0, Math.min(255, Math.round(v * k)));
-  return `rgb(${c(r)},${c(g)},${c(b)})`;
+  return fwMix(hex, hex, 0, 0.45 + clamp01(t) * 0.7);
+}
+
+/**
+ * 年龄热力图：**刚改过的暖、越旧越冷**。
+ *
+ * 与后端 `ShadingMode::ByAge` 的 `shade_t` 配套：`t=0` 是「今天改过」，
+ * `t=1` 是 `AGE_NORM_DAYS`（三年）以上。
+ *
+ * 之前这里走的是「同一个色相 + 调亮度」的老路（后端把槽位固定成 0），
+ * 结果是整张图**同一个颜色**、只是深浅略有差别 —— 用户看不出新旧。
+ * 热力图必须换色相：红→橙→黄→绿→青→蓝。
+ */
+const FW_HEAT = ['#eb5757', '#e0913f', '#d4c257', '#57c98a', '#2fbdd6', '#2f6fd6'];
+
+/** `t` 在 0~1 → 热力图上的颜色（线性插值两端的调色点）。 */
+function fwHeat(t) {
+  const u = clamp01(t) * (FW_HEAT.length - 1);
+  const i = Math.min(FW_HEAT.length - 2, Math.floor(u));
+  return fwMix(FW_HEAT[i], FW_HEAT[i + 1], u - i, 1);
+}
+
+function clamp01(v) {
+  return Math.max(0, Math.min(1, Number(v) || 0));
+}
+
+/** 两个十六进制色按 `f` 插值，再整体乘 `k`（亮度）。解析只写这一份。 */
+function fwMix(hexA, hexB, f, k) {
+  const a = fwRgb(hexA);
+  const b = fwRgb(hexB);
+  const ch = (i) => Math.max(0, Math.min(255, Math.round((a[i] + (b[i] - a[i]) * f) * k)));
+  return `rgb(${ch(0)},${ch(1)},${ch(2)})`;
+}
+
+function fwRgb(hex) {
+  return [
+    parseInt(hex.slice(1, 3), 16),
+    parseInt(hex.slice(3, 5), 16),
+    parseInt(hex.slice(5, 7), 16),
+  ];
 }

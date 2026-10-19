@@ -464,6 +464,14 @@ SINGLE_DEF = {
     "fn event_path": "crates/core-scan/src/paths.rs",
     # FRN → 记录号的掩码（曾经在三个 crate 里各抄一份）
     "const RECNO_MASK": "crates/core-index/src/arena.rs",
+    # 时间口径。CLI、界面、变更流水都要"现在几点"和"怎么显示"，
+    # 各写一份的直接后果是：同一次操作里标题、文件名、日志三个时间对不上
+    # （历史上 CLI 与 GUI 各自有一个 `base_ms` / `now_ms`，共三处）。
+    "fn unix_ms": "crates/core-io/src/util.rs",
+    "fn unix_secs": "crates/core-io/src/util.rs",
+    "fn civil_from_days": "crates/core-io/src/util.rs",
+    "fn unix_utc": "crates/core-io/src/util.rs",
+    "fn unix_stamp": "crates/core-io/src/util.rs",
 }
 
 _def_files = collections.defaultdict(list)

@@ -36,6 +36,15 @@ const VALUE_KEYS: &[&str] = &[
     "journal-size",
     "journal-delta",
     "out",
+    // F12 重复文件查找
+    "min-size",
+    "block",
+    "max-per-group",
+    "max-candidates",
+    "csv",
+    // F11 快照对比
+    "max-entries",
+    "min-delta",
 ];
 
 #[derive(Debug, Default)]

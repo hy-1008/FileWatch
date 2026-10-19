@@ -14,8 +14,10 @@
 compile_error!("FileWatch 仅支持 Windows：核心依赖 NTFS $MFT 直读与 USN Journal。");
 
 pub mod buffered_reader;
+pub mod hash;
 pub mod ioctl;
 pub mod jsonlite;
+pub mod test_dir;
 pub mod util;
 pub mod volume;
 pub mod volumes;

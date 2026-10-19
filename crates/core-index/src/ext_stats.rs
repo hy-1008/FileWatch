@@ -6,7 +6,21 @@
 
 use crate::aggregate::SizeMode;
 use crate::tree::{extension_of, Tree};
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+/// 扩展名 → 表键。**唯一**一处做大小写折叠的地方。
+///
+/// Windows 文件系统不区分大小写，`Report.TXT` 与 `notes.txt` 在用户眼里是同一个
+/// 扩展名。折叠规则只能有一份：以前建表时折叠、按名字查时**不**折叠，于是
+/// `A.TXT` 在类型列表里有统计数字、按名字却查不到，落到「其他」桶里。
+fn key_of(ext: &str) -> Cow<'_, str> {
+    if ext.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(ext.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(ext)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtStat {
@@ -64,12 +78,7 @@ impl ExtensionTable {
                 continue;
             }
             let name = tree.names.get(node.name);
-            let ext = extension_of(name);
-            let key = if ext.bytes().any(|b| b.is_ascii_uppercase()) {
-                ext.to_ascii_lowercase()
-            } else {
-                ext.to_string()
-            };
+            let key = key_of(extension_of(name)).into_owned();
             let e = m.entry(key).or_insert((0, 0, 0));
             e.0 += 1;
             e.1 = e.1.saturating_add(node.size);
@@ -101,15 +110,23 @@ impl ExtensionTable {
     }
 
     /// 名字 → `ext_id`；未知扩展名返回 `u32::MAX`（「其他」桶）。
+    ///
+    /// 注意是查**扩展名**（`key_of` 折叠后）而不是整个文件名 —— 表的键是扩展名。
     pub fn id_of_name(&self, name: &str) -> u32 {
-        let ext = extension_of(name);
-        *self.map.get(ext).unwrap_or(&u32::MAX)
+        let key = key_of(extension_of(name));
+        self.map.get(key.as_ref()).copied().unwrap_or(u32::MAX)
     }
 
     /// 节点下标 → `ext_id`。
+    ///
+    /// 面积图拿它上色（`ext_id % (SHADE_SLOTS-1)`），点击类型列表高亮也靠它，
+    /// 所以**查不到就等于整个面积图只有一个颜色** —— 见下面 `node_lookup_*` 的用例。
     pub fn id_of_node(&self, tree: &Tree, idx: u32) -> u32 {
         match tree.arena.get(idx) {
-            Some(n) if n.is_file() => self.map.get(tree.names.get(n.name)).copied().unwrap_or(u32::MAX),
+            Some(n) if n.is_file() => {
+                let key = key_of(extension_of(tree.names.get(n.name)));
+                self.map.get(key.as_ref()).copied().unwrap_or(u32::MAX)
+            }
             _ => u32::MAX,
         }
     }
@@ -228,6 +245,75 @@ mod tests {
         let t = tree_with_files(&[("a.txt", 1, 1)]);
         let table = ExtensionTable::build(&t);
         assert_eq!(table.id_of_name("nope.xyz"), u32::MAX);
+    }
+
+    /// 按名字/节点查 id 必须与统计表**同一套算法**。
+    ///
+    /// 这组用例以前不存在，于是 `id_of_node` 拿**整个文件名**去查以扩展名为键的
+    /// 表，永远查不到 → 每个文件都拿到 `u32::MAX` → 面积图整片同色
+    /// （用户反馈：「着色选文件类型时没有按类型上色」）。这个 bug 不会让编译失败、
+    /// 也不会让任何既有测试变红，只会让画面难看，所以必须有测试盯着。
+    #[test]
+    fn node_lookup_returns_the_same_id_as_the_table() {
+        let t = tree_with_files(&[
+            ("a.txt", 100, 100),
+            ("b.LOG", 50, 50),
+            ("Makefile", 5, 5),
+            ("c.bin", 900, 900),
+        ]);
+        let table = ExtensionTable::build(&t);
+
+        // 逐个文件对照：`id_of_node` == 按扩展名查
+        for (i, ext) in [(1, "txt"), (2, "log"), (3, ""), (4, "bin")] {
+            let want = table.id_of_ext(ext).expect("表里应该有这个扩展名");
+            assert_eq!(
+                table.id_of_node(&t, i),
+                want,
+                "节点 #{i}（.{ext}）拿到的 id 与统计表不一致"
+            );
+        }
+        // 无扩展名是**独立的一类**，不是「其他」桶
+        assert_ne!(table.id_of_node(&t, 3), u32::MAX);
+        // 目录不参与类型着色（保持「其他」）
+        assert_eq!(table.id_of_node(&t, 0), u32::MAX);
+        // 表里没有的扩展名才算「其他」
+        let t2 = tree_with_files(&[("d.xyz", 1, 1)]);
+        let table2 = ExtensionTable::build(&t2);
+        assert_eq!(table2.id_of_node(&t2, 1), table2.id_of_ext("xyz").unwrap());
+        assert_eq!(table2.id_of_name("e.abc"), u32::MAX);
+    }
+
+    /// 不同扩展名必须拿到**不同的 id** —— 面积图的色槽是 `ext_id % (SHADE_SLOTS-1)`，
+    /// 全都相等就等于全图一个颜色。
+    #[test]
+    fn distinct_extensions_get_distinct_ids() {
+        let t = tree_with_files(&[
+            ("a.txt", 10, 10),
+            ("b.log", 20, 20),
+            ("c.bin", 30, 30),
+            ("d.png", 40, 40),
+        ]);
+        let table = ExtensionTable::build(&t);
+        let ids: Vec<u32> = (1..=4).map(|i| table.id_of_node(&t, i)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert_ne!(*id, u32::MAX, "第 {i} 个文件不该落进「其他」桶");
+        }
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "四个扩展名应得到四个不同的 id");
+    }
+
+    /// 大小写折叠：`A.TXT` 与 `b.txt` 归到同一行，按名字查也要命中同一个 id。
+    #[test]
+    fn lookup_is_case_insensitive() {
+        let t = tree_with_files(&[("A.TXT", 10, 10), ("b.txt", 20, 20)]);
+        let table = ExtensionTable::build(&t);
+        assert_eq!(table.len(), 1);
+        let id = table.id_of_ext("txt").unwrap();
+        assert_eq!(table.id_of_node(&t, 1), id);
+        assert_eq!(table.id_of_node(&t, 2), id);
+        assert_eq!(table.id_of_name("c.TxT"), id);
     }
 
     #[test]
