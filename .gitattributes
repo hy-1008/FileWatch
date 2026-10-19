@@ -1,0 +1,21 @@
+# 统一行尾：源码一律 LF（跨平台协作时不让 CRLF 制造整文件 diff）。
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+LICENSE text eol=lf
+
+# 二进制：别让 git 试图合并或转换它们
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.dll binary
