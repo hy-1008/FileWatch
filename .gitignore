@@ -3,6 +3,8 @@
 *.pdb
 /crates/*/target
 /apps/*/target
+# 便携版打包产物（tools/package.py 生成），每次都是重造的，不进版本控制
+/dist
 # GUI 的 src-tauri 是它自己的 workspace 根（见 apps/gui/README.md），
 # 所以它的 target 不在上面那条 `/apps/*/target` 的覆盖范围内。
 /apps/gui/src-tauri/target
@@ -10,3 +12,11 @@
 /apps/gui/src-tauri/*-log.txt
 # tauri-build 生成的权限 schema，每次构建会重写，不进版本控制
 /apps/gui/src-tauri/gen/schemas
+# Python 工具产生的字节码缓存
+__pycache__/
+*.py[cod]
+# 开发期的无头浏览器夹具（mock_*.js / preview_*.py）与截图：它们只在本机
+# 用来验证前端，靠注入假的 __TAURI__ 跑真实页面 —— 对使用者没有价值。
+/tmp/
+# 本机临时文件
+*.log

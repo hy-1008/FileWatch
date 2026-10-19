@@ -20,9 +20,9 @@ exclude = ["apps/gui/src-tauri"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-license = "MIT"
+license = "GPL-3.0-or-later"
 authors = ["FileWatch contributors"]
-repository = ""
+repository = "https://github.com/hy-1008/FileWatch"
 
 [workspace.dependencies]
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,10 +1,50 @@
 # FileWatch —— Windows 文件增量监控工具
 
-基于 NTFS `$MFT` 直读 + USN Journal 的高性能文件监控引擎，配 Squarified Treemap
-面积图可视化。
+用 NTFS `$MFT` 直读 + USN Journal 做全盘扫描与实时监控，配 Squarified Treemap
+面积图看清楚"空间到底被谁吃了"。
 
-* **引擎 + CLI**（M0~M3）：验收全绿，见第 5 节。
-* **GUI**（M4~M5，Tauri 2 + Canvas）：已落地，见 [`apps/gui/README.md`](apps/gui/README.md)。
+**不装驱动、不常驻索引服务、不联网。** 扫一次把目录树（名字 / 大小 / 时间）
+装进内存，之后靠 USN 增量事件更新；200 万文件的盘通常几秒扫完，常驻内存
+控制在几百 MB 以内。
+
+![面积图界面](artifacts/ui/main.png)
+
+## 能做什么
+
+| 能力 | 说明 |
+|---|---|
+| 全盘扫描 | `$MFT` 直读（需管理员）或目录遍历（普通权限）。两条路功能一致，只是快慢差 1~2 个数量级，界面会明确标注用的是哪条 |
+| 面积图 | Treemap 下钻，按文件类型 / 目录深度 / 修改时间着色；滚轮缩放、Esc 返回 |
+| 实时监控 | USN 增量，事件不丢不重；变更流水可导出 CSV |
+| 阈值预警 | `abs=` / `grow=` / `rate=` 三种规则（与 CLI 同一套语法），带滞回与冷却；命中时**系统通知 + 托盘图标闪动 + 托盘菜单记一条**，窗口收起来也看得见 |
+| 重复文件 | 体积 → 首尾哈希 → 全哈希 → **逐字节复核**；只查找、不删除 |
+| 快照对比 | 存一份 `.tsv` 快照，过一段时间再比：谁新增 / 删除 / 变大 / 变小，六列表格 + CSV |
+| 文件搜索 | 在**内存索引**里搜名字（包含 / 模糊 / 正则），也可搜纯文本文件的内容（txt / 日志 / CSV / 源码） |
+| 常驻托盘 | 可设为「关闭窗口只收进托盘」，监控继续跑；可选开机自启 |
+
+![文件搜索](artifacts/ui/search.png)
+
+## 不做什么
+
+* **不删文件**。重复文件只列出来，删不删由你自己决定。
+* **不上传任何数据**。没有遥测、没有联网检查更新。
+* **不改磁盘内容**。读 `$MFT` 与 USN 都是只读；监控只读元数据，不锁定文件。
+* **不解析 Office 文档内容**（docx/xlsx/pptx 是压缩包，引擎层刻意零第三方依赖）。
+
+---
+
+## 0. 只想打开软件看看
+
+## 0. 只想打开软件看看
+
+```powershell
+python tools/package.py
+.\dist\FileWatch-*-win64-*\FileWatch.exe          # 双击也行（目录名带时间戳）
+```
+
+包里是**绿色便携**的：`FileWatch.exe`（界面）、`WebView2Loader.dll`（必须在
+exe 旁边，缺了启动即报错）、`cli\filewatch.exe`（命令行版）、`使用说明.txt`。
+首次启动会问一次要不要管理员权限 —— 选哪个功能都全，只是快慢差 1~2 个数量级。
 
 ---
 
@@ -92,6 +132,9 @@ journal <盘符> [--status|--create|--delete]
 scan <盘符> [选项]          全量扫描并输出统计（M1 验收）
 top <盘符> [--n=20]         恒定内存找最大的 N 个文件（不建树）
 monitor <路径> [选项]       实时监控 + 阈值预警（M2/M3 验收）
+dupes <盘符|目录> [选项]    重复文件查找：体积 → 部分哈希 → 全哈希 → 逐字节复核（F12）
+snapshot <盘符|目录> [选项] 把当前文件清单存成 .tsv 快照（F11）
+diff <旧快照> <新快照>      对比两份快照，看谁新增/删除/变大/变小（F11）
 selftest [--verbose]        免管理员的全链路自检
 help / version
 ```
@@ -148,6 +191,59 @@ filewatch monitor C: --rule=abs=2G --create-journal      # 自动启用 USN Jour
 | `--watch-buffer=64K` | 目录监视缓冲（突发变更多时调大，防丢事件） |
 | `--watch-max-nodes=N` | 实时增量的路径索引上限（默认 300000） |
 
+### dupes（F12 重复文件）
+
+```powershell
+filewatch dupes D:\photos --min-size=1M --top=50
+filewatch dupes C: --min-size=1M --csv=dups.csv --json      # 需要管理员才能走 MFT 直读
+```
+
+| 选项 | 含义 |
+|---|---|
+| `--min-size=1M` | 小于它的文件不参与比较（默认不限；0 字节文件永远排除） |
+| `--top=N` | 最多输出多少组（按可回收空间降序，默认 200） |
+| `--max-per-group=N` | 每组最多列出几个文件（真实数量仍如实计，默认 50） |
+| `--block=4K` | 部分哈希读首尾各多少字节（默认 4 KiB） |
+| `--max-candidates=N` | 候选数上限，防止 `--min-size=0` 把内存吃满（0 = 不限） |
+| `--csv=FILE` / `--json` | 结果落盘 / 机器可读 |
+
+**为什么快**：三级漏斗把绝大多数文件直接跳过。体积唯一的文件**一个字节都不读**；
+体积相同的才读首尾各 4 KiB；还撞上的才读整份；最后再逐字节复核给出确定结论。
+实测 6 个文件的小树只读了 617 KB —— 其中那份 200 KB 的"同体积不同内容"文件
+在第二轮就被筛掉了。
+
+**哈希为什么可以用非加密的 FNV-1a**：哈希只当**筛子**，最终判据是逐字节比对。
+所以撞车不会导致误报（自检第 25 项专门用"强制所有哈希相等"的数据源把这条钉住），
+也就不需要 SHA-256 那种开销。
+
+### snapshot / diff（F11 快照对比）
+
+```powershell
+filewatch snapshot D:\projects --out=before.tsv
+# …过一段时间，磁盘有变化…
+filewatch snapshot D:\projects --out=after.tsv
+filewatch diff before.tsv after.tsv --top=50 --min-delta=1K
+filewatch diff before.tsv after.tsv --by-abs --csv=changes.csv
+```
+
+| 选项（snapshot） | 含义 |
+|---|---|
+| `--out=FILE` | 输出路径（默认 `snapshot-<UTC 时间戳>.tsv`） |
+| `--max-entries=N` | 最多记多少个文件（0 = 不限；截断会如实标注） |
+
+| 选项（diff） | 含义 |
+|---|---|
+| `--top=N` | 最多列出多少行（默认 50） |
+| `--min-delta=1K` | 变化小于它的不进列表（仍计入统计） |
+| `--by-abs` | 按变化幅度排序（变大变小混在一起） |
+| `--by-path` | 按路径排序（便于与外部 `diff` 工具对照） |
+| `--csv=FILE` | 明细落盘 |
+
+快照是 **TSV 纯文本**（可读、可 `sort`/`grep`、体积接近二进制），第一行是魔数 +
+版本号，`#count` 与实际条数不符即报错 —— 因为**截断的快照会让后半段全被判成
+"已删除"**，用户可能照着它去清理并不存在的垃圾。写入先落 `.part` 再改名，
+中途被杀不会留下一份"看起来正常、少了一半"的文件当基准。
+
 ---
 
 ## 4. 架构
@@ -155,13 +251,13 @@ filewatch monitor C: --rule=abs=2G --create-journal      # 自动启用 USN Jour
 ```
 apps/cli                    命令行（M0~M3 的主力验证工具）
 crates/
-  core-io       卷句柄 / 16 MB 预读 / DeviceIoControl / 手写 Win32 FFI
+  core-io       卷句柄 / 16 MB 预读 / DeviceIoControl / 手写 Win32 FFI / 内容哈希 / 时间口径
   core-ntfs     引导扇区、fixup、属性链、Data Runs、$FILE_NAME、单条 MFT 记录
   core-usn      USN Journal 读写、USN_RECORD_V2/V3 解析、Reason→语义事件、游标自愈
   core-index    40 字节紧凑节点、字符串池、目录树、O(树深) 增量聚合、扩展名统计
   core-viz      Squarified Treemap、LOD 剪枝、相机钳制（纯函数）
   core-monitor  有界队列、debounce 合并、三种阈值规则、预警去重、变更流水、合成路径重映射
-  core-scan     扫描调度与会话编排（唯一对外入口）
+  core-scan     扫描调度与会话编排（唯一对外入口）+ 重复文件三级去重 + 快照与差异
 ```
 
 ### 分层规则
@@ -235,7 +331,35 @@ FRN 低 48 位，**不用 HashMap** 做定位；文件名进字符串池、节�
 | M4 | 面积图布局 | `scan --layout=WxH` | 布局算法完成，字符网格预览可用 |
 | M5 | GUI（Tauri 2 + Canvas） | `filewatch-gui.exe` | **已落地**（盘符/扫描/树/面积图/类型/Top-N/详情 + 权限申请） |
 | F6/F7/F8 | 实时监控 / 阈值预警 / 变更流水 | `filewatch-gui.exe` 底部抽屉；CLI 侧是 `monitor` | **已落地**（同一棵索引树，CLI 与界面共用一套事件口径） |
-| M6 | 打包分发 | — | 未开始（桌面端的 UAC 提权已提前做掉，见下） |
+| F11 | 快照对比（存快照 / 与当前对比 / 导出 CSV） | CLI：`snapshot` + `diff`；GUI：中间区「快照对比」 | **已落地**（引擎实现共用，界面只做编排） |
+| F12 | 重复文件查找（三级去重） | CLI：`dupes`；GUI：中间区「重复文件」 | **已落地**（后台线程 + 进度推送，不冻界面） |
+| F13 | 文件搜索（名字：包含/模糊/正则；内容：纯文本类） | GUI：中间区「文件搜索」 | **已落地**（名字在内存索引里搜；内容走后台线程 + 进度） |
+| M6 | 打包分发 | `python tools/package.py` | **已落地**（`dist/FileWatch-<版本>-win64-<时间戳>.zip`，实测可启动） |
+
+### 真实目录实测：F11 / F12 与独立实现对拍
+
+重复文件与快照这两件事**只看屏幕不算数**（少一组、多一组、少算一个字节都不会
+报错，只会安静地给出一个看起来合理的数字），所以另外拿 Python 的独立实现
+（`os.walk` + `hashlib`）对了一遍 —— 造一棵已知答案的树，逐项比数字：
+
+| 检查 | filewatch | 独立参考实现（Python） | 结论 |
+|---|---|---|---|
+| 重复组数 / 可回收字节 | 1 组 / 400 000 B | 1 组 / 400 000 B | **一致** |
+| 同体积但内容不同（`uniq.bin`） | 部分哈希后 3 → 完整哈希后 3，被剔除 | 内容分组后同样剔除 | **一致** |
+| 导出 CSV 里的路径集合 | 3 条 | 3 条（集合完全相等） | **一致** |
+| 快照文件数 / 总字节 | 6 / 800 200 B | 6 / 800 200 B | **一致** |
+| diff 四类变更计数 | 新增 1 / 删除 1 / 变大 1 / 变小 1 | 同一批操作 | **一致** |
+| diff 净变化 | −188.43 KB | 3000 + 4096 − 200 000 − 50 = −192 954 B | **一致** |
+
+树里有三个 200 000 B 的相同文件、一个**同体积不同内容**的文件、两个 100 B
+的小文件；随后删掉一个、追加 4096 B、新建 3000 B、改小一个。
+
+```bash
+python tools/e2e_real.py        # 17 项断言；工作目录在系统临时目录
+```
+
+「同体积不同内容」这一条是刻意加的：只按体积分组就能"找到重复"的话，
+这个工具会把一堆互不相干的文件报成重复 —— 而且报得理直气壮。
 
 ### 真实目录实测（不是只在临时小目录里跑）
 
@@ -270,12 +394,15 @@ System32 那 23 个目录的差值是**计数口径**不同，不是漏算：fil
 
 ```powershell
 cargo test --release      # 单元测试 + 集成测试（e2e 直接跑真实 exe）
-filewatch selftest        # 28 项内置自检，逐项打印「通过/失败/跳过」
+filewatch selftest        # 31 项内置自检，逐项打印「通过/失败/跳过」
+python tools/e2e_real.py  # 真实目录上跟 Python 独立实现对拍（F11/F12）
+python tools/check_api.py .
+python tools/muttest.py
 
 # GUI 侧
 cd apps/gui/src-tauri; cargo test --release
-node apps/gui/tools/check-wire.js     # 线格式：按文档偏移对拍（801 条断言）
-node apps/gui/tools/check-admin.js    # 权限弹窗规则真值表 + DOM 接线（41 条断言）
+node apps/gui/tools/check-wire.js     # 线格式：按文档偏移对拍（830 条断言）
+node apps/gui/tools/check-admin.js    # 界面规则真值表 + DOM 接线 + 模式/自启/周期任务/路径选择器对账（253 条断言）
 ```
 
 自检把**失败**和**跳过**分开报：跳过只发生在环境本身不支持时（例如容器里
@@ -285,18 +412,24 @@ node apps/gui/tools/check-admin.js    # 权限弹窗规则真值表 + DOM 接线
 
 | 目标 | 结果 |
 |---|---|
-| `cargo build --release` | 0 warning / 0 error |
-| `core-io` | 15 / 15 |
+| `cargo build --release`（引擎 + CLI） | 0 warning / 0 error |
+| `cargo build --release`（GUI） | 0 warning / 0 error |
+| `core-io` | 28 / 28 |
 | `core-ntfs` | 35 / 35 |
 | `core-usn` | 29 / 29 |
 | `core-index` | 42 / 42 |
 | `core-viz` | 58 / 58 |
-| `core-monitor` | 87 / 87 |
-| `core-scan` | 36 / 36 |
-| `filewatch`（bin + e2e） | 29 + 12 |
-| `filewatch selftest` | 通过 28 / 失败 0 / 跳过 0 |
-| `tools/muttest.py` | 通过 23 / 失败 0 |
+| `core-monitor` | 96 / 96 |
+| `core-scan` | 88 / 88 |
+| `filewatch`（bin + e2e） | 24 + 12 |
+| `filewatch-gui` | 36 / 36 |
+| **合计（Rust）** | **448 / 448** |
+| `filewatch selftest` | 通过 31 / 失败 0 / 跳过 0 |
+| `tools/e2e_real.py` | 通过 17 / 失败 0 |
+| `tools/muttest.py` | 通过 25 / 失败 0 |
 | `tools/check_api.py` | ERROR 0 / WARN 0 |
+| `apps/gui/tools/check-wire.js` | 830 条断言全过 |
+| `apps/gui/tools/check-admin.js` | 253 条断言全过 |
 
 ### 无编译器时的静态预检（`tools/`）
 
@@ -312,21 +445,27 @@ node apps/gui/tools/check-admin.js    # 权限弹窗规则真值表 + DOM 接线
 | E/F | `E0425` / `E0433` | `core_x::mod::Item` 与 `crate::mod::Item` 是否存在 |
 | G | `unused_imports` | 导入但未使用（已排除 `pub use` 与靠方法语法使用的 trait） |
 | H | `E0063` / `E0560` | 结构体字面量**缺字段 / 多字段 / 字段名拼错** |
+| I | — | **共用语法与口径只允许一处顶层定义**（见上一节的 I 类） |
 
 ```bash
 python tools/check_api.py           # 输出 ERROR/WARN 清单，有 ERROR 时退出码 1
 python tools/check_api.py .         # 也可以显式指定工程根目录
 python tools/muttest.py             # 变异测试：验证上面这套检查器真的抓得到错
+python tools/e2e_real.py            # 真实目录上跟 Python 独立实现对拍（F11 / F12）
 ```
 
-`muttest.py` 是这件事的关键：它会往**副本**里故意注入 17 类错误（另有 6 个
+`muttest.py` 是这件事的关键：它会往**副本**里故意注入 16 类错误（另有 9 个
 「看着可疑但完全合法」的回归守卫，如 `fn f() -> Rect {`、`..Default::default()`、
 `impl` 块里的同名方法），确认每一类都被检出、且合法写法零误报。
 
-其中 **I 类**（本次新增）专门盯「同一件事被写了两遍」：`parse_size` / `parse_rule` /
-`event_size_text` / `join_path` / `RECNO_MASK` 这些共用语法与口径，全工程
-**只允许有一处顶层定义**，谁要在别处再写一份，检查器直接报错。这类分叉不会让
-编译失败，只会让同一个动作在 CLI 与界面上表现不一致 —— 本项目已经因此吃过两次亏。
+其中 **I 类**专门盯「同一件事被写了两遍」：`parse_size` / `parse_ms` / `parse_rule` /
+`event_size_text` / `join_path` / `event_path` / `RECNO_MASK`，以及
+**时间口径**（`unix_ms` / `unix_secs` / `civil_from_days` / `unix_utc` / `unix_stamp`）
+全工程**只允许有一处顶层定义**，谁要在别处再写一份，检查器直接报错。
+这类分叉不会让编译失败，只会让同一个动作在 CLI 与界面上表现不一致 ——
+本项目已经因此吃过两次亏（路径双重替换、落盘用合成路径）；时间口径也一样，
+它曾同时存在三份实现（CLI 的 `base_ms`、GUI 的 `commands::now_ms` 与
+`monitor::now_ms`），分叉的表现是「标题、文件名、日志里的时间对不上」。
 一个只报「0 错误」而没有通过变异测试的检查器，其「0 错误」是没有意义的。
 
 副本放在**系统临时目录**（`%TEMP%\filewatch_muttest\{prime,work}`）而不是工程里：
@@ -334,7 +473,7 @@ python tools/muttest.py             # 变异测试：验证上面这套检查器
 那一两个文件从 `prime` 还原回去。早期实现是「每轮重建整棵副本树」，21 轮要删除
 一千多个文件 —— 又慢又会撞上环境的批量删除保护。测试结束**不**删副本，下次原地复用。
 
-当前状态：**20 / 20 通过，工程代码 0 ERROR / 0 WARN**。
+当前状态：**25 / 25 通过，工程代码 0 ERROR / 0 WARN**。
 （注意：这不等于能编译。借用检查、trait 解析、泛型单态化等仍必须靠 `rustc`。）
 
 ### 需要提权才能验收的部分
@@ -370,6 +509,20 @@ filewatch monitor C: --rule=abs=50G --duration=5m
   如何用 `journal --delete` 恢复。
 * 分配大小（占用空间）在遍历模式下只能按簇对齐**估算**，没有 MFT 的
   `$DATA` 分配簇数精确。
+* **F12 只查找、绝不删除。** 内容相同的两个文件不代表可以删（程序数据目录里的
+  同名文件、字体、快捷方式目标都可能各自必需），所以工具只给出组与可回收空间，
+  删除由你自己决定。界面与 CLI 都不会调 `DeleteFile`。
+* **F12 的四类排除**：0 字节文件（互相"相同"但没有意义）、重解析点
+  （符号链接 / 联接点，删了链接不等于删了数据）、候选数超上限被截断的部分、
+  读不到的文件（权限 / 被占用 / 中途被删）。每一项都在输出里如实计数，
+  不静默丢弃。
+* **F11 的快照不是历史，只是"某一时刻的清单"。** 对比需要两份（CLI 给两个
+  路径；界面是"一份快照 + 当前扫描结果"，因为界面本来就有一棵活着的索引树）。
+  若某份快照存的时候就被 `--max-entries` 截断过，**没被记进去的文件会被判成
+  「新增」** —— 工具会在摘要、界面提示、`#count` 校验三处同时说明这一点，
+  但最终仍需你自己留意不要把那份清单当成删除清单。
+* **F11 不同扫描根的对比不报错但会警告**（换了挂载点/盘符时确实可能要比），
+  因为"整盘少了一半"这个结论一旦被当成真的，代价很大。
 
 ---
 
@@ -380,24 +533,68 @@ filewatch/
 ├─ Cargo.toml                  workspace（8 个成员，零第三方依赖）
 ├─ setup-rust.ps1              一键搭环境 + 构建 + 自检（含国内镜像）
 ├─ tools/
-│  ├─ check_api.py             无编译器时的静态预检（A~H 七类检查）
-│  └─ muttest.py               对 check_api.py 的变异测试（23 项）
+│  ├─ check_api.py             无编译器时的静态预检（A~I 九类检查）
+│  ├─ muttest.py               对 check_api.py 的变异测试（25 项）
+│  ├─ e2e_real.py              真实目录上跟 Python 独立实现对拍（F11/F12）
+│  └─ package.py               打便携包 → dist/FileWatch-<版本>-win64[.zip]
 ├─ .cargo/config.toml          固定 x86_64-pc-windows-gnu 目标（脚本生成）
 ├─ apps/cli/
 │  ├─ src/main.rs              命令分发 + 各命令实现
 │  ├─ src/args.rs              自包含参数解析（含 --rule 语法）
 │  ├─ src/render.rs            时间/表格/字符网格面积图
-│  ├─ src/selftest.rs          28 项内置自检
+│  ├─ src/selftest.rs          31 项内置自检
 │  └─ tests/e2e.rs             端到端测试（跑真实 exe）
 ├─ apps/gui/                   GUI（Tauri 2 + Canvas）
 │  ├─ src-tauri/               Rust 侧；**它自己是 workspace 根**，
 │  │                           被上面的 exclude 挡在外面，所以引擎的依赖图仍是空的
 │  │                           （commands 命令层 / state 共享状态 / wire 二进制协议 /
-│  │                            elevate 权限 / prefs 偏好 / monitor 监控线程）
-│  └─ src/                     前端（纯静态，无 npm / 无打包器）
+│  │                            elevate 权限 / prefs 偏好 / monitor 监控线程 /
+│  │                            analyze 重复文件与快照对比）
+│  ├─ src/                     前端（纯静态，无 npm / 无打包器）
+│  │                           app.js 主控 / treemap.js 画布 / wire.js 解码 /
+│  │                           admin-rule.js 权限规则 / view-rule.js 盘符归属规则
+│  │                           （两条 *-rule.js 都是纯函数，单独跑真值表）
+│  └─ tools/                   make-icon.py / check-wire.js / check-admin.js
 └─ crates/                     7 个引擎 crate，详见第 4 节
 ```
 
 分层上只有一个方向：`apps/* → core-scan → core-*`。GUI 与 CLI 是**并列**的两个
 调用方，都用 `core_scan::Session` 这一条装配路径 —— 所以同一个目录在两边显示的
-大小必须一致，不一致就是 bug 而不是「口径不同」。
+大小必须一致，不一致就是 bug 而不是「口径不同」。F11/F12 也是这个规矩：
+界面里的「重复文件」「快照对比」调用的是 `core_scan::dedup` /
+`core_scan::snapshot`，与 `filewatch dupes` / `snapshot` / `diff` 是**同一份实现**；
+连 CSV 的列头与转义都只写了一遍（界面把结果转回引擎类型再导，而不是自己拼）。
+
+---
+
+## 8. 许可
+
+[GNU General Public License v3.0 or later](LICENSE)（`GPL-3.0-or-later`）。
+
+可以自由使用、修改、分发，包括商用；但分发修改版时必须同样开源，
+且不提供任何担保。改源码前请读一遍第 4 节的分层约定 —— 尤其是
+**`crates/**` 保持零第三方依赖**这一条，它是"任意机器都能 `cargo build`"
+的前提。
+
+## 9. 反馈与贡献
+
+提 Issue 时最有用的是这三样：
+
+1. Windows 版本、是否管理员运行（界面状态栏的「权限」按钮里有完整报告）；
+2. 扫描方式（`MFT 直读` 还是降级遍历 —— 底部状态栏会写）；
+3. 复现步骤，以及涉及的目录规模（文件数）。
+
+改代码前后建议跑：
+
+```bash
+cargo build --release && cargo test --release   # 引擎：零 warning、全绿
+filewatch selftest                              # 31 项内置自检
+python tools/e2e_real.py && python tools/muttest.py
+python tools/check_api.py .
+cd apps/gui/src-tauri && cargo test --release   # 界面后端
+node apps/gui/tools/check-admin.js              # 界面规则真值表 + DOM 接线
+```
+
+界面的其余守卫脚本清单在 [`apps/gui/README.md`](apps/gui/README.md)。
+"零 warning"不是洁癖：这类项目里残留的往往是某个分支忘了处理的情况，
+编译器是唯一会提醒你的东西。
