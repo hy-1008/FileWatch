@@ -27,6 +27,24 @@ async function contextExplore(path) {
   const result = await call('explore_path', { path });
   if (!result.exact) toast(`目标已不存在，已打开仍存在的上级目录：${result.path}`);
 }
+/** 「打开方式…」：系统原生的"你要如何打开这个文件？"对话框。
+ *  选哪个程序由用户在那个对话框里决定，我们只把路径递过去 —— 程序清单
+ *  来自注册表，前端自己去猜只会猜错。 */
+async function contextOpenWith(path) {
+  await call('open_with_dialog_path', { path });
+}
+/** 「用默认程序打开」= 在资源管理器里双击它，**文件会被执行**。 */
+async function contextOpenDefault(path) {
+  await call('open_default_path', { path });
+}
+/** 「用默认程序打开」对这些扩展名等于运行一个程序。
+ *  这类文件只给「打开方式…」—— 流水里手抖点中一个 .exe 的代价太大，
+ *  让用户在系统对话框里再确认一次。扩展名不在这张表里不代表安全，
+ *  但表里这些是"点一下就真的跑起来"的那批。 */
+const CONTEXT_EXECUTABLE = /\.(exe|msi|msix|appx|bat|cmd|com|scr|pif|ps1|vbs|vbe|jse?|wsf|wsh|hta|lnk|reg|jar)$/i;
+function contextIsExecutable(path) {
+  return CONTEXT_EXECUTABLE.test(String(path).replace(/[\\/]+$/, ''));
+}
 async function contextLocate(path) {
   let node = await call('find_by_path', { path });
   if (node === null || node === undefined) {
@@ -60,10 +78,18 @@ function contextRecord(row) {
 async function contextItems(descriptor) {
   const item = (id, label, action, disabled = false) => ({ id, label, action, disabled });
   const separator = () => ({ separator: true });
-  const common = (path, name) => [
-    // 两个"打开资源管理器"的动作不是一回事：
-    //   打开 —— 进到这个文件夹（是文件时进它所在的目录）
-    //   定位 —— 打开上级目录并**选中**它（看清它在哪、周围有什么）
+  /** `dir` 三态：true = 明确是文件夹（不给"打开方式"）；false = 明确是文件；
+   *  undefined = 不确定（流水/快照行只有路径），交给后端拒绝并给出提示。 */
+  const common = (path, name, dir) => [
+    // 打开 vs 定位 vs 打开方式，三件事别混：
+    //   用默认程序打开 —— 文件被它的关联程序打开（会执行文件，可执行类型在菜单里不出现）
+    //   打开方式…     —— 系统对话框，让用户挑程序
+    //   打开 / 定位   —— 只是资源管理器窗口，永远不执行目标
+    ...(dir ? [] : [
+      item('open-with', '打开方式…', () => contextOpenWith(path)),
+      ...(contextIsExecutable(path) ? [] : [item('open-default', '用默认程序打开', () => contextOpenDefault(path))]),
+      separator(),
+    ]),
     item('open', '在文件资源管理器打开', () => contextExplore(path)),
     item('reveal', '在资源管理器中定位', () => contextReveal(path)),
     separator(), item('copy-path', '复制完整路径', () => contextCopy(path)),
@@ -82,7 +108,7 @@ async function contextItems(descriptor) {
         guard(); const node = info.is_dir ? info.node : await call('node_parent', { node: info.node });
         guard(); monShow(false); setView('map'); await goto(node);
         if (!info.is_dir) await pickNode(info.node);
-      }), ...common(info.path, info.name), separator(),
+      }), ...common(info.path, info.name, info.is_dir), separator(),
       item('copy-info', '复制大小与路径', () => contextCopy(`${info.path}\n逻辑大小：${humanSize(info.size)}\n占用大小：${humanSize(info.alloc)}`)),
       separator(),
       item('parent', '当前视图返回上一级', () => { guard(); return goto(state.crumbs[state.crumbs.length - 2].node); }, state.crumbs.length < 2),
@@ -93,7 +119,7 @@ async function contextItems(descriptor) {
     const v = descriptor.volume, path = /^[a-z]:\\?$/i.test(v.root) ? v.root.slice(0, 2) + '\\' : v.root;
     return { title: `${v.drive} ${v.label || ''}`, items: [
       item('scan', busy ? '扫描此盘符（请先结束联动监控或扫描）' : '扫描此盘符', () => startScan(v.drive, null), busy),
-      ...common(path, v.label || v.drive),
+      ...common(path, v.label || v.drive, true),
       item('copy-info', '复制容量信息', () => contextCopy(`${path}\n${v.label || ''} ${v.fs_name}\n总容量：${humanSize(v.total)}\n可用：${humanSize(v.free)}`)),
     ] };
   }

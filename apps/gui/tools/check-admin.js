@@ -787,6 +787,24 @@ function main() {
        path.join(__dirname, '..', 'src-tauri', 'src', 'explorer.rs'), 'utf8')),
      '打开动作必须经 explore_target 决定目标（文件 → 所在目录，绝不执行文件）');
 
+  /* ── v0.1.1 右键「打开方式…」/「用默认程序打开」 ────────────────────────
+   * 这两个动作**会执行目标文件**，所以边界必须写死：
+   *   · 程序清单来自系统对话框，前端不许自己读注册表/拼命令行；
+   *   · 可执行扩展名只在「打开方式…」里出现，不给一键执行。 */
+  const explorerRs = fs.readFileSync(path.join(__dirname, '..', 'src-tauri', 'src', 'explorer.rs'), 'utf8');
+  ok(/item\('open-with', '打开方式…'/.test(ctxjs),
+     '右键菜单要有「打开方式…」');
+  ok(/'open_with_dialog_path'/.test(ctxjs) && /pub async fn open_with_dialog_path/.test(explorerRs),
+     '「打开方式…」必须走 open_with_dialog_path（前端只管递路径）');
+  ok(/SHOpenWithDialog/.test(explorerRs) && /OPENASINFO/.test(explorerRs),
+     '「打开方式」要用系统原生的 SHOpenWithDialog，不要自己猜关联程序');
+  ok(/fn file_target/.test(explorerRs) && /不是文件/.test(explorerRs),
+     '两个打开命令共用 file_target：目录与已删除的目标都要拒绝');
+  ok(/CONTEXT_EXECUTABLE/.test(ctxjs) && /open-default/.test(ctxjs),
+     '「用默认程序打开」必须经 CONTEXT_EXECUTABLE 挡掉可执行文件（点一下就跑起来）');
+  ok(/contextIsExecutable\(path\) \? \[\] : \[item\('open-default'/.test(ctxjs),
+     '可执行文件只能留「打开方式…」，不能同时给出「用默认程序打开」');
+
   /* ── 后台周期任务：不许换掉用户正在看的那块盘 ──────────────────────────
    * 一次扫描会替换进程里那份**唯一**的扫描结果，所以"后台扫 D 盘"的代价是
    * 用户正在看的 C 盘视图被换掉 —— 比"数据旧一点"糟得多。这条守卫挡的是

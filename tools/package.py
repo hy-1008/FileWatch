@@ -70,7 +70,7 @@ def workspace_version() -> str:
     """
     cargo = ROOT / "Cargo.toml"
     if not cargo.exists():
-        return "0.1.0"
+        return "0.1.1"
     in_pkg = False
     for line in cargo.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -79,7 +79,7 @@ def workspace_version() -> str:
             continue
         if in_pkg and stripped.startswith("version"):
             _, _, value = stripped.partition("=")
-            return value.strip().strip('"').strip("'") or "0.1.0"
+            return value.strip().strip('"').strip("'") or "0.1.1"
     return "0.1.0"
 
 
@@ -172,10 +172,15 @@ def readme_text(version: str, stamp: str) -> str:
 文件夹树顶部可输入已扫描目录的完整路径，按 Enter 或「→」前往；无匹配会提示，
 不会退回上级目录。方块数移至面积图路径栏右侧。双击大文件可前往其所在目录。
 文件夹树、面积图方块、大文件、面包屑与详情支持右键：查看详情、目录导航、
-**在文件资源管理器打开**、资源管理器定位、复制路径/名称/大小、加入独立监控等。
+**打开方式…**、用默认程序打开（仅文件）、在文件资源管理器打开、资源管理器定位、
+复制路径/名称/大小、加入独立监控等。
 盘符可右键扫描或复制容量；文件类型可右键高亮；监控目标可编辑、启停或移除配置；
 流水、预警与快照对比的差异行可复制完整记录或本行变化。
 菜单支持 Shift+F10/菜单键与方向键、Enter、Esc。输入框保留原有文字编辑菜单。
+
+「打开方式…」弹出 Windows 自己的"你要如何打开这个文件？"对话框，挑哪个程序
+由你在那个对话框里决定；「用默认程序打开」等于双击。可执行文件（exe、bat、
+cmd、ps1、vbs、lnk、reg 等）只给「打开方式…」，不给一键执行。文件夹没有这两项。
 
 「在文件资源管理器打开」与「在资源管理器中定位」不是一回事：
 前者打开这个文件夹（目标是文件时打开它所在的目录），后者打开上级目录并**选中**
@@ -192,7 +197,7 @@ def readme_text(version: str, stamp: str) -> str:
               文件名过长时从中间省略（扩展名一直看得见）。
   文件搜索  —— 在**已扫描的索引**里搜文件名，不重新遍历磁盘，所以很快。
               方式：包含（子串）/ 模糊（按顺序的字符，rpt 命中 report）/ 正则
-              （支持 . * + ? [abc] [a-z] [^…] ^ $ 与 \ 转义）。
+              （支持 . * + ? [abc] [a-z] [^…] ^ $ 与反斜杠转义）。
               范围：文件 / 文件夹 / 两者。回车即搜，双击前往所在目录，右键有更多操作。
               「内容」那一行是在文件**里面**找（纯文本类：txt / 日志 / CSV / MD / 源码…，
               含 UTF-16 的 txt）。只搜文本：Office 文档（docx/xlsx/pptx）本身是压缩包，

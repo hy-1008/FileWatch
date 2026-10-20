@@ -94,6 +94,10 @@ fn main() {
             picker::choose_path,
             explorer::reveal_path,
             explorer::explore_path,
+            // v0.1.1 打开方式：open_with_dialog_path 走系统对话框，
+            // open_default_path 是双击的等价物（界面上只给非可执行文件）
+            explorer::open_with_dialog_path,
+            explorer::open_default_path,
             independent::independent_snapshot,
             independent::independent_upsert,
             independent::independent_remove,

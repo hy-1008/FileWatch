@@ -31,6 +31,7 @@ const scope = { console, setTimeout, clearTimeout, actions, notices,
       if (command === 'node_parent') return 10;
       if (command === 'reveal_path') return { path: 'C:\\测试', exact: false };
       if (command === 'explore_path') return { path: 'C:\\测试', exact: false };
+      if (command === 'open_with_dialog_path' || command === 'open_default_path') return null;
       throw Error('Unexpected command: ' + command);
     } }, event: { listen: async () => () => {} } } },
 };
@@ -73,6 +74,23 @@ function event(target, overrides = {}) {
   assert.equal(requests.filter(r => r.command === 'explore_path').at(-1).args.path, info.path);
   assert.match(notices.pop(), /已打开仍存在的上级目录/);
   assert.equal(action(node, 'open').label, '在文件资源管理器打开');
+  // v0.1.1「打开方式」：只有文件才有这项；它走系统对话框，前端不自己猜程序清单
+  assert.equal(action(node, 'open-with').label, '打开方式…');
+  await action(node, 'open-with').action();
+  assert.equal(requests.at(-1).command, 'open_with_dialog_path');
+  assert.equal(requests.at(-1).args.path, info.path);
+  await action(node, 'open-default').action();
+  assert.equal(requests.at(-1).command, 'open_default_path');
+  assert.equal(requests.at(-1).args.path, info.path);
+
+  info = { ...fileInfo, name: 'setup.exe', path: 'C:\\测试\\setup.exe' };
+  const exeMenu = await api.contextItems({ kind: 'node', node: 44 });
+  assert(exeMenu.items.some(i => i.id === 'open-with'), '可执行文件仍能通过「打开方式…」选程序');
+  assert(!exeMenu.items.some(i => i.id === 'open-default'), '可执行文件不给一键执行（.exe 点一下就跑起来了）');
+  info = { ...fileInfo, is_dir: true };
+  const dirMenu = await api.contextItems({ kind: 'node', node: 44 });
+  assert(!dirMenu.items.some(i => i.id === 'open-with' || i.id === 'open-default'), '文件夹没有「打开方式」');
+  info = fileInfo;
 
   const row = { seq: 2, time_ms: 1700000000123, kind: 'modified', kind_cn: '修改', path: 'C:\\' + '长路径'.repeat(90), name: 'test', size_text: '+2 KB', suffix: '合并 3 次' };
   const record = await api.contextItems({ kind: 'record', row });
@@ -137,5 +155,5 @@ function event(target, overrides = {}) {
   release(info); await stale; hold = null;
   assert.equal(menu.children[0].textContent, '.log · 4 个文件', 'slow node lookup must not replace a newer right click');
   assert(!menu.children.some(c => c.innerHTML), 'untrusted filenames must never become menu HTML');
-  console.log('context menus: per-object actions, exact target paths, stale scans, clipboard fallback, viewport bounds, keyboard, input preservation and async races passed');
+  console.log('context menus: per-object actions, open-with (files only, no one-click exec), exact target paths, stale scans, clipboard fallback, viewport bounds, keyboard, input preservation and async races passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
