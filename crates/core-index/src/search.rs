@@ -148,7 +148,57 @@ impl Filters {
             .collect()
     }
 
-    fn accepts(&self, name: &str, size: u64, mtime: i64) -> bool {
+    /// 解析时间文本（`after` / `before` 的输入）→ Unix 秒。
+    ///
+    /// 两种写法，同一份语法给 GUI 与 CLI：
+    ///
+    /// | 写法 | 含义 |
+    /// |---|---|
+    /// | `7d` / `12h` / `30m`（分钟）/ `2w`（周） | **相对**：`now − 这么久`。搜"最近一周动过的文件"就是这么来的 |
+    /// | `2026-01-01`、`2026-01-01 12:30[:15]` | **绝对**：按本地时区换算（[`local_to_unix`]），不是 UTC —— 文件属性页里写的是本地时间，输入也该按本地时间认 |
+    ///
+    /// 相对写法秒数固定（86400×天），不查日历："7d" 就是 604800 秒前，
+    /// 与"上周三"无关 —— 搜索要的是"大约最近"，不是排班表。
+    pub fn parse_when(s: &str, now: i64) -> Option<i64> {
+        let t = s.trim();
+        if t.is_empty() {
+            return None;
+        }
+        // 先试相对写法；单位不认识（比如 "2026-01-01" 的尾巴 "-01-01"）就
+        // 落到下面的绝对日期，而不是报错 —— 两种写法都以数字开头，靠单位表分辨。
+        if let Some(secs) = relative_secs(t) {
+            return now.checked_sub(secs);
+        }
+        // 绝对写法：`YYYY-MM-DD` 或 `YYYY-MM-DD HH:MM[:SS]`（也接受 T 分隔）
+        let (date_part, time_part) = match t.split_once([' ', 'T']) {
+            Some((d, rest)) if !rest.trim().is_empty() => (d, rest.trim()),
+            _ => (t, ""),
+        };
+        let mut dp = date_part.split('-');
+        let y = dp.next()?.parse::<i64>().ok()?;
+        let mo = dp.next()?.parse::<i64>().ok()?;
+        let d = dp.next()?.parse::<i64>().ok()?;
+        if dp.next().is_some() || y < 1601 || y > 9999 {
+            return None;
+        }
+        let (h, mi, se) = if time_part.is_empty() {
+            (0, 0, 0)
+        } else {
+            let mut tp = time_part.split(':');
+            let h = tp.next()?.parse::<i64>().ok()?;
+            let mi = tp.next()?.parse::<i64>().ok()?;
+            let se = tp.next().unwrap_or("0").parse::<i64>().ok()?;
+            if tp.next().is_some() {
+                return None;
+            }
+            (h, mi, se)
+        };
+        core_io::util::local_to_unix(y, mo, d, h, mi, se)
+    }
+
+    /// 公开给 GUI 的内容搜索复用：名字搜索与内容搜索的"体积 ≥ 10M"
+    /// 必须是同一句话（[`Filters::accepts`]）。
+    pub fn accepts(&self, name: &str, size: u64, mtime: i64) -> bool {
         if let Some(v) = self.min_size {
             if size < v {
                 return false;
@@ -182,6 +232,24 @@ impl Filters {
 /// 一次搜索。空关键字直接返回空结果（不把"所有文件"倒进列表）。
 pub fn search(tree: &Tree, q: &Query<'_>) -> Result<Outcome, String> {
     search_filtered(tree, q, &Filters::default())
+}
+
+/// `7d` / `12h` / `30m` / `2w` → 秒数；不是相对写法（比如 `2026-01-01`）返回
+/// `None`，让 [`Filters::parse_when`] 继续按绝对日期解析。
+fn relative_secs(t: &str) -> Option<i64> {
+    let digits_end = t.find(|c: char| !c.is_ascii_digit())?;
+    if digits_end == 0 {
+        return None; // 不以数字开头：一定不是相对写法
+    }
+    let n: i64 = t[..digits_end].parse().ok()?;
+    let mul = match t[digits_end..].trim().to_ascii_lowercase().as_str() {
+        "d" | "day" | "days" => 86_400,
+        "h" | "hr" | "hour" | "hours" => 3_600,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "w" | "week" | "weeks" => 7 * 86_400,
+        _ => return None,
+    };
+    n.checked_mul(mul)
 }
 
 /// [`search`] + 附加条件（体积 / 时间 / 扩展名）。
@@ -734,4 +802,44 @@ mod tests {
         assert!(!Filters { exts: vec!["txt".into()], ..Default::default() }.is_empty());
     }
 
+    /// 时间文本两种写法：**相对**（`7d`）与**绝对**（`2026-01-01`）。
+    /// 界面与 CLI 都靠它把"最近一周""元旦之后"翻成 Unix 秒 ——
+    /// 口径只要有两份，同一个条件在两个入口就会筛出两个结果。
+    #[test]
+    fn parse_when_handles_relative_and_absolute() {
+        let now = 1_760_000_000i64; // 一个固定的"现在"，测试不依赖真实时钟
+        assert_eq!(Filters::parse_when("", now), None, "留空 = 不设条件");
+        assert_eq!(Filters::parse_when("7d", now), Some(now - 7 * 86_400));
+        assert_eq!(Filters::parse_when("2w", now), Some(now - 14 * 86_400));
+        assert_eq!(Filters::parse_when("12h", now), Some(now - 12 * 3_600));
+        assert_eq!(Filters::parse_when("30m", now), Some(now - 30 * 60));
+        assert_eq!(Filters::parse_when("  7D ", now), Some(now - 7 * 86_400), "大小写与空格都要能忍");
+        assert_eq!(Filters::parse_when("7 days", now), Some(now - 7 * 86_400));
+        // 绝对日期必须按"天"取整，并且相邻两天差一整天
+        let a = Filters::parse_when("2026-01-01", now).expect("元旦要能解析");
+        let b = Filters::parse_when("2026-01-02", now).expect("元旦后一天要能解析");
+        assert_eq!(b - a, 86_400, "相邻日期必须差一整天");
+        assert_eq!(core_io::util::local_date(a), "2026-01-01",
+                   "输入是本地时间，显示回去也得是本地的同一天");
+        // 带时间的写法：`2026-01-01 12:30` 应晚于当天零点 12.5 小时
+        let c = Filters::parse_when("2026-01-01 12:30", now).expect("带时间的要能解析");
+        assert_eq!(c - a, 12 * 3_600 + 30 * 60);
+        assert_eq!(c, Filters::parse_when("2026-01-01T12:30:00", now).unwrap(), "T 分隔与空格同义");
+        // 基准时刻是 2025-10 月里的一个固定值，元旦永远在它之后（时区只差十几小时）
+        assert!(a > now, "2026-01-01 必须晚于基准时刻：{a} vs {now}");
+    }
+
+    /// 看不懂的时间文本必须**解析失败**，而不是"当作不限"。
+    ///
+    /// 静默忽略是最坏的那一类 bug：用户写 `7天` 或 `2026/01/01`，
+    /// 界面却给出了"没有用到我的条件"的结果，而用户毫无察觉。
+    #[test]
+    fn parse_when_rejects_garbage() {
+        let now = 1_760_000_000i64;
+        for bad in ["2026/01/01", "01-01-2026", "7x", "abc", "2026-13-01", "2026-2-30", "7"] {
+            assert_eq!(Filters::parse_when(bad, now), None, "{bad} 必须被拒绝");
+        }
+        assert!(Filters::parse_when("2024-02-29", now).is_some(), "闰年是合法日期");
+        assert_eq!(Filters::parse_when("2026-02-29", now), None, "平年没有 2 月 29 日");
+    }
 }

@@ -472,11 +472,24 @@ body.drives-collapsed .vol .glyph {
 /* 数字框窄、路径框宽。分开成两个类而不是靠 :not() —— 后者在两边的
    选择器权重上很容易踩坑。 */
 .tool input.num { width: 72px; }
+
+/* 搜索过滤器的输入框：填的是 `10M` / `7d` / `2026-01-01` 这种短文本，
+   沿用路径框的 260px 会让一行挤成两行（五个条件框尤其明显）。
+   宁可窄一点让它们留在同一行 —— 条件之间的关系比单个框的可读性重要。 */
+.tool .f > input.cond { width: 96px; flex: 0 1 96px; }
+.tool .f > input.cond-date { width: 118px; flex: 0 1 118px; }
 /* 路径框要能伸开：路径本来就长，给 72px 就变成"只能看见盘符" */
 input.path { width: 260px; min-width: 0; max-width: 100%; flex: 0 1 300px; }
 .tool .progress { flex: 1 1 140px; min-width: 80px; height: 5px; }
 /* 「候选 1234 个文件（排除：…）」这类说明可以很长，允许它换行占满整行 */
 .tool .hint { flex: 1 1 100%; min-width: 0; }
+
+/* 搜索摘要里"本次生效的条件"另起一行：混在同一行里会被当成同一句话读完，
+ * 而它是"结果已经按它筛过了"的提醒，不该一晃而过。 */
+.hint .cond, .mon-empty .cond {
+  display: block; margin-top: 3px;
+  color: var(--accent); opacity: .85;
+}
 
 /* 通用可滚动列表（重复文件的组、快照对比的行都用它） */
 .list { flex: 1 1 auto; overflow: auto; min-height: 0; }

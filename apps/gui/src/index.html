@@ -394,6 +394,38 @@
           <span class="hint" id="search-content-hint">不含 Office 文档</span>
         </div>
 
+        <!-- 第三行：附加条件。**对名称搜索与内容搜索同时生效** ——
+             两个框看着像同一件事，条件也就必须是同一套（后端只有一份解析）。
+             文本由后端按规则那套语法解析（`10M` / `7d` / `2026-01-01`），
+             前端不自己换算，免得界面和终端学会两套写法。 -->
+        <div class="tool">
+          <label class="f"><span>体积 ≥</span>
+            <input id="search-min-size" class="cond" type="text" autocomplete="off"
+                   placeholder="不限"
+                   title="最小体积。写法：10M / 512K / 1073741824（1024 进制）。留空 = 不限。回车即搜">
+          </label>
+          <label class="f"><span>体积 ≤</span>
+            <input id="search-max-size" class="cond" type="text" autocomplete="off"
+                   placeholder="不限"
+                   title="最大体积，写法同上。留空 = 不限。回车即搜">
+          </label>
+          <label class="f"><span>修改于</span>
+            <input id="search-after" class="cond-date" type="text" autocomplete="off"
+                   placeholder="不限"
+                   title="起始时间。写法：7d（七天内）/ 12h / 30m / 2w，或 2026-01-01、2026-01-01 12:30（本地时间）。留空 = 不限。回车即搜">
+          </label>
+          <label class="f"><span>至</span>
+            <input id="search-before" class="cond-date" type="text" autocomplete="off"
+                   placeholder="不限"
+                   title="截止时间，写法同上。留空 = 不限。回车即搜">
+          </label>
+          <label class="f grow"><span>扩展名</span>
+            <input id="search-exts" class="path" type="text" autocomplete="off"
+                   placeholder="mp4,mkv,avi"
+                   title="扩展名白名单，逗号或分号分隔，大小写随意。留空 = 不限。注意：此条件同时约束内容搜索，与纯文本白名单取交集。回车即搜">
+          </label>
+        </div>
+
         <div id="content-progress" class="tool thin hidden">
           <div class="progress"><div id="content-bar"></div></div>
           <span id="content-stage" class="hint"></span>

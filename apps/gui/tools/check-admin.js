@@ -367,8 +367,8 @@ function main() {
   ok(/call\('search_nodes'/.test(appjs), '搜索必须调后端 search_nodes（在内存索引里搜）');
   const commandsRs = fs.readFileSync(
     path.join(__dirname, '..', 'src-tauri', 'src', 'commands.rs'), 'utf8');
-  ok(/core_index::search\(/.test(commandsRs),
-     'search_nodes 必须走引擎的 core_index::search（不能在前端或命令里另写一套匹配）');
+  ok(/core_index::search_filtered\(/.test(commandsRs),
+     'search_nodes 必须走引擎的 core_index::search_filtered（不能在前端或命令里另写一套匹配）');
   const engineSearchRs = fs.readFileSync(
     path.join(__dirname, '..', '..', '..', 'crates', 'core-index', 'src', 'search.rs'), 'utf8');
   ok(/pub fn parse\(s: &str\) -> MatchMode/.test(engineSearchRs)
@@ -379,9 +379,53 @@ function main() {
   ok(/value="dirs"/.test(html), '搜索范围必须能选文件夹');
   ok(/view-tab-search/.test(appjs) && /setView\('search'\)/.test(appjs),
      '文件搜索必须能被切到（页签 → setView）');
-  ok(/\['search-text', 'search-content'\]/.test(appjs)
+  ok(/\['search-text', 'search-content'[\s\S]{0,200}?\]/.test(appjs)
      && /\.onkeydown = \(e\) => \{\s*if \(e\.key === 'Enter'\)/.test(appjs),
      '两个搜索框（名称 / 内容）都必须支持回车即搜');
+
+  /* ── E8 搜索过滤器（体积 / 修改时间 / 扩展名）───────────────────────────
+   * 三条硬规矩，每条都对应一次踩过的坑：
+   *   1. 文本必须交给**后端**解析（`parse_search_filters`）—— 前端自己写一个
+   *      换算，用户在终端里学会的 `10M` 到界面上就会给出另一个数（规则 10）。
+   *   2. 名称搜索与内容搜索必须**共用同一份**，两个入口看起来像一件事。
+   *   3. 前端不许出现第二份体积/时间换算（"每一步都能自己重算"的诱惑在这
+   *      里特别强，因为看着只是个单位换算）。 */
+  for (const id of ['search-min-size', 'search-max-size', 'search-after',
+                    'search-before', 'search-exts']) {
+    ok(htmlIds.has(id), `index.html 缺少 #${id}`);
+    ok(usedIds.has(id), `app.js 没有接线 #${id}`);
+  }
+  ok(/call\('search_nodes'/.test(appjs) && /\.\.\.searchFilters\(\)/.test(appjs),
+     '名称搜索必须把过滤框的值原样传给后端（展开 searchFilters()）');
+  ok(/call\('content_search_start'[\s\S]{0,220}\.\.\.searchFilters\(\)/.test(appjs),
+     '内容搜索也必须用同一套过滤条件（两个入口不能各写一份）');
+  ok(/fn parse_search_filters\(/.test(commandsRs),
+     'commands.rs 必须有 parse_search_filters（两个入口共用一份解析）');
+  ok(/core_index::search_filtered\(/.test(commandsRs),
+     'search_nodes 必须走 core_index::search_filtered（附加条件在引擎里判）');
+  const guiSearchFilterRs = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'search.rs'), 'utf8');
+  ok(/parse_search_filters\(/.test(guiSearchFilterRs) && /filters\.accepts\(/.test(guiSearchFilterRs),
+     '内容搜索的候选必须复用同一个 Filters（解析 + 判定都是同一份）');
+  ok(/pub fn parse_when\(/.test(engineSearchRs),
+     '时间文本（7d / 2026-01-01）必须由引擎的 Filters::parse_when 解析');
+  ok(/Filters::parse_when\(/.test(commandsRs) && /parse_size\(/.test(commandsRs),
+     '体积与时间都走现成的那一套语法（parse_size / parse_when），不另写');
+  // 前端那一段函数体里不许出现任何换算：单位换算看着无害，一旦两边各有一份，
+  // 界面与终端对同一个条件就会给出两个结果（这类分歧很难被测试抓到）。
+  const collectBody = (appjs.match(/function searchFilters\(\)[\s\S]{0,1200}?\n\}/) || [''])[0];
+  ok(collectBody.length > 0, 'app.js 缺少 searchFilters()');
+  for (const bad of ['1024', 'parseInt', 'parseFloat', 'new Date']) {
+    ok(!collectBody.includes(bad),
+       `searchFilters() 里不许出现 ${bad}（换算必须在后端那一份）`);
+  }
+  // Tauri 2 的命令参数按 **camelCase** 匹配：传 `min_size` 会被**静默丢弃**，
+  // 过滤条件悄悄失效、结果却照常返回（实测踩过：10K 下限筛出 4KB 的行）。
+  // 所以这里点名要求 camelCase，并禁止 snake_case 的键。
+  ok(/minSize:/.test(collectBody) && /maxSize:/.test(collectBody),
+     'searchFilters() 必须用 camelCase 键（minSize/maxSize）—— Tauri 按 camelCase 匹配');
+  ok(!/min_size:|max_size:/.test(collectBody),
+     'searchFilters() 不许出现 snake_case 键（会被 Tauri 静默丢弃 = 条件失效）');
 
   /* ── 内容搜索（F13 后半段：纯文本类） ──────────────────────────────
    * 它是唯一需要真读文件的搜索，所以必须走"后台线程 + 三条事件"；

@@ -1972,9 +1972,18 @@ function renderSearch() {
     sum.textContent = `没有命中（比过 ${v.scanned.toLocaleString()} 个节点，用时 ${v.elapsed_ms} ms）`;
     sum.className = 'hint';
   } else {
+    // 有条件时把条件写出来：不然"3 个命中"是在什么条件下挑出来的，
+    // 用户回到列表里对着看也想不起自己填了什么。
+    const scope = searchFilterText();
     sum.textContent = `${v.matched.toLocaleString()} 个命中`
       + (v.truncated ? `，只列前 ${v.hits.length.toLocaleString()} 个` : '')
       + `　比过 ${v.scanned.toLocaleString()} 个节点，用时 ${v.elapsed_ms} ms`;
+    if (scope) {
+      const tag = document.createElement('span');
+      tag.className = 'cond';
+      tag.textContent = `条件：${scope}`;
+      sum.appendChild(tag);
+    }
     sum.className = 'hint';
   }
 
@@ -2065,6 +2074,13 @@ function renderContent() {
       + `，用时 ${v.elapsed_ms} ms`
     : `内容没有命中（读过 ${v.scanned.toLocaleString()} 个纯文本文件，用时 ${v.elapsed_ms} ms）`;
   if (!v.hits.length) head.className = 'mon-empty';
+  const cond2 = searchFilterText();
+  if (cond2) {
+    const tag = document.createElement('span');
+    tag.className = 'cond';
+    tag.textContent = `条件：${cond2}`;
+    head.appendChild(tag);
+  }
   box.appendChild(head);
   if (!v.hits.length) return;
 
@@ -2116,6 +2132,38 @@ async function runSearch() {
   else { contentSearch.view = null; contentSearch.error = null; renderContent(); }
 }
 
+/* 收一遍过滤条件框的值。
+ *
+ * 这里**只做收集**（去掉两端空白），不解析：`10M` 是多少字节、`7d` 是几秒，
+ * 由后端那一处（`parse_search_filters`，与 CLI 同源）说了算。前端自己换算
+ * 一次，用户在终端里学会的写法到界面上就会给出另一个数。 */
+function searchFilters() {
+  const raw = {
+    minSize: document.getElementById('search-min-size').value.trim(),
+    maxSize: document.getElementById('search-max-size').value.trim(),
+    after: document.getElementById('search-after').value.trim(),
+    before: document.getElementById('search-before').value.trim(),
+    exts: document.getElementById('search-exts').value.trim(),
+  };
+  // 空白 → null（后端眼里 null 与 "" 都是"不设这个条件"，这里统一成一种）
+  const out = {};
+  for (const k of Object.keys(raw)) out[k] = raw[k] || null;
+  return out;
+}
+
+/** 生效条件的**原样**说明（给人看用，不做换算）：搭配结果摘要出现，
+ *  否则用户不知道这 3 个命中是在什么条件下挑出来的。 */
+function searchFilterText() {
+  const f = searchFilters();
+  const parts = [];
+  if (f.minSize) parts.push(`体积 ≥ ${f.minSize}`);
+  if (f.maxSize) parts.push(`体积 ≤ ${f.maxSize}`);
+  if (f.after) parts.push(`修改于 ${f.after} 起`);
+  if (f.before) parts.push(`截至 ${f.before}`);
+  if (f.exts) parts.push(`扩展名 ${f.exts}`);
+  return parts.join('　');
+}
+
 async function runNameSearch(text) {
   if (searchView.running) return;
   const button = document.getElementById('search-run');
@@ -2129,6 +2177,7 @@ async function runNameSearch(text) {
       mode: document.getElementById('search-mode').value,
       scope: document.getElementById('search-scope').value,
       limit: 500,
+      ...searchFilters(),
     });
     searchView.error = null;
   } catch (e) {
@@ -2152,9 +2201,11 @@ async function runContentSearch(text) {
   renderContent();
   try {
     // 开工即返回：真正的读文件在后台线程里，进度走 content:progress
+    // 过滤条件与名称搜索同一套（后端也只有一份解析）
     await call('content_search_start', {
       text,
       regex: document.getElementById('search-content-regex').checked,
+      ...searchFilters(),
     });
   } catch (e) {
     contentSearch.running = false;
@@ -2774,8 +2825,11 @@ function wireViews() {
   };
 
   document.getElementById('search-run').onclick = runSearch;
-  // 回车即搜：这个框的用途是"打完字就要结果"，再让用户去点一次没有道理
-  for (const id of ['search-text', 'search-content']) {
+  // 回车即搜：这几个框的用途是"打完字就要结果"，再让用户去点一次没有道理。
+  // 过滤条件框也算 —— 改完条件想立刻看结果，和一个字一个字敲的路径一样自然。
+  for (const id of ['search-text', 'search-content', 'search-min-size',
+                    'search-max-size', 'search-after', 'search-before',
+                    'search-exts']) {
     document.getElementById(id).onkeydown = (e) => {
       if (e.key === 'Enter') { e.preventDefault(); runSearch(); }
     };

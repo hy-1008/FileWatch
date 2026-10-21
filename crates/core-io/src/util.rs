@@ -333,6 +333,52 @@ fn local_systemtime(secs: i64) -> Option<crate::winapi::SYSTEMTIME> {
     Some(local)
 }
 
+/// 本地的 `年 月 日 时 分 秒` → Unix 秒 —— [`local_time`] 的反函数。
+///
+/// 界面上"修改时间从 2026-01-01 起"这种**输入**最终要变成一个 Unix 秒才能
+/// 去比节点的 `mtime`。两边必须同一套换算：显示走 `local_time`（UTC→本地），
+/// 输入走这里（本地→UTC），否则用户输的 0 点会把早上 8 点的文件也算进来。
+///
+/// 做法：先把输入当作 UTC 求出它的**本地**表示（复用 [`local_systemtime`]），
+/// 两者之差就是该时刻的时区偏移；本地时刻 − 偏移 = 真正的 Unix 秒。夏令时
+/// 切换的那一小时会差一次偏移档位，属于可接受的误差（文件搜索不是排班表）。
+/// 其它平台没有本地换算能力，按 UTC 处理 —— 与 [`local_time`] 的回退一致。
+///
+/// 无效日期（2 月 30 日之类）返回 `None`：解析成 3 月 2 日比报错更坑人。
+pub fn local_to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> Option<i64> {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0..=59).contains(&sec)
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    // civil_from_days(days) 必须还原出同一个日期：不还原说明这一天不存在
+    //（2 月 30 日会被 days_from_civil 平滑成 3 月 2 日，这里要拒绝而不是采纳）。
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    let naive = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3600 + min * 60 + sec)?;
+    #[cfg(windows)]
+    {
+        let st = local_systemtime(naive)?;
+        let local_secs = days_from_civil(st.wYear as i64, st.wMonth as i64, st.wDay as i64)
+            .checked_mul(86_400)?
+            + (st.wHour as i64) * 3600
+            + (st.wMinute as i64) * 60
+            + st.wSecond as i64;
+        Some(naive - (local_secs - naive)) // 减去时区偏移 = 回到 UTC
+    }
+    #[cfg(not(windows))]
+    {
+        Some(naive)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +565,50 @@ mod local_time_tests {
         assert_eq!(local_days(b) - local_days(a), 1, "{da} → {db}");
         let (y, m, d) = civil_from_days(local_days(a));
         assert_eq!(format!("{y:04}-{m:02}-{d:02}"), da);
+    }
+
+    /// `local_to_unix` 与 `local_time` 互为逆运算：输入一个本地时间，
+    /// 显示回去必须是同一时刻。搜索过滤的"修改时间从 …"完全靠它，
+    /// 差一小时就会把用户明确要排除的文件又算进来。
+    #[test]
+    fn local_to_unix_round_trips_local_time() {
+        for secs in [1_700_000_000i64, 1_760_000_000, 300_000_000, 4_100_000_000] {
+            let t = local_time(secs);
+            if !t.contains('Z') && t.len() == 19 {
+                let (y, m, d) = (
+                    t[0..4].parse::<i64>().unwrap(),
+                    t[5..7].parse::<i64>().unwrap(),
+                    t[8..10].parse::<i64>().unwrap(),
+                );
+                let (h, mi, s) = (
+                    t[11..13].parse::<i64>().unwrap(),
+                    t[14..16].parse::<i64>().unwrap(),
+                    t[17..19].parse::<i64>().unwrap(),
+                );
+                let back = local_to_unix(y, m, d, h, mi, s).expect("合法日期必须能换算");
+                assert_eq!(back, secs, "local_to_unix({t}) = {back}");
+            }
+        }
+        // 整点 0 分 0 秒：任何时区下都应落在"那一天"里（再由搜索的界面语义保证）
+        let midnight = local_to_unix(2026, 1, 1, 0, 0, 0).expect("元旦零点必须能换算");
+        assert_eq!(local_date(midnight), "2026-01-01");
+        // 相邻两天的零点必须差一整天
+        let next = local_to_unix(2026, 1, 2, 0, 0, 0).unwrap();
+        assert_eq!(next - midnight, 86_400, "跨一天的零点差 86400 秒");
+    }
+
+    /// 无效日期（2 月 30 日、13 月、25 时）必须拒绝 ——
+    /// 把它们平滑成"下个月"比报错更坑人：用户明明在找 2 月的文件。
+    #[test]
+    fn local_to_unix_rejects_impossible_dates() {
+        assert!(local_to_unix(2026, 2, 30, 0, 0, 0).is_none(), "2026 不是闰年");
+        assert!(local_to_unix(2024, 2, 29, 0, 0, 0).is_some(), "2024 是闰年");
+        assert!(local_to_unix(2026, 2, 29, 0, 0, 0).is_none());
+        assert!(local_to_unix(2026, 13, 1, 0, 0, 0).is_none());
+        assert!(local_to_unix(2026, 0, 1, 0, 0, 0).is_none());
+        assert!(local_to_unix(2026, 1, 0, 0, 0, 0).is_none());
+        assert!(local_to_unix(2026, 1, 1, 24, 0, 0).is_none());
+        assert!(local_to_unix(2026, 1, 1, 12, 60, 0).is_none());
+        assert!(local_to_unix(2026, 1, 1, 12, 0, 60).is_none());
     }
 }

@@ -118,8 +118,22 @@ pub fn content_search_start(
     regex: Option<bool>,
     limit_files: Option<usize>,
     max_hits: Option<usize>,
+    min_size: Option<String>,
+    max_size: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    exts: Option<String>,
 ) -> Result<(), String> {
     let pattern = Pattern::new(&text, regex.unwrap_or(false))?;
+    // 过滤条件与名称搜索同源（`parse_search_filters`）：两个搜索框看着像
+    // 同一件事，就必须真的是同一件事 —— 包括报错的写法。
+    let filters = crate::commands::parse_search_filters(
+        min_size.as_deref(),
+        max_size.as_deref(),
+        after.as_deref(),
+        before.as_deref(),
+        exts.as_deref(),
+    )?;
     if hub.is_running() {
         return Err("已有一次内容搜索在进行中".into());
     }
@@ -177,6 +191,11 @@ pub fn content_search_start(
                 }
                 let name = tree.name(i as u32);
                 if !content::is_text_name(name) {
+                    continue;
+                }
+                // 附加条件（体积 / 时间 / 扩展名）与名称搜索同一套判定 ——
+                // 在候选阶段就筛掉，因为读盘是这次作业里最贵的一步。
+                if !filters.accepts(name, node.size, node.mtime) {
                     continue;
                 }
                 let raw = tree.path_of(i as u32);

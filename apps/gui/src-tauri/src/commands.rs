@@ -14,6 +14,7 @@
 use crate::state::{Loaded, ScanSummary, Shared};
 use crate::wire;
 use core_index::aggregate::{sorted_children, top_files as top_files_impl, SizeMode};
+use core_index::SearchFilters;
 use core_scan::{ScanPhase, Session, SessionConfig};
 use core_viz::{compute_layout, LayoutOptions, LodPolicy, Rect, ShadingMode};
 use serde::{Deserialize, Serialize};
@@ -756,6 +757,50 @@ pub fn top_files(
 // 一次搜索几十毫秒。所以这是同步命令 —— 但要挡住"扫描进行中"（那时树正在
 // 变，搜出来的东西和界面对不上）。
 
+/// 把搜索页的过滤条件文本框解析成 [`SearchFilters`]。
+///
+/// **名字搜索与内容搜索共用这一份**：两处各写一版的话，用户在"名称" tab
+/// 学会的写法（`10M` / `7d` / `mp4,mkv`）到了内容搜索就不认了 —— 而这句话
+/// 在两个入口长得一模一样，最容易被当成同一件事。
+///
+/// 解析失败要**报错**（而不是当成不限）：静默忽略会让人以为条件生效了。
+pub(crate) fn parse_search_filters(
+    min_size: Option<&str>,
+    max_size: Option<&str>,
+    after: Option<&str>,
+    before: Option<&str>,
+    exts: Option<&str>,
+) -> Result<SearchFilters, String> {
+    fn size_of(label: &str, s: Option<&str>) -> Result<Option<u64>, String> {
+        let raw = s.unwrap_or("").trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        // 体积语法只有一份（core_monitor::spec），与规则阈值、CLI 的 --min-size 同源
+        let v = core_monitor::spec::parse_size(raw).ok_or_else(|| {
+            format!("{label}「{raw}」看不懂。写法示例：10M / 512K / 1073741824，留空 = 不限")
+        })?;
+        Ok(Some(v))
+    }
+    fn when_of(label: &str, s: Option<&str>) -> Result<Option<i64>, String> {
+        let raw = s.unwrap_or("").trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let v = SearchFilters::parse_when(raw, core_io::util::unix_secs()).ok_or_else(|| {
+            format!("{label}「{raw}」看不懂。写法示例：7d / 12h / 2026-01-01 / 2026-01-01 12:30，留空 = 不限")
+        })?;
+        Ok(Some(v))
+    }
+    Ok(SearchFilters {
+        min_size: size_of("最小体积", min_size)?,
+        max_size: size_of("最大体积", max_size)?,
+        after: when_of("起始修改时间", after)?,
+        before: when_of("截止修改时间", before)?,
+        exts: SearchFilters::parse_exts(exts.unwrap_or("")),
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHitRow {
     pub node: u32,
@@ -786,12 +831,22 @@ pub fn search_nodes(
     mode: Option<String>,
     scope: Option<String>,
     limit: Option<usize>,
+    min_size: Option<String>,
+    max_size: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    exts: Option<String>,
 ) -> Result<SearchView, String> {
     let t0 = Instant::now();
     let query_text = text.trim().to_string();
     let m = core_index::MatchMode::parse(mode.as_deref().unwrap_or("contains"));
     let s = core_index::Scope::parse(scope.as_deref().unwrap_or("files"));
     // 空关键字：直接回空（不要把"所有文件"倒进列表里）
+    // 但**先把过滤器解析一遍**：条件写错了要立刻说，不能等用户填了名字才报。
+    let filters = parse_search_filters(
+        min_size.as_deref(), max_size.as_deref(),
+        after.as_deref(), before.as_deref(), exts.as_deref(),
+    )?;
     if query_text.is_empty() {
         return Ok(SearchView {
             hits: Vec::new(), scanned: 0, matched: 0, truncated: false, elapsed_ms: 0,
@@ -804,9 +859,10 @@ pub fn search_nodes(
     }
     let l = st.loaded()?;
     let tree = l.tree();
-    let out = core_index::search(
+    let out = core_index::search_filtered(
         tree,
         &core_index::Query { text: &query_text, mode: m, scope: s, limit: limit.unwrap_or(500) },
+        &filters,
     )?;
     Ok(SearchView {
         hits: out
@@ -1917,5 +1973,53 @@ mod tests {
         assert!(slots.len() > 1, "面积图只有一个色槽 = 整片同色（正是用户报的问题）：{slots:?}");
     }
 
+    /* ── E8 搜索过滤器：两个搜索入口共用一份解析 ──────────────────────────
+     * 这组断言盯的是"同一句话在两个入口是同一个意思"：名称搜索与内容搜索
+     * 都调用 parse_search_filters，语法(source)既然只有一处，就要由它的
+     * 行为保证 —— 语法变了（比如哪天加了 GiB），两个入口同时跟着变。 */
 
+    fn f_of(min: &str, max: &str, after: &str, before: &str, exts: &str) -> SearchFilters {
+        parse_search_filters(
+            Some(min), Some(max), Some(after), Some(before), Some(exts),
+        )
+        .expect("合法输入必须能解析")
+    }
+
+    #[test]
+    fn parse_search_filters_treats_blank_as_no_condition() {
+        let f = parse_search_filters(None, Some(""), Some("  "), None, Some(",")).unwrap();
+        assert!(f.is_empty(), "留空 = 不限：{f:?}");
+        assert!(f.min_size.is_none() && f.after.is_none() && f.exts.is_empty());
+    }
+
+    #[test]
+    fn parse_search_filters_shares_the_rule_syntax() {
+        // 体积走的是规则阈值那一套（core_monitor::spec），1024 进制
+        let f = f_of("10M", "1G", "", "", "");
+        assert_eq!(f.min_size, Some(10 * 1024 * 1024));
+        assert_eq!(f.max_size, Some(1024u64.pow(3)));
+        // 相对时间 = 现在减去固定的秒数（不是查日历）
+        let now = core_io::util::unix_secs();
+        let g = f_of("", "", "7d", "12h", "");
+        assert!((now - g.after.unwrap()).abs_diff(7 * 86_400) <= 2, "{g:?}");
+        assert!((now - g.before.unwrap()).abs_diff(12 * 3_600) <= 2, "{g:?}");
+        // 扩展名：大小写、前导点、分隔符混用都要能认
+        let h = f_of("", "", "", "", "MP4, .mkv; avi");
+        assert_eq!(h.exts, vec!["mp4", "mkv", "avi"]);
+    }
+
+    #[test]
+    fn parse_search_filters_rejects_garbage_instead_of_ignoring_it() {
+        // 静默忽略是最坏的 bug：用户以为筛了，其实没筛。
+        for (args, why) in [
+            ((Some("abc"), None, None, None, None), "体积写法不认识"),
+            ((None, Some("10P"), None, None, None), "单位不在表里"),
+            ((None, None, Some("昨天"), None, None), "中文相对时间不支持"),
+            ((None, None, None, Some("2026/01/01"), None), "日期必须用短横线"),
+        ] {
+            let (a, b, c, d, e) = args;
+            let err = parse_search_filters(a, b, c, d, e).unwrap_err();
+            assert!(err.contains("写法示例"), "错误要给出正确写法（{why}）：{err}");
+        }
+    }
 }
