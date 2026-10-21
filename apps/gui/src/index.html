@@ -226,6 +226,9 @@
         <div class="canvas-wrap">
           <canvas id="canvas" tabindex="0" aria-label="面积图，支持右键菜单"></canvas>
           <canvas id="canvas-previous" aria-hidden="true"></canvas>
+          <!-- E7：扫描中的半成品视图叠在最上层（pointer-events:none，不挡鼠标）。
+               扫完之后隐藏，交回真正的面积图。 -->
+          <canvas id="scan-preview" class="hidden" aria-hidden="true"></canvas>
           <div id="tip" class="tip hidden"></div>
           <div id="empty-hint" class="empty-hint">
             <div class="empty-mark" aria-hidden="true">▦</div>

@@ -1017,3 +1017,34 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
 .xrow .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .xrow .up { color: var(--warn); }
 .xrow .hint { font-size: 11px; }
+
+/* ── E7 扫描中的渐进渲染 ──────────────────────────────────────────────────
+ * 单独一层画布叠在面积图上：不去改 Treemap 的状态机 —— 扫描中布局随时在变，
+ * 让正式渲染器读半成品数据会把"当前视图/焦点"这类状态搅乱。
+ * 扫完隐藏这一层，真正的面积图照常接管。
+ */
+#scan-preview {
+  position: absolute; inset: 0; display: block;
+  width: 100%; height: 100%;
+  pointer-events: none;
+  z-index: 4;
+}
+#scan-preview.hidden { display: none; }
+
+/* E7：渐进渲染期间，把全屏遮罩让开。
+ *
+ * 默认的 `.overlay` 是 72% 黑 + 居中卡片 —— 扫描时会把人刚等着看的面积图压成
+ * 一片灰。半成品期间改成"透明遮罩 + 左下角小卡片"：地图全亮着，进度在角落跳。
+ */
+body.previewing #scan-overlay {
+  background: transparent;
+  pointer-events: none;
+  align-items: flex-end;
+  justify-content: flex-start;
+}
+body.previewing #scan-overlay .card {
+  margin: 0 0 46px 16px;
+  padding: 8px 12px;
+  min-width: 260px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+}

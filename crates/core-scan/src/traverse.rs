@@ -101,7 +101,28 @@ pub fn full_scan_traverse_indexed<P>(
     drive: &str,
     opts: TraverseOptions,
     collect_paths: bool,
+    progress: P,
+) -> (Tree, TraverseStats, HashMap<Box<str>, u32>)
+where
+    P: FnMut(u64, u64),
+{
+    full_scan_traverse_indexed_with(root, drive, opts, collect_paths, progress, None)
+}
+
+/// 每访问多少个**目录**回调一次半成品视图（E7）。
+///
+/// 遍历比 MFT 慢一到两个数量级，按"目录数"而不是"条目数"计数：
+/// 一个目录里的条目再多也是一次 `read_dir` 的产物，界面上看不出差别。
+pub const PARTIAL_STRIDE_DIRS: u64 = 400;
+
+/// [`full_scan_traverse_indexed`] + 半成品视图回调（E7）。
+pub fn full_scan_traverse_indexed_with<P>(
+    root: &Path,
+    drive: &str,
+    opts: TraverseOptions,
+    collect_paths: bool,
     mut progress: P,
+    partial: Option<&crate::session::PartialSink>,
 ) -> (Tree, TraverseStats, HashMap<Box<str>, u32>)
 where
     P: FnMut(u64, u64),
@@ -140,6 +161,7 @@ where
     let mut stack: Vec<(PathBuf, u32, u32)> = vec![(root.to_path_buf(), ROOT_IDX, 0)];
     let every = opts.progress_every.max(1);
     let mut next_progress_at = ROOT_IDX as u64 + every;
+    let mut next_partial_at = PARTIAL_STRIDE_DIRS;
 
     while let Some((dir, parent_idx, depth)) = stack.pop() {
         if depth > opts.max_depth {
@@ -147,6 +169,17 @@ where
         }
         stats.dirs_visited += 1;
         stats.max_depth_reached = stats.max_depth_reached.max(depth);
+
+        // E7：每访问若干个目录回调一次。`tick` 内部先聚合再回调 ——
+        // 遍历过程中目录节点的 size 还是 0，不聚合就画出来是一屏空方块。
+        if let Some(sink) = partial {
+            sink.tick(
+                &mut tree,
+                stats.dirs_visited as u64,
+                &mut next_partial_at,
+                PARTIAL_STRIDE_DIRS,
+            );
+        }
 
         let rd = match std::fs::read_dir(&dir) {
             Ok(r) => r,

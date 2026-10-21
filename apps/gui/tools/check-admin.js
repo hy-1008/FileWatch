@@ -991,6 +991,33 @@ function main() {
   ok(/history::history_view/.test(mainRs) && /history::history_record/.test(mainRs),
      '两个命令必须在 tauri 的 invoke_handler 里注册');
 
+  /* ── E7 扫描期渐进渲染 ────────────────────────────────────────────────
+   * 两条不能让步的：
+   * 1. 回调前**必须**先聚合（`PartialSink::tick` 里调 aggregate）——
+   *    扫描中目录节点的 size 还是 0，漏了就是一屏空方块；
+   * 2. 预览画在**独立画布**上，不碰 Treemap 的状态机（布局每 200 ms 换一次，
+   *    让正式渲染器读半成品会把"当前焦点/视图根"搅乱）。
+   */
+  ok(htmlIds.has('scan-preview'), 'index.html 缺少 #scan-preview（扫描预览画布）');
+  ok(/listen\('scan:partial'/.test(appjs) && /onScanPartial/.test(appjs),
+     '前端必须监听 scan:partial 并画到预览画布上');
+  ok(/function hideScanPreview/.test(appjs) && /hideScanPreview\(\)/.test(appjs),
+     '扫完必须收起预览（否则它盖住真正的面积图）');
+  const sessRs = fs.readFileSync(path.join(ENGINE, 'core-scan', 'src', 'session.rs'), 'utf8');
+  ok(/pub struct PartialSink/.test(sessRs) && /aggregate\(tree\)/.test(sessRs),
+     'PartialSink.tick 必须先聚合再回调（否则目录 size 全是 0）');
+  const fullRs = fs.readFileSync(path.join(ENGINE, 'core-scan', 'src', 'full_scan.rs'), 'utf8');
+  const travRs = fs.readFileSync(path.join(ENGINE, 'core-scan', 'src', 'traverse.rs'), 'utf8');
+  ok(/full_scan_mft_with/.test(fullRs) && /sink\.tick\(/.test(fullRs),
+     'MFT 扫描必须调 PartialSink::tick');
+  ok(/full_scan_traverse_indexed_with/.test(travRs) && /sink\.tick\(/.test(travRs),
+     '降级（遍历）路径也必须调 —— 普通用户才是主要场景');
+  ok(/scan:partial/.test(fs.readFileSync(COMMANDS_RS, 'utf8'))
+     && /preview_of/.test(fs.readFileSync(COMMANDS_RS, 'utf8')),
+     '后端必须算预览并 emit scan:partial');
+  ok(/core_viz::squarify/.test(fs.readFileSync(COMMANDS_RS, 'utf8')),
+     '预览布局必须复用 core_viz::squarify（与面积图同一份实现）');
+
   /* ── 结果 ────────────────────────────────────────────────────────── */
   console.log('='.repeat(72));
   console.log('界面规则校验（admin-rule.js / view-rule.js + DOM 接线 + 版面结构）');

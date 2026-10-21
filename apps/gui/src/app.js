@@ -342,6 +342,9 @@ async function startScan(drive, root) {
 
 async function afterScan(summary, errorMsg) {
   setScanning(false);
+  // E7：扫描结束（无论成败）都收起半成品视图 —— 它只是"扫的时候看一眼"，
+  // 留着会挡住真正的面积图，而且数据已经过时了。
+  hideScanPreview();
   if (errorMsg) {
     state.summary = null;
     setBadge('扫描失败', '');
@@ -1448,6 +1451,93 @@ function wireMonitor() {
  *      点它只是改 `focus`，面积图下次显示时自然就是新的那一层。
  */
 
+/* ── E7 扫描中的渐进渲染 ────────────────────────────────────────────────
+ *
+ * 后端每扫到一批（MFT 200k 槽位 / 遍历 400 个目录）就把「根的第一层」算好发过来，
+ * 坐标是 0~1 的归一化值。这里只负责画到一个**独立画布**上：
+ *
+ * 不去碰 `Treemap` 的状态机 —— 扫描过程中布局每 200 ms 就换一次，
+ * 让正式渲染器读半成品数据会把"当前焦点/视图根"搅乱。扫完隐藏这一层，
+ * 真正的面积图照常接管，用户看到的过渡是"预览 → 真图"。
+ */
+function hideScanPreview() {
+  const cv = document.getElementById('scan-preview');
+  if (cv) cv.classList.add('hidden');
+  // 遮罩恢复成常规样式（盖住全屏、居中卡片）
+  document.body.classList.remove('previewing');
+}
+
+function onScanPartial(p) {
+  if (!p || !p.rects || !p.rects.length) return;
+  if (state.view !== 'map') return; // 在看别的页签，别为看不见的东西重绘
+  const cv = document.getElementById('scan-preview');
+  const host = document.getElementById('canvas');
+  const w = host.clientWidth;
+  const h = host.clientHeight;
+  if (!w || !h) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const pxW = Math.round(w * dpr);
+  const pxH = Math.round(h * dpr);
+  if (cv.width !== pxW || cv.height !== pxH) {
+    cv.width = pxW;
+    cv.height = pxH;
+  }
+  cv.classList.remove('hidden');
+  // 半成品期间把「正在扫描」的遮罩让开：72% 的黑色蒙层会把刚画出来的
+  // 面积图压成一片灰，那这个功能就白做了。改成左下角的小卡片。
+  document.body.classList.add('previewing');
+  document.getElementById('empty-hint').classList.add('hidden');
+
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const styles = getComputedStyle(document.body);
+  const accent = (styles.getPropertyValue('--accent') || '#378add').trim();
+  const bg = (styles.getPropertyValue('--bg-panel') || '#1b1b1b').trim();
+  const ink = (styles.getPropertyValue('--text') || '#ddd').trim();
+
+  g.fillStyle = bg;
+  g.fillRect(0, 0, w, h);
+
+  g.font = '11px ui-sans-serif, system-ui, sans-serif';
+  g.textBaseline = 'top';
+  p.rects.forEach((r, i) => {
+    const x = r.x * w;
+    const y = r.y * h;
+    const rw = r.w * w;
+    const rh = r.h * h;
+    if (rw < 1 || rh < 1) return;
+    // 目录稍深、文件更淡：与面积图"块越大越显眼"的直觉一致，
+    // 但这里不做类型着色 —— 半成品还谈不上"看类型"
+    // 相邻方块要能区分：第一层常有一两个巨块（比如占 70%），统一透明度会
+    // 糊成一整片纯色，看着像"页面还没画完"。按序号换三档，目录略深。
+    g.globalAlpha = 0.24 + (i % 3) * 0.13 + (r.dir ? 0.05 : 0);
+    g.fillStyle = accent;
+    g.fillRect(x, y, rw, rh);
+    g.globalAlpha = 0.75;
+    g.strokeStyle = bg;
+    g.lineWidth = 1;
+    g.strokeRect(x + 0.5, y + 0.5, rw - 1, rh - 1);
+    if (rw > 64 && rh > 20) {
+      g.globalAlpha = 0.9;
+      g.fillStyle = ink;
+      const label = r.name.length > Math.floor(rw / 7) ? r.name.slice(0, Math.floor(rw / 7) - 1) + '…' : r.name;
+      g.fillText(label, x + 4, y + 3);
+    }
+  });
+  g.globalAlpha = 1;
+
+  // 顶部状态条：让它一眼能看出"这是半成品，还在扫"
+  const text = `扫描中 · 已扫 ${p.files.toLocaleString()} 个文件 · ${humanSize(p.total)}`;
+  g.fillStyle = accent;
+  g.globalAlpha = 0.9;
+  g.fillRect(0, 0, w, 22);
+  g.globalAlpha = 1;
+  g.fillStyle = bg;
+  g.fillText(text, 8, 5);
+}
+
 const VIEW_HINTS = {
   map: '滚轮下钻 · Esc 返回上一层',
   dup: '三级筛选：体积 → 首尾各 4 KiB 哈希 → 全文件哈希 → 逐字节复核',
@@ -1472,6 +1562,8 @@ function setView(v) {
   document.getElementById('view-tab-risk').classList.toggle('on', v === 'risk');
   document.getElementById('view-tab-trend').classList.toggle('on', v === 'trend');
   document.getElementById('view-hint').textContent = VIEW_HINTS[v] || '';
+  // 不在面积图页时不要留着"半成品"的遮罩样式（那是给地图让位的）
+  if (v !== 'map') document.body.classList.remove('previewing');
   if (v === 'map') refreshLayout().catch(() => {});
   // 切到搜索页就把光标放进输入框：进这个页签的下一步一定是打字
   if (v === 'search') document.getElementById('search-text').focus();
@@ -2807,6 +2899,7 @@ async function boot() {
     renderVolumes();
   });
   await listen('scan:progress', (ev) => progressUI(ev.payload));
+  await listen('scan:partial', (ev) => onScanPartial(ev.payload));
   await listen('scan:done', (ev) => afterScan(ev.payload, null));
   await listen('scan:error', (ev) => afterScan(null, String(ev.payload)));
   await listen('admin:relaunch', (ev) => onRelaunchOutcome(ev.payload || {}));

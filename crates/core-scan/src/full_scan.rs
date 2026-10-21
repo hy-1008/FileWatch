@@ -108,7 +108,29 @@ pub fn full_scan_mft<P>(
     drive: &str,
     ntfs: &NtfsVolume,
     opts: ScanOptions,
+    progress: P,
+) -> io::Result<(Tree, ScanStats)>
+where
+    P: FnMut(u64, u64),
+{
+    full_scan_mft_with(vol, drive, ntfs, opts, progress, None)
+}
+
+/// 每多少个 **MFT 槽位**回调一次半成品视图。
+///
+/// 200k 槽位在 SSD 上约 0.1~0.2 s，2M 条记录共 10 次回调 —— 界面看起来是
+/// 「一帧一帧长出来」，而聚合的开销（每次 O(n)）摊到 10 次可以忽略。
+/// 和进度条用同一个步长没有意义：进度要密，预览要省。
+pub const PARTIAL_STRIDE: u64 = 200_000;
+
+/// [`full_scan_mft`] + 半成品视图回调（E7）。
+pub fn full_scan_mft_with<P>(
+    vol: &Volume,
+    drive: &str,
+    ntfs: &NtfsVolume,
+    opts: ScanOptions,
     mut progress: P,
+    partial: Option<&crate::session::PartialSink>,
 ) -> io::Result<(Tree, ScanStats)>
 where
     P: FnMut(u64, u64),
@@ -132,6 +154,7 @@ where
     let sector = vol.sector_size() as usize;
     let progress_every = opts.progress_every.max(1);
     let mut next_progress_at = progress_every;
+    let mut next_partial_at = PARTIAL_STRIDE;
 
     // 逐段顺序读。`for_each_chunk` 保证记录不跨块/跨段，
     // 因此这里可以对每块做零拷贝的定长切片。
@@ -170,6 +193,12 @@ where
         if stats.slots_seen >= next_progress_at {
             progress(stats.slots_seen, stats.total_records);
             next_progress_at = stats.slots_seen + progress_every;
+        }
+
+        // E7：半成品视图。`tick` 内部先聚合再回调 —— 扫描中目录节点的 size
+        // 还是 0，不聚合就画出来是一屏 0 面积的方块。
+        if let Some(sink) = partial {
+            sink.tick(&mut tree, stats.slots_seen, &mut next_partial_at, PARTIAL_STRIDE);
         }
     })?;
 

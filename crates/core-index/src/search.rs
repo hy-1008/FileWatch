@@ -110,8 +110,82 @@ pub struct Query<'a> {
     pub limit: usize,
 }
 
+/// 名字之外的附加条件（E8）：体积 / 修改时间 / 扩展名。
+///
+/// 这些条件在**同一个循环里**判，而不是先搜再过滤：过滤放在外面的话，
+/// `limit` 会先被不合格的命中占满，用户看到"只找到 3 个"而其实有 300 个 ——
+/// 这类"数字对不上"最难解释。所以 `matched` 只统计**通过全部条件**的条目。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filters {
+    /// 体积下界（含），字节
+    pub min_size: Option<u64>,
+    /// 体积上界（含），字节
+    pub max_size: Option<u64>,
+    /// 修改时间下界（含），Unix 秒
+    pub after: Option<i64>,
+    /// 修改时间上界（含），Unix 秒
+    pub before: Option<i64>,
+    /// 扩展名白名单（小写、不带点）。空 = 不限
+    pub exts: Vec<String>,
+}
+
+impl Filters {
+    pub fn is_empty(&self) -> bool {
+        self.min_size.is_none()
+            && self.max_size.is_none()
+            && self.after.is_none()
+            && self.before.is_none()
+            && self.exts.is_empty()
+    }
+
+    /// 解析 `--exts=mp4,mkv,.AVI` 这种写法：统一小写、去掉前导点、去空项。
+    ///
+    /// 前端与 CLI 都走它，免得一边接受 `.MP4` 另一边不接受。
+    pub fn parse_exts(s: &str) -> Vec<String> {
+        s.split(|c| c == ',' || c == ';' || c == ' ')
+            .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect()
+    }
+
+    fn accepts(&self, name: &str, size: u64, mtime: i64) -> bool {
+        if let Some(v) = self.min_size {
+            if size < v {
+                return false;
+            }
+        }
+        if let Some(v) = self.max_size {
+            if size > v {
+                return false;
+            }
+        }
+        if let Some(v) = self.after {
+            if mtime < v {
+                return false;
+            }
+        }
+        if let Some(v) = self.before {
+            if mtime > v {
+                return false;
+            }
+        }
+        if !self.exts.is_empty() {
+            let ext = crate::tree::extension_of(name).to_lowercase();
+            if !self.exts.iter().any(|e| *e == ext) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// 一次搜索。空关键字直接返回空结果（不把"所有文件"倒进列表）。
 pub fn search(tree: &Tree, q: &Query<'_>) -> Result<Outcome, String> {
+    search_filtered(tree, q, &Filters::default())
+}
+
+/// [`search`] + 附加条件（体积 / 时间 / 扩展名）。
+pub fn search_filtered(tree: &Tree, q: &Query<'_>, f: &Filters) -> Result<Outcome, String> {
     let text = q.text.trim();
     if text.is_empty() {
         return Ok(Outcome { hits: Vec::new(), scanned: 0, matched: 0, truncated: false });
@@ -136,6 +210,10 @@ pub fn search(tree: &Tree, q: &Query<'_>) -> Result<Outcome, String> {
         out.scanned += 1;
         let name = tree.name(i as u32);
         if name.is_empty() {
+            continue;
+        }
+        // 附加条件先判：它们比（可能带正则的）名字匹配便宜得多
+        if !f.is_empty() && !f.accepts(name, node.size, node.mtime) {
             continue;
         }
         let score = match q.mode {
@@ -590,4 +668,70 @@ mod tests {
         // 要么正常判 false，要么明确报预算耗尽 —— 都不能卡死
         assert!(matches!(e, Ok(false) | Err(_)), "{e:?}");
     }
+
+    // ── E8 附加条件 ──────────────────────────────────────────────────────
+
+    fn q(text: &str) -> Query<'_> {
+        Query { text, mode: MatchMode::Contains, scope: Scope::Files, limit: 10 }
+    }
+
+    #[test]
+    fn filters_by_size_and_extension() {
+        let t = tree_with(&[
+            ("a.mp4", false, 10 * 1024 * 1024),
+            ("b.mkv", false, 20 * 1024 * 1024),
+            ("c.txt", false, 5 * 1024 * 1024),
+        ]);
+        // 6 MB 的下界挡掉 5 MB 的 c.txt；留下的两个按体积降序（大文件先）
+        let big = Filters { min_size: Some(6 * 1024 * 1024), ..Default::default() };
+        let o = search_filtered(&t, &q("."), &big).unwrap();
+        assert_eq!(names_of(&o), vec!["b.mkv", "a.mp4"]);
+
+        // 扩展名大小写与前导点都要能认（前端传的是输入框原文）
+        let exts = Filters::parse_exts("MP4, .mkv;");
+        assert_eq!(exts, vec!["mp4", "mkv"]);
+        let o2 = search_filtered(&t, &q("."), &Filters { exts, ..Default::default() }).unwrap();
+        let mut got = names_of(&o2);
+        got.sort();
+        assert_eq!(got, vec!["a.mp4", "b.mkv"]);
+    }
+
+    #[test]
+    fn filters_by_time() {
+        let mut t = tree_with(&[("old.log", false, 1), ("new.log", false, 1)]);
+        // 两个文件的 mtime 在 helper 里是同一个值，这里手动拉开
+        t.arena.nodes[2].mtime = 1_600_000_000;
+        t.arena.nodes[3].mtime = 1_700_000_000;
+        let o = search_filtered(&t, &q("log"), &Filters { after: Some(1_650_000_000), ..Default::default() }).unwrap();
+        assert_eq!(names_of(&o), vec!["new.log"]);
+        let o2 = search_filtered(&t, &q("log"), &Filters { before: Some(1_650_000_000), ..Default::default() }).unwrap();
+        assert_eq!(names_of(&o2), vec!["old.log"]);
+    }
+
+    /// 被条件挡掉的条目**不能占掉 limit 名额**。
+    ///
+    /// 否则计数会骗人：明明有 3 个同名文件符合体积条件，界面却说"共 1 个" ——
+    /// 或者反过来，"只找到 1 个"而其实有 300 个。这类数字对不上最难解释。
+    #[test]
+    fn filtered_out_items_do_not_consume_the_limit() {
+        let t = tree_with(&[("x.bin", false, 1), ("x.bin", false, 2), ("x.bin", false, 1_000_000)]);
+        let f = Filters { min_size: Some(1_000_000), ..Default::default() };
+        let mut query = q("x");
+        query.limit = 1;
+        let o = search_filtered(&t, &query, &f).unwrap();
+        assert_eq!(o.matched, 1, "只有 1 个真的合格");
+        assert!(!o.truncated, "不是被 limit 截断的");
+        assert_eq!(o.hits.len(), 1);
+    }
+
+    #[test]
+    fn empty_filters_behave_like_plain_search() {
+        let t = tree_with(&[("a.txt", false, 1), ("b.txt", false, 2)]);
+        let a = search(&t, &q("txt")).unwrap();
+        let b = search_filtered(&t, &q("txt"), &Filters::default()).unwrap();
+        assert_eq!(names_of(&a), names_of(&b));
+        assert!(Filters::default().is_empty());
+        assert!(!Filters { exts: vec!["txt".into()], ..Default::default() }.is_empty());
+    }
+
 }

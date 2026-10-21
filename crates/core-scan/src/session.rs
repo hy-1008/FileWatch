@@ -39,6 +39,45 @@ pub enum ScanPhase {
     Traverse,
 }
 
+/// 扫描中的「半成品视图」回调（E7 渐进渲染）。
+///
+/// 引擎每扫到一定数量就回调一次，回调里拿到的是**已聚合过大小**的整棵树。
+/// 为什么不让调用方自己决定什么时候聚合：扫描过程中目录节点的 `size` 一直是 0
+/// （只有文件节点有大小），漏掉聚合的话画出来是一屏 0 面积的方块 ——
+/// 看起来像"扫到的东西全是空的"，比不画还糟。所以聚合与回调必须绑在一起。
+pub struct PartialSink(pub std::sync::Arc<dyn Fn(&core_index::Tree) + Send + Sync>);
+
+impl Clone for PartialSink {
+    fn clone(&self) -> Self {
+        PartialSink(self.0.clone())
+    }
+}
+
+impl std::fmt::Debug for PartialSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PartialSink")
+    }
+}
+
+impl PartialSink {
+    /// 到了步长就聚合并回调。返回是否真的回调了，并把 `next` 推进到下一个触发点。
+    pub fn tick(
+        &self,
+        tree: &mut core_index::Tree,
+        seen: u64,
+        next: &mut u64,
+        stride: u64,
+    ) -> bool {
+        if seen < *next {
+            return false;
+        }
+        *next = seen.saturating_add(stride.max(1));
+        core_index::aggregate::aggregate(tree);
+        (self.0)(tree);
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub drive: String,
@@ -69,6 +108,11 @@ pub struct SessionConfig {
     pub watch_buffer_bytes: usize,
     /// 是否递归监视子目录
     pub watch_subtree: bool,
+    /// 扫描过程中的半成品视图回调（`None` = 不回调）。
+    ///
+    /// 只在**全量扫描**阶段有效；增量回放不触发 —— 那一步量小，
+    /// 而且此时画面上已经有完整的图了，再画一遍只会闪。
+    pub partial: Option<PartialSink>,
 }
 
 impl Default for SessionConfig {
@@ -87,6 +131,7 @@ impl Default for SessionConfig {
             watch_max_nodes: 300_000,
             watch_buffer_bytes: 64 * 1024,
             watch_subtree: true,
+            partial: None,
         }
     }
 }
@@ -184,12 +229,13 @@ impl Session {
 
                     // 全量扫描
                     let t = std::time::Instant::now();
-                    let (tree, stats) = full_scan::full_scan_mft(
+                    let (tree, stats) = full_scan::full_scan_mft_with(
                         &inc.vol,
                         &cfg.drive,
                         inc.ntfs.as_ref().unwrap(),
                         cfg.scan,
                         |done, total| progress(ScanPhase::Mft, done, total),
+                        cfg.partial.as_ref(),
                     )?;
                     let _ = t;
 
@@ -258,12 +304,13 @@ impl Session {
         // ① 全量遍历。若打算启用实时增量，就顺手收集「路径 → 节点」索引——
         //    事后反推是错的（Tree 里的路径前缀是盘符，不是真实扫描根）
         let want_watch = cfg.allow_traverse_watch;
-        let (tree, tstats, paths) = traverse::full_scan_traverse_indexed(
+        let (tree, tstats, paths) = traverse::full_scan_traverse_indexed_with(
             &root,
             &cfg.drive,
             cfg.traverse,
             want_watch,
             |done, _total| progress(ScanPhase::Traverse, done, 0),
+            cfg.partial.as_ref(),
         );
 
         // ② 建立目录监视会话。三种情况会退化为「只扫描、不增量」：
@@ -547,6 +594,63 @@ fn norm_lookup(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 手搭一棵最小的树：目录 5（根）→ 6（子目录）→ 三个文件。
+    fn tiny_tree() -> core_index::Tree {
+        use core_index::arena::{Node, NODE_DIR, NODE_IN_USE};
+        let mut t = core_index::Tree::new("C:", 16);
+        t.root = 5;
+        t.arena.ensure(12);
+        let mut set = |t: &mut core_index::Tree, idx: u32, parent: u32, dir: bool, size: u64| {
+            if let Some(n) = t.arena.get_mut(idx) {
+                *n = Node {
+                    parent,
+                    flags: NODE_IN_USE | if dir { NODE_DIR } else { 0 },
+                    size,
+                    alloc: size,
+                    ..Node::EMPTY
+                };
+            }
+        };
+        set(&mut t, 5, 5, true, 0);
+        set(&mut t, 6, 5, true, 0);
+        set(&mut t, 7, 6, false, 100);
+        set(&mut t, 8, 6, false, 50);
+        set(&mut t, 9, 6, false, 7);
+        t
+    }
+
+    /// 回调**必须看到已聚合的目录大小**。
+    ///
+    /// 扫描中目录节点的 size 一直是 0；漏掉聚合，界面画出来就是一屏
+    /// 0 面积的方块 —— 看起来像"扫到的东西全是空的"，比不画还糟。
+    #[test]
+    fn partial_sink_aggregates_before_callback() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<u64>>> = Default::default();
+        let s2 = seen.clone();
+        let sink = PartialSink(std::sync::Arc::new(move |t: &core_index::Tree| {
+            s2.lock().unwrap()
+                .push(t.node(6).map(|n| n.size).unwrap_or(0));
+        }));
+        let mut tree = tiny_tree();
+        let mut next = 10u64;
+        // 没到步长：不回调
+        assert!(!sink.tick(&mut tree, 9, &mut next, 10));
+        assert!(seen.lock().unwrap().is_empty());
+        // 到步长：回调一次，且目录 6 的大小已经算成 157
+        assert!(sink.tick(&mut tree, 10, &mut next, 10));
+        assert_eq!(seen.lock().unwrap().as_slice(), &[157]);
+        assert_eq!(next, 20, "下一次触发点必须推进");
+        // 再调一次同样的 seen 不重复触发
+        assert!(!sink.tick(&mut tree, 10, &mut next, 10));
+    }
+
+    /// 回调是 `Send + Sync` 的：扫描在后台线程跑，闭包里要能带 AppHandle。
+    #[test]
+    fn partial_sink_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PartialSink>();
+    }
 
     #[test]
     fn backend_labels() {

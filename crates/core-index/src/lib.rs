@@ -30,7 +30,10 @@ pub use aggregate::{
 pub use arena::{recno_of, Arena, Node, INVALID_PARENT, RECNO_MASK};
 pub use ext_stats::{ExtensionTable, ExtStat};
 pub use hardlink::{build_report, DedupReport};
-pub use search::{search, Hit, MatchMode, Outcome, Query, Scope, SimpleRegex};
+pub use search::{
+    search, search_filtered, Filters as SearchFilters, Hit, MatchMode, Outcome, Query, Scope,
+    SimpleRegex,
+};
 // 敏感盘点的结果类型叫 `Finding`（不是 `Hit`）—— 与搜索的 `Hit` 区分开。
 // 同名会让 check_api 的符号表互相覆盖，报出一堆假错。
 pub use sensitive::{

@@ -275,6 +275,74 @@ pub fn scan_start(
 ///
 /// 记下的 `last_drive` 是「用户当前在看哪块盘」，后台周期任务靠它决定刷谁
 /// （**不能**去扫别的盘，那会把用户的视图换掉，见 [`crate::scheduler`]）。
+/// 扫描中预览最多画多少个方块。再多也认不出名字，只会糊成一团。
+const PREVIEW_SLOTS: usize = 28;
+
+/// 扫描中预览的一个方块（坐标是 0~1 的**归一化**值）。
+///
+/// 归一化而不是像素：后端不知道窗口多大，前端乘一下就行 —— 这样
+/// 扫描中改窗口大小也不需要重新算布局。
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewRect {
+    pub name: String,
+    pub size: u64,
+    pub dir: bool,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanPreview {
+    pub files: u64,
+    pub dirs: u64,
+    pub total: u64,
+    pub rects: Vec<PreviewRect>,
+}
+
+/// 扫描中预览：根的直接子项按大小取前 `max` 个，剩下的并成「（其余）」。
+///
+/// 布局用 `core_viz::squarify`（与面积图同一份实现），所以预览与扫完之后的
+/// 形状是连续的 —— 扫完切过去不会"跳一下变成另一种布法"。
+pub fn preview_of(tree: &core_index::Tree, max: usize) -> ScanPreview {
+    let root = tree.root;
+    let mut items: Vec<(String, u64, bool)> = Vec::new();
+    for (i, n) in tree.arena.nodes.iter().enumerate() {
+        if !n.in_use() || i as u32 == root || n.parent != root {
+            continue;
+        }
+        items.push((tree.name(i as u32).to_string(), n.size, n.is_dir()));
+    }
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(max.max(1));
+    let shown: u64 = items.iter().map(|x| x.1).sum();
+    if tree.total_size > shown {
+        items.push(("（其余）".to_string(), tree.total_size - shown, false));
+    }
+    let areas: Vec<f64> = items.iter().map(|x| x.1 as f64).collect();
+    let rects = core_viz::squarify(&areas, Rect::new(0.0, 0.0, 1.0, 1.0));
+    ScanPreview {
+        files: tree.file_count,
+        dirs: tree.dir_count,
+        total: tree.total_size,
+        rects: items
+            .iter()
+            .zip(rects.iter())
+            .filter(|(it, r)| it.1 > 0 && r.w > 0.0 && r.h > 0.0)
+            .map(|((name, size, dir), r)| PreviewRect {
+                name: name.clone(),
+                size: *size,
+                dir: *dir,
+                x: r.x as f64,
+                y: r.y as f64,
+                w: r.w as f64,
+                h: r.h as f64,
+            })
+            .collect(),
+    }
+}
+
 pub fn spawn_scan(
     app: &AppHandle,
     drive: &str,
@@ -316,6 +384,31 @@ pub fn spawn_scan(
         cfg.allow_traverse_watch = watch;
         cfg.engine.write_changelog = false;
         cfg.changelog_path = None;
+
+        // E7 渐进渲染：扫描中途把「第一层」画出来。
+        //
+        // 只画根的直接子项 —— 深层的方块在扫描过程中一直在变，画了也读不下去。
+        // 这里再按时间节流：聚合是引擎按步长给的（便宜），但 IPC + 重绘不便宜，
+        // 按 5 fps 给就够了，多了只是让画面抖。
+        let preview_app = app.clone();
+        let preview_gap = std::sync::Arc::new(std::sync::Mutex::new(
+            Instant::now() - Duration::from_secs(5),
+        ));
+        cfg.partial = Some(core_scan::session::PartialSink(std::sync::Arc::new(
+            move |tree: &core_index::Tree| {
+                {
+                    let mut last = match preview_gap.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    if last.elapsed() < Duration::from_millis(200) {
+                        return;
+                    }
+                    *last = Instant::now();
+                }
+                let _ = preview_app.emit("scan:partial", preview_of(tree, PREVIEW_SLOTS));
+            },
+        )));
 
         let app_p = app.clone();
         let mut last: Option<Instant> = None;
