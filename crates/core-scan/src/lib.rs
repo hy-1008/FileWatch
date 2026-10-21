@@ -79,7 +79,7 @@ pub use paths::{event_path, join_path, raw_event_path};
 pub use report::{build_html, build_html_with, ReportOptions};
 pub use session::{ScanBackend, ScanPhase, Session, SessionConfig};
 pub use snapshot::{
-    diff, rows_to_csv, signed_size, DiffKind, DiffOptions, DiffOrder, DiffReport, DiffRow,
+    csv_field, diff, rows_to_csv, signed_size, DiffKind, DiffOptions, DiffOrder, DiffReport, DiffRow,
     SnapEntry, Snapshot, SnapshotOptions,
 };
 pub use traverse::{

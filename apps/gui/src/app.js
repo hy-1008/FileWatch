@@ -309,6 +309,52 @@ function wireMenus() {
   };
 }
 
+/* ── 键盘快捷键 ──────────────────────────────────────────────────────────
+ *
+ * 只有三个，都是桌面工具的常识键，不发明新组合：
+ *
+ * | 键 | 做什么 | 为什么必须挡默认行为 |
+ * |---|---|---|
+ * | `Ctrl+F` | 切到搜索页（`setView('search')` 自己会把光标放进输入框） | WebView2 会弹自己的"在页面中查找"，那是找 DOM 文本，不是找文件 |
+ * | `F5` | 重扫当前根（与「文件 → 重新扫描」同一个函数） | **F5 在 WebView2 里是刷新页面** —— 一按就丢掉整棵索引，用户以为"刷新了一下数据"，实际是白扫了一遍 |
+ * | `Esc` | 收掉打开的一层（菜单 → 弹窗） | 右键菜单的 Esc 在 context-menu.js 里自己处理，这里只管 `<details>` 菜单与提权弹窗 |
+ *
+ * 两处刻意的取舍：
+ *
+ * 1. `Ctrl+F` **在输入框里也生效**。看起来像抢键，但用户的意图是"换个词搜"，
+ *    而不是"在搜索框里找这几个字"—— 后者没有任何意义。
+ * 2. `Esc` 一次只收一层，连按才逐层退。一把全关掉会让人不知道自己退到了哪一层。
+ */
+function wireShortcuts() {
+  document.addEventListener('keydown', (event) => {
+    const modal = document.getElementById('admin-modal');
+    const modalOpen = modal && !modal.classList.contains('hidden');
+
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f') {
+      event.preventDefault();
+      setView('search');
+      return;
+    }
+
+    if (event.key === 'F5') {
+      event.preventDefault();
+      // 提权弹窗还没答就问"要不要重扫"，顺序反了
+      if (!modalOpen) scanCurrentFolder();
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      // 菜单先收（它是最外层的"临时层"），再收弹窗。
+      // 右键菜单不走这里：context-menu.js 在捕获阶段已经处理并 stopPropagation。
+      for (const menu of document.querySelectorAll('details.menu[open]')) {
+        menu.open = false;
+        return;
+      }
+      if (modalOpen) closeAdminModal();
+    }
+  });
+}
+
 function progressUI(p) {
   document.getElementById('progress-text').textContent =
     `${p.phase}　已处理 ${p.done.toLocaleString()} 个节点` +
@@ -1949,6 +1995,9 @@ const searchView = {
   view: null,
   error: null,
   running: false,
+  /** 勾选的节点 id。**只存 id，不存行对象** —— 重绘列表时行是新的，
+   *  而"哪几条被选中"必须跨重绘活下来（导出、复制都发生在重绘之后）。 */
+  sel: new Set(),
 };
 
 function renderSearch() {
@@ -1994,16 +2043,36 @@ function renderSearch() {
 
   box.innerHTML = '';
   if (!v || !v.hits.length) {
+    // 列表都空了，勾选也就无从谈起：不清掉的话批量条会浮在一个空列表上面
+    searchView.sel.clear();
+    renderSearchBulk();
     box.innerHTML = `<div class="mon-empty">${searchView.error ? esc(searchView.error) : (v ? '没有命中。换个关键字，或把「方式」改成模糊试试。' : '还没有搜索。')}</div>`;
     return;
   }
 
-  // 列头与快照对比同一套节奏：类型 / 文件名 / 大小 / 修改时间 / 所在目录
+  // 列头与快照对比同一套节奏：（勾选）/ 类型 / 文件名 / 大小 / 修改时间 / 所在目录
   const cols = document.createElement('div');
   cols.className = 'shead';
-  cols.innerHTML = '<span>类型</span><span>文件名</span><span class="d">大小</span>'
+  cols.innerHTML = '<span class="c"><input type="checkbox" id="search-all" '
+    + 'title="全选 / 全不选（当前列出的这些）" aria-label="全选"></span>'
+    + '<span>类型</span><span>文件名</span><span class="d">大小</span>'
     + '<span>修改时间</span><span>所在目录</span>';
   box.appendChild(cols);
+
+  const all = document.createElement('input');
+  all.type = 'checkbox';
+  all.id = 'search-all';
+  all.title = '全选 / 全不选（当前列出的这些）';
+  all.setAttribute('aria-label', '全选');
+  all.checked = v.hits.length > 0 && v.hits.every((h) => searchView.sel.has(h.node));
+  all.onchange = () => {
+    searchView.sel.clear();
+    // 全选只作用于**列出来的这些**（truncated 时 matched 可能更大），
+    // 否则"全选"会去勾一批屏幕上根本没有、也没法取消的行。
+    if (all.checked) for (const h of v.hits) searchView.sel.add(h.node);
+    renderSearch();
+  };
+  cols.querySelector('.c').replaceChildren(all);
 
   for (const h of v.hits) {
     const row = document.createElement('div');
@@ -2013,11 +2082,22 @@ function renderSearch() {
       : '';
     row.title = h.path;
     row.innerHTML =
+      '<span class="c"><input type="checkbox" aria-label="选中这一行"></span>' +
       `<span class="k${h.is_dir ? ' dir' : ''}">${h.is_dir ? '文件夹' : '文件'}</span>` +
       `<span class="n">${esc(fwMiddleEllipsis(h.name, 52))}</span>` +
       `<span class="d">${h.is_dir ? '—' : humanSize(h.size)}</span>` +
       `<span class="t">${esc(fwLocalTime(h.mtime))}</span>` +
       `<span class="p">${esc(dir || '—')}</span>`;
+    const tick = row.querySelector('input');
+    tick.checked = searchView.sel.has(h.node);
+    tick.onchange = () => {
+      if (tick.checked) searchView.sel.add(h.node);
+      else searchView.sel.delete(h.node);
+      renderSearchBulk();
+      // 列头那个"全选"的勾要跟着单行变化走，但不重绘整张表（会丢滚动位置）
+      const head = box.querySelector('#search-all');
+      if (head) head.checked = v.hits.length > 0 && v.hits.every((x) => searchView.sel.has(x.node));
+    };
     // 右键复用"节点"菜单：定位、在资源管理器打开、复制路径、加入独立监控……
     // 搜索结果是索引里的真实节点，所以 node 菜单的每一项都成立。
     ContextMenu.bind(row, { kind: 'node', node: h.node });
@@ -2030,6 +2110,64 @@ function renderSearch() {
     };
     box.appendChild(row);
   }
+  renderSearchBulk();
+}
+
+/** 批量动作条：只在有选择时出现，并报出"选了几条 / 一共几条"。
+ *
+ * 报"一共"是因为 `truncated` 时列表只是命中里的一截 —— 用户点全选，
+ * 以为选的是全部命中，实际只选了列出来的这些，这件事必须写在明面上。 */
+function renderSearchBulk() {
+  const bar = document.getElementById('search-bulk');
+  const n = searchView.sel.size;
+  bar.classList.toggle('hidden', n === 0);
+  if (!n) return;
+  const total = searchView.view ? searchView.view.hits.length : 0;
+  const count = document.getElementById('search-bulk-count');
+  count.textContent = `已选 ${n.toLocaleString()} 条`
+    + (total && n < total ? `（列出 ${total.toLocaleString()} 条）` : '');
+}
+
+/** 选中的路径，按列表顺序（不是勾选顺序 —— 导出文件的行序要跟屏幕一致）。 */
+function selectedSearchRows() {
+  const v = searchView.view;
+  if (!v) return [];
+  return v.hits.filter((h) => searchView.sel.has(h.node));
+}
+
+async function searchCopyPaths() {
+  const rows = selectedSearchRows();
+  if (!rows.length) { toast('没有选中任何结果'); return; }
+  // 每行一个完整路径：这样贴进资源管理器地址栏、贴进脚本、贴进 Excel 都能用
+  const text = rows.map((h) => h.path).join('\r\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`已复制 ${rows.length} 条路径`);
+  } catch (e) { toast('复制失败：' + e, true); }
+}
+
+async function searchExportCsv() {
+  const rows = selectedSearchRows();
+  if (!rows.length) { toast('没有选中任何结果'); return; }
+  const box = document.getElementById('search-csv');
+  let p = box.value.trim();
+  if (!p) {
+    // 默认名由后端拼（桌面位置 + 本地时间戳都只有一处实现）
+    p = await call('analyze_default_path', { kind: 'search' });
+    box.value = p;
+  }
+  try {
+    const out = await call('search_export_csv', {
+      path: p,
+      nodes: rows.map((h) => h.node),
+    });
+    toast(`已导出 ${out.rows} 行到 ${out.path}`);
+  } catch (e) { /* call() 已经提示过 */ }
+}
+
+function searchClearSelection() {
+  searchView.sel.clear();
+  renderSearch();
 }
 
 /* 内容搜索的状态。与名字搜索分开：一个是同步命令、一个是后台线程 + 事件，
@@ -2179,6 +2317,9 @@ async function runNameSearch(text) {
       limit: 500,
       ...searchFilters(),
     });
+    // 换了一批结果，旧的勾选**必须**清掉：节点 id 是数组下标，重扫后同一个 id
+    // 可能指向另一个文件 —— 留着就是"导出的是上一批的路径"这种最难查的错。
+    searchView.sel.clear();
     searchView.error = null;
   } catch (e) {
     searchView.view = null;
@@ -2809,6 +2950,11 @@ function wireViews() {
   document.getElementById('dup-start').onclick = startDup;
   document.getElementById('dup-export').onclick = dupExport;
 
+  // 批量动作（v0.1.8）：勾选 → 复制路径 / 导出 CSV / 清空
+  document.getElementById('search-copy').onclick = searchCopyPaths;
+  document.getElementById('search-export').onclick = searchExportCsv;
+  document.getElementById('search-clear').onclick = searchClearSelection;
+
   document.getElementById('diff-save').onclick = saveSnapshot;
   document.getElementById('diff-compare').onclick = compareSnapshot;
   document.getElementById('diff-export').onclick = diffExport;
@@ -2899,6 +3045,7 @@ async function boot() {
   document.getElementById('tree-go').onclick = goTreePath;
   document.getElementById('tree-path').onkeydown = e => { if (e.key === 'Enter') goTreePath(); };
   wireMenus();
+  wireShortcuts();
   wireViews();
   // 监控抽屉、布局选择、窗口缩放都会改变画布尺寸，需要重新计算矩形坐标。
   let resizeTimer;

@@ -1062,6 +1062,56 @@ function main() {
   ok(/core_viz::squarify/.test(fs.readFileSync(COMMANDS_RS, 'utf8')),
      '预览布局必须复用 core_viz::squarify（与面积图同一份实现）');
 
+  /* ── 键盘快捷键 ────────────────────────────────────────────────────
+   *
+   * 三条都要有，而且 `F5` **必须** preventDefault：WebView2 里 F5 是刷新页面，
+   * 不挡掉的话按一下整棵索引就没了，用户还以为只是"刷新了数据"。
+   */
+  const scBody = (appjs.match(/function wireShortcuts\(\)[\s\S]{0,1600}?\n\}/) || [''])[0];
+  ok(scBody.length > 0, 'app.js 缺少 wireShortcuts()');
+  ok(/wireShortcuts\(\);/.test(appjs), 'boot() 必须调用 wireShortcuts()');
+  ok(/key\.toLowerCase\(\) === 'f'/.test(scBody) && /setView\('search'\)/.test(scBody),
+     'Ctrl+F 必须切到搜索页（setView 自己会把光标放进输入框）');
+  ok(/event\.key === 'F5'/.test(scBody) && /scanCurrentFolder\(\)/.test(scBody),
+     'F5 必须重扫当前根（与「文件 → 重新扫描」同一个函数，不能另写一套）');
+  const f5Block = (scBody.match(/if \(event\.key === 'F5'\)[\s\S]{0,220}?return;/) || [''])[0];
+  ok(/preventDefault\(\)/.test(f5Block),
+     'F5 必须先 preventDefault —— 否则 WebView2 会刷新页面，整棵索引直接丢掉');
+  ok(/Escape/.test(scBody) && /closeAdminModal\(\)/.test(scBody),
+     'Esc 必须能收掉提权弹窗（右键菜单的 Esc 由 context-menu.js 自己处理）');
+
+  /* ── 搜索结果的批量动作（v0.1.8）────────────────────────────────────
+   *
+   * 三条底线：
+   * 1. 导出的行**由后端从索引树取**（前端手里的 hits 是上一次搜索的快照）；
+   * 2. 列与时间口径与 CLI 的 `search --csv` 完全一致（同一份 csv_field / local_time）；
+   * 3. 换一批搜索结果必须清掉旧勾选 —— 节点 id 是数组下标，重扫后会指到别的文件。
+   */
+  for (const id of ['search-bulk', 'search-bulk-count', 'search-copy', 'search-export', 'search-clear', 'search-csv']) {
+    ok(htmlIds.has(id), `index.html 缺少 #${id}（批量动作）`);
+  }
+  ok(/function renderSearchBulk/.test(appjs) && /sel\.size/.test(appjs),
+     '批量条必须按选择数量显示/隐藏');
+  ok(/function selectedSearchRows/.test(appjs) && /sel\.has\(h\.node\)/.test(appjs),
+     '选中的行必须按节点 id 从当前结果里取（不能按行下标）');
+  ok(/function searchCopyPaths/.test(appjs) && /navigator\.clipboard\.writeText/.test(appjs),
+     '复制路径要走剪贴板，多行用 \\r\\n 分隔');
+  ok(/function searchExportCsv/.test(appjs) && /call\('search_export_csv'/.test(appjs),
+     '导出必须调后端 search_export_csv');
+  ok(/nodes: rows\.map\(\(h\) => h\.node\)/.test(appjs),
+     '导出只传**选中的**节点 id');
+  ok(/searchView\.sel\.clear\(\)/.test(appjs),
+     '换搜索结果/无结果时必须清掉旧勾选（节点 id 会指向别的文件）');
+  ok(!/path,bytes,is_dir,mtime/.test(appjs),
+     'CSV 列名不许写在前端（后端一份，与 CLI 对齐）');
+  const cmdRs2 = fs.readFileSync(COMMANDS_RS, 'utf8');
+  ok(/pub fn search_export_csv/.test(cmdRs2) && /core_scan::csv_field/.test(cmdRs2),
+     'search_export_csv 必须复用 core_scan::csv_field');
+  ok(/core_io::util::local_time\(n\.mtime\)/.test(cmdRs2),
+     'CSV 的修改时间必须写本地时间（与 CLI、屏幕同一口径）');
+  ok(/tree\.node\(node\)/.test(cmdRs2),
+     '导出的行必须从索引树取（路径/时间只有一处实现）');
+
   /* ── 结果 ────────────────────────────────────────────────────────── */
   console.log('='.repeat(72));
   console.log('界面规则校验（admin-rule.js / view-rule.js + DOM 接线 + 版面结构）');

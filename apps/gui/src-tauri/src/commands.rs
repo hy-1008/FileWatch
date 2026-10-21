@@ -891,8 +891,77 @@ pub fn search_nodes(
     })
 }
 
-// ── 敏感文件盘点（E5）──────────────────────────────────────────────────────
+/// 导出一次 CSV 的结果：落盘路径 + 行数（前端要报「写到哪了」）。
+#[derive(Debug, Clone, Serialize)]
+pub struct CsvExport {
+    pub path: String,
+    pub rows: usize,
+}
 
+/// 把**选中的**搜索结果导成 CSV（批量动作的一半，另一半是复制路径）。
+///
+/// 两个刻意的决定：
+///
+/// 1. **行由后端从索引树取**，不由前端拼。前端手里的 `hits` 是上一次搜索的
+///    快照，而"路径文本 / 本地时间 / CSV 转义"这三件事各自只有一份实现
+///    （`path_remap`、`core_io::util::local_time`、`core_scan::csv_field`）；
+///    让前端再拼一遍就是第二份，改一处漏一处迟早会出现在导出文件里。
+/// 2. 列与 CLI 的 `search --csv` **完全一致**（`path,bytes,is_dir,mtime`），
+///    时间写本地文本。同一个功能两个入口导出两种格式，是最容易被当成 bug 的那种"特性"。
+/// 选中节点 → CSV 正文。抽成纯函数是为了能单测：命令本身要 `State`，测不动。
+///
+/// 返回 `(正文, 行数)`；取不到的节点**跳过**（节点可能已经被后来的扫描换掉），
+/// 一行都不剩时由调用方决定报什么错。
+fn build_search_csv(
+    tree: &core_index::Tree,
+    nodes: &[u32],
+    remap: Option<&core_monitor::pathremap::PathRemap>,
+) -> (String, usize) {
+    let mut body = String::from("path,bytes,is_dir,mtime\n");
+    let mut rows = 0usize;
+    for &node in nodes {
+        // 节点可能已经被后来的扫描换掉了（索引按代数对齐）。取不到就跳过，
+        // 而不是拿一个错的路径写进文件 —— 导出文件里出现空行比少一行更难查。
+        let Some(n) = tree.node(node) else { continue };
+        let raw = tree.path_of(node);
+        let path_text = remap.map(|r| r.apply(&raw)).unwrap_or(raw);
+        body.push_str(&format!(
+            "{},{},{},{}\n",
+            core_scan::csv_field(&path_text),
+            n.size,
+            n.is_dir(),
+            core_io::util::local_time(n.mtime),
+        ));
+        rows += 1;
+    }
+    (body, rows)
+}
+
+#[tauri::command]
+pub fn search_export_csv(
+    state: State<'_, Shared>,
+    path: String,
+    nodes: Vec<u32>,
+) -> Result<CsvExport, String> {
+    if nodes.is_empty() {
+        return Err("没有选中任何结果".into());
+    }
+    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    if st.scanning {
+        return Err("正在扫描：导出要基于稳定的索引树，扫完再导".into());
+    }
+    let l = st.loaded()?;
+    let remap = l.session.path_remap();
+    let (body, rows) = build_search_csv(l.tree(), &nodes, remap.as_ref());
+    if rows == 0 {
+        return Err("选中的结果在索引里已经找不到了（可能刚重扫过），请重新搜索".into());
+    }
+    let target = crate::analyze::export_target(&path, "search", "csv")?;
+    crate::analyze::write_text_file(&target, &body)?;
+    Ok(CsvExport { path: target, rows })
+}
+
+// ── 敏感文件盘点（E5）──────────────────────────────────────────────────────
 /// 一行命中。
 #[derive(Debug, Clone, Serialize)]
 pub struct SensitiveRow {
@@ -1529,6 +1598,72 @@ mod tests {
         assert!(find_directory(&s, &root.join("sub/file.txt").to_string_lossy()).is_none());
         assert!(find_directory(&s, r"Z:\outside").is_none());
         assert_eq!(find_directory(&s, &(root.join("sub").to_string_lossy().replace('\\', "/").to_uppercase() + "/")), Some(sub));
+    }
+
+    /// 批量导出的 CSV：列名、行数、时间口径、以及"取不到的节点要跳过"。
+    ///
+    /// 时间那一列是**本地时间文本**（19 字符）而不是 Unix 秒 —— 屏幕上是
+    /// `2026-10-21 21:30:00`、CSV 里却是 `1792000000`，是最容易被读错的一种错。
+    #[test]
+    fn search_csv_rows_match_the_index() {
+        let owned = core_io::test_dir::TestDir::new("gui-search-csv").unwrap();
+        let root = owned.path().to_path_buf();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("a.txt"), b"hello").unwrap();
+        let mut cfg = SessionConfig {
+            scan_root: Some(root.clone()),
+            force_traverse: true,
+            allow_traverse_watch: false,
+            ..Default::default()
+        };
+        cfg.engine.write_changelog = false;
+        let s = Session::open(cfg, |_, _, _| {}).unwrap();
+
+        let mut file_node = None;
+        for i in 0..s.tree.arena.len() as u32 {
+            if s.tree.node(i).is_some() && s.tree.name(i) == "a.txt" {
+                file_node = Some(i);
+            }
+        }
+        let file_node = file_node.expect("索引里应当有 a.txt");
+        let sub = find_directory(&s, &root.join("sub").to_string_lossy()).unwrap();
+        let remap = s.path_remap();
+
+        // 混一个不存在的节点：必须被跳过，而不是写一行空路径
+        let (body, rows) = build_search_csv(&s.tree, &[file_node, sub, 9_999_999], remap.as_ref());
+        assert_eq!(rows, 2, "两个真实节点，越界的那个要跳过");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "表头 + 两行");
+        assert_eq!(lines[0], "path,bytes,is_dir,mtime", "列名与 CLI 的 search --csv 一致");
+
+        let file_row: Vec<&str> = lines[1].split(',').collect();
+        assert_eq!(file_row.len(), 4, "四列：{file_row:?}");
+        assert!(file_row[0].ends_with("a.txt"), "路径要过 remap：{}", file_row[0]);
+        assert_eq!(file_row[1], "5", "字节数取索引里的值");
+        assert_eq!(file_row[2], "false");
+        assert_eq!(file_row[3].len(), 19, "本地时间文本（不是 Unix 秒）：{}", file_row[3]);
+        assert_eq!(&file_row[3][4..5], "-");
+
+        let dir_row: Vec<&str> = lines[2].split(',').collect();
+        assert_eq!(dir_row[2], "true", "目录要标出来");
+    }
+
+    /// 一条都没取到时 `rows == 0`：命令层据此报"请重新搜索"，
+    /// 而不是写一个只有表头的空文件。
+    #[test]
+    fn search_csv_without_live_nodes_is_empty() {
+        let owned = core_io::test_dir::TestDir::new("gui-search-csv-empty").unwrap();
+        let mut cfg = SessionConfig {
+            scan_root: Some(owned.path().to_path_buf()),
+            force_traverse: true,
+            allow_traverse_watch: false,
+            ..Default::default()
+        };
+        cfg.engine.write_changelog = false;
+        let s = Session::open(cfg, |_, _, _| {}).unwrap();
+        let (body, rows) = build_search_csv(&s.tree, &[9_999_999], None);
+        assert_eq!(rows, 0);
+        assert_eq!(body, "path,bytes,is_dir,mtime\n");
     }
 
     /// 参数映射：这些「字符串 → 枚举」的翻译只有一处，错了界面就会用错口径

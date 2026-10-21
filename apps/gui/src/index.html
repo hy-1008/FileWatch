@@ -434,6 +434,20 @@
           <span id="search-summary" class="hint">在已扫描的索引里搜，不重新遍历磁盘。
             双击结果可前往它所在的目录，右键还有更多操作。</span>
         </div>
+        <!-- 批量动作（v0.1.8）。勾选才出现 —— 没有选择时留一条空工具条
+             只是白占高度。路径与时间由**后端**从索引树取，前端只交出勾了哪几个。 -->
+        <div id="search-bulk" class="tool thin hidden">
+          <span id="search-bulk-count" class="hint">已选 0 条</span>
+          <button id="search-copy" class="mini" type="button"
+                  title="把选中项的完整路径按行复制到剪贴板">复制路径</button>
+          <label class="f grow"><span>导出 CSV</span>
+            <input id="search-csv" class="path" type="text" autocomplete="off"
+                   placeholder="留空 = 桌面默认名"
+                   title="给目录就用默认文件名，给完整路径就按它写">
+          </label>
+          <button id="search-export" class="mini" type="button">导出选中</button>
+          <button id="search-clear" class="mini" type="button">清空选择</button>
+        </div>
         <div id="search-list" class="list"></div>
         <div id="content-list" class="list"></div>
       </div>

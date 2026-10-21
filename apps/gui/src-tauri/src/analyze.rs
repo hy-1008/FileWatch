@@ -409,7 +409,7 @@ fn stamp_name(stem: &str, ext: &str) -> String {
 ///
 /// 判定：以分隔符结尾 → 目录；磁盘上确实是目录 → 目录；否则 → 文件
 /// （还没创建的不存在的路径一律当文件，这样手填文件名照旧可用）。
-fn export_target(path: &str, stem: &str, ext: &str) -> Result<String, String> {
+pub(crate) fn export_target(path: &str, stem: &str, ext: &str) -> Result<String, String> {
     let t = path.trim();
     if t.is_empty() {
         return Err("请填写导出路径".into());
@@ -421,7 +421,7 @@ fn export_target(path: &str, stem: &str, ext: &str) -> Result<String, String> {
     Ok(p)
 }
 
-fn write_text_file(path: &str, body: &str) -> Result<(), String> {
+pub(crate) fn write_text_file(path: &str, body: &str) -> Result<(), String> {
     let path = std::path::PathBuf::from(path.trim().replace('/', "\\"));
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
@@ -465,7 +465,11 @@ pub fn analyze_default_path(kind: String) -> Result<String, String> {
         "snapshot" => ("snapshot", "tsv"),
         "duplicates" => ("duplicates", "csv"),
         "diff" => ("diff", "csv"),
-        other => return Err(format!("未知的导出类型「{other}」（只认 snapshot / duplicates / diff）")),
+        // 批量动作导出的搜索结果（v0.1.8）
+        "search" => ("search", "csv"),
+        other => return Err(format!(
+            "未知的导出类型「{other}」（只认 snapshot / duplicates / diff / search）"
+        )),
     };
     let dir = crate::monitor::monitor_default_export_dir();
     Ok(format!(

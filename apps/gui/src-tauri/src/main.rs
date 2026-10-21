@@ -116,6 +116,8 @@ fn main() {
             commands::top_files,
             // F13 文件搜索（在内存索引里搜，不碰磁盘）
             commands::search_nodes,
+            // 批量动作：把选中的搜索结果导成 CSV（列与 CLI 的 search --csv 一致）
+            commands::search_export_csv,
             // F13 内容搜索（后台线程 + content:progress / content:done / content:error）
             search::content_search_start,
             search::content_search_status,

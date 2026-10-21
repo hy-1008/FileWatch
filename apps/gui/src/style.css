@@ -747,10 +747,14 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
 /* 搜索结果：类型 / 文件名 / 大小 / 修改时间 / 所在目录（五列，比差异行少一列） */
 .shead, .srow {
   display: grid;
-  grid-template-columns: 60px minmax(140px, 1.6fr) 92px 108px minmax(100px, 1.2fr);
+  /* 第一列是勾选框（批量动作）：宽度固定 18px，比任何数字列都窄，
+     所以它不吃掉文件名那列的空间。 */
+  grid-template-columns: 18px 60px minmax(140px, 1.6fr) 92px 108px minmax(100px, 1.2fr);
   gap: 10px; align-items: center; padding: 0 10px; white-space: nowrap;
-  min-width: 620px;
+  min-width: 640px;
 }
+.shead .c, .srow .c { display: flex; align-items: center; justify-content: center; }
+.srow .c input { margin: 0; cursor: pointer; }
 .shead {
   position: sticky; top: 0; z-index: 1; height: 26px;
   color: var(--text-faint); font-size: 11px;

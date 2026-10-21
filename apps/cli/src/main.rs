@@ -40,9 +40,9 @@ use core_monitor::rules::Alert;
 use core_monitor::{PathRemap, Rule, RuleKind, TickOutcome};
 use std::path::{Path, PathBuf};
 use core_scan::{
-    collect_candidates, find_duplicates, groups_to_csv, rows_to_csv, signed_size, DiffOptions,
-    DiffOrder, DupOptions, DupProgress, DupReport, DupStage, FsSource, ScanBackend, ScanPhase,
-    Session, SessionConfig, Snapshot, SnapshotOptions,
+    collect_candidates, csv_field, find_duplicates, groups_to_csv, rows_to_csv, signed_size,
+    DiffOptions, DiffOrder, DupOptions, DupProgress, DupReport, DupStage, FsSource, ScanBackend,
+    ScanPhase, Session, SessionConfig, Snapshot, SnapshotOptions,
 };
 use core_usn::journal;
 use core_viz::{compute_layout, LayoutOptions, LodPolicy, Rect, ShadingMode};
@@ -117,7 +117,7 @@ fn print_help() {
   volumes                     列出本机所有卷、文件系统与可用后端
   probe <盘符>                读引导扇区 + $MFT 记录 0，逐字段对照 fsutil（M0 验收）
   journal <盘符> [选项]       查询 / 创建 / 删除 USN Journal
-  scan <盘符> [选项]          全量扫描并输出统计（M1 验收）
+  scan <盘符|目录> [选项]     全量扫描并输出统计（M1 验收）
   top <盘符> [选项]           恒定内存找最大的 N 个文件（不建树）
   monitor <路径> [选项]       实时监控 + 阈值预警（M2/M3 验收）
   dupes <盘符|目录> [选项]    查找内容相同的重复文件（F12）
@@ -223,6 +223,14 @@ rules 选项（E9，规则试算 —— 不触发任何提醒，只回答"会不
          top     恒定内存依赖 $MFT 直读 → 用 scan <目录> --top=N 代替
          journal USN Journal 是 NTFS 的 Windows 实现特性（Linux 用 inotify）
          probe   仍可用，但只能读块设备或磁盘镜像文件（块设备需要 root）
+
+位置参数怎么解释（Windows）：
+  只有 c / C: / C:\ 三种写法算"盘符" → 扫整卷（可能走 $MFT）。
+  其它一律当目录（相对路径按当前目录算），而且**必须存在**：
+      filewatch search crates --text=main      ← 只扫 crates 这一个目录
+      filewatch report . --out=r.html          ← 只扫当前目录
+  写错名字（既不是盘符也不是存在的目录）会直接报错退出 ——
+  绝不会悄悄退化成"扫整卷"（那是最坏的默认值：又慢又不像他要的）。
 
 示例：
   filewatch volumes
@@ -538,22 +546,12 @@ fn cmd_scan(a: &Args) -> i32 {
     // * Windows：盘符（子目录要用 `--root=`，整卷才可能走 $MFT）；
     // * Linux：**路径**（`scan /home/me/x` 就只扫那个目录）—— 没有盘符概念，
     //   硬套 Windows 语义会让用户为了扫一个目录还得再写一次 --root。
-    let (norm, positional_root) = if cfg!(windows) {
-        match core_io::normalize_drive(&target) {
-            Ok((d, _)) => (d, None),
-            Err(e) => {
-                eprintln!("盘符「{}」无效：{}", target, e);
-                return 2;
-            }
-        }
-    } else {
-        match split_target(&target) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{}", e);
-                return 2;
-            }
-        }
+    //
+    // 两种都收在 `resolve_scan_target` 里：`scan crates` 这种"给个目录名"的写法
+    // 不会被取首字母变成 `C:`（那会扫整卷）。
+    let (norm, positional_root) = match resolve_scan_target(&target) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
 
     // ── 先校验**全部**参数，再开始扫描 ──────────────────────────────────
@@ -1983,33 +1981,94 @@ fn print_attribution(attr: &core_scan::Attribution) {
 ///
 /// 返回 `Err(退出码)`：调用方直接 `return` 那个码。参数校验与 `scan` 走同一套
 /// （`build_scan_config`），所以 `--root` / `--force-traverse` / `--chunk` 的行为一致。
+/// 位置参数看起来像盘符吗（`c` / `C:` / `C:\` 三种，别的都不算）。
+///
+/// 这个判定必须发生在 [`core_io::normalize_drive`] **之前**：它是"取第一个字母"，
+/// 所以 `search crates` 会被读成 `C:` 然后开始遍历整个 C 盘 —— 用户以为自己只扫了
+/// 一个目录，实际在等 150 万条（本机实测）。
+fn looks_like_drive(s: &str) -> bool {
+    let b = s.trim().as_bytes();
+    match b.len() {
+        1 => b[0].is_ascii_alphabetic(),
+        2 => b[0].is_ascii_alphabetic() && b[1] == b':',
+        3 => b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'),
+        _ => false,
+    }
+}
+
+/// 位置参数 → (盘符, 可选的扫描根)。
+///
+/// Windows 上位置参数的传统约定是**盘符**，但"给一个目录"才是人的第一反应
+/// （`report C:\Users\me\proj`、`search crates`）。规则：
+///
+/// * 只有 `c` / `C:` / `C:\` 算盘符 → 整卷，才可能走 `$MFT`；
+/// * 其它一律当目录，**并且必须存在** —— 不存在就报错退出，绝不退化成"扫整卷"。
+///   静默扫整卷是最坏的默认值：又慢又不是他要的，而且看起来像成功了。
+/// * 相对路径按当前目录转成绝对，免得扫描根与显示路径一个相对一个绝对。
+///
+/// Linux 没有盘符概念，位置参数本身就是路径（[`split_target`]）。
+fn resolve_scan_target(target: &str) -> Result<(String, Option<std::path::PathBuf>), i32> {
+    if !cfg!(windows) {
+        return match split_target(target) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                eprintln!("{}", e);
+                Err(2)
+            }
+        };
+    }
+    // `c` 这种只有字母的写法先补上冒号：盘符就是盘符，不该因为少一个冒号
+    // 被当成"当前目录下叫 c 的文件夹"。
+    let t = target.trim();
+    let as_drive = if t.len() == 1 && t.as_bytes()[0].is_ascii_alphabetic() {
+        format!("{}:", t.to_ascii_uppercase())
+    } else {
+        t.to_string()
+    };
+    if looks_like_drive(&as_drive) {
+        return match split_target(&as_drive) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                eprintln!("{e}");
+                Err(2)
+            }
+        };
+    }
+    let abs = match std::path::absolute(t) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("「{}」无法解析为路径：{}", target, e);
+            return Err(2);
+        }
+    };
+    if !abs.is_dir() {
+        eprintln!(
+            "「{}」既不是盘符（应形如 C:），也不是存在的目录（解析为 {}）。",
+            target,
+            abs.display()
+        );
+        eprintln!("想扫当前目录写 `.`；想扫子目录写目录名或完整路径。");
+        return Err(2);
+    }
+    match abs.to_string_lossy().chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => Ok((format!("{}:", c.to_ascii_uppercase()), Some(abs))),
+        // UNC（`\\server\share`）没有盘符，按卷扫描走不通；降级路径是 --root=
+        _ => {
+            eprintln!("「{}」不在盘符路径上（网络路径请用 --root=）", target);
+            Err(2)
+        }
+    }
+}
+
 fn open_session_for(a: &Args) -> Result<(Session, String), i32> {
     let target = a
         .positional
         .first()
         .cloned()
         .unwrap_or_else(|| core_io::paths::DEFAULT_VOLUME.to_string());
-    // Windows 上位置参数按 `scan` 的约定是**盘符**（子目录要用 `--root=`）。
-    // 但直接把一个路径当位置参数是人的第一反应（`report C:\Users\me\proj`），
-    // 而 `normalize_drive` 只会取首字母 —— 于是"扫一个目录"变成"扫整卷"，
-    // 又慢又不是他要的。这里把含分隔符的位置参数直接当扫描根。
-    let path_like = target.contains('\\') || target.contains('/');
-    let (norm, positional_root) = if cfg!(windows) {
-        match core_io::normalize_drive(&target) {
-            Ok((d, _)) => (d, None),
-            Err(e) => {
-                eprintln!("盘符「{}」无效：{}", target, e);
-                return Err(2);
-            }
-        }
-    } else {
-        match split_target(&target) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{}", e);
-                return Err(2);
-            }
-        }
+    let (norm, positional_root) = match resolve_scan_target(&target) {
+        Ok(v) => v,
+        Err(code) => return Err(code),
     };
     let mut cfg = match build_scan_config(a, &norm, false) {
         Ok(c) => c,
@@ -2018,12 +2077,9 @@ fn open_session_for(a: &Args) -> Result<(Session, String), i32> {
             return Err(2);
         }
     };
+    // 位置参数指到目录时，它就是扫描根（`--root=` 仍然优先）
     if cfg.scan_root.is_none() {
-        cfg.scan_root = if cfg!(windows) && path_like {
-            Some(std::path::PathBuf::from(&target))
-        } else {
-            positional_root
-        };
+        cfg.scan_root = positional_root;
     }
     match Session::open(cfg, progress_to_stderr) {
         Ok(s) => Ok((s, norm)),
@@ -2220,13 +2276,6 @@ fn filter_summary(f: &core_index::SearchFilters) -> String {
 
 /// CSV 字段转义：带逗号 / 引号 / 换行的路径必须包起来，双引号翻倍。
 /// 各命令各写一份的话迟早有一份漏掉换行，所以放在这一处。
-fn csv_field(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
-}
 
 /// 把命中路径过一遍 remap（与 GUI/Top-N 同一规则），返回 (路径, 是否换过)。
 fn remapped(session: &Session, raw: String) -> String {
@@ -2900,9 +2949,43 @@ mod tests {
         );
     }
 
+    /// 位置参数到底是盘符还是目录 —— 这是「扫整卷」与「扫一个目录」的分水岭。
+    ///
+    /// 真正的 bug 就出在这里：`search crates` 被 `normalize_drive` 取首字母变成
+    /// `C:`，然后开始遍历整个 C 盘（本机实测 150 万条）。所以 `looks_like_drive`
+    /// 只认三种写法，别的都必须走目录那条路。
     #[test]
-    fn layout_spec_parses_and_validates() {
-        assert_eq!(parse_layout_spec("100x30").unwrap(), (100, 30));
+    fn only_three_spellings_count_as_a_drive() {
+        for yes in ["c", "C", "c:", "C:", "d:\\", "D:/"] {
+            assert!(looks_like_drive(yes), "{yes} 应当被认成盘符");
+        }
+        for no in ["crates", "projects", ".", "..", "C:\\Users", "no-drive-here", ""] {
+            assert!(!looks_like_drive(no), "{no} 不该被认成盘符（否则会扫整卷）");
+        }
+    }
+
+    /// 目录那一路：存在的相对目录 → 扫描根 = 它的**绝对**路径；
+    /// 不存在的 → 报错退出，**绝不**退化成"扫整卷"。
+    #[test]
+    #[cfg(windows)]
+    fn directory_positional_becomes_scan_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let (drive, root) = resolve_scan_target(".").expect("`.` 必须被当成当前目录");
+        assert_eq!(root.as_deref(), Some(cwd.as_path()), "相对路径要转成绝对");
+        let want = format!("{}:", cwd.to_string_lossy().chars().next().unwrap().to_ascii_uppercase());
+        assert_eq!(drive, want);
+
+        // 盘符仍然走"整卷"那条路
+        assert_eq!(resolve_scan_target("C:").unwrap(), ("C:".to_string(), None));
+        assert_eq!(resolve_scan_target("c").unwrap(), ("C:".to_string(), None), "少个冒号也是盘符");
+        assert_eq!(resolve_scan_target("D:\\").unwrap(), ("D:".to_string(), None), "带尾杠仍是整卷");
+
+        // 不存在 → 参数错误（码 2），不是"扫整卷"
+        assert_eq!(resolve_scan_target("no-such-dir-xyzzy").unwrap_err(), 2);
+    }
+
+    #[test]
+    fn layout_spec_parses_and_validates() {        assert_eq!(parse_layout_spec("100x30").unwrap(), (100, 30));
         assert_eq!(parse_layout_spec("120X40").unwrap(), (120, 40));
         assert!(parse_layout_spec("100").is_err());
         assert!(parse_layout_spec("10x4").is_err());

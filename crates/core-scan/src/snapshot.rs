@@ -747,7 +747,7 @@ pub fn rows_to_csv(rows: &[DiffRow]) -> String {
     out
 }
 
-fn csv_field(s: &str) -> String {
+pub fn csv_field(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
