@@ -46,6 +46,8 @@ DUP_CSV = os.path.join(TMP, "duplicates.csv")
 DIFF_CSV = os.path.join(TMP, "diff.csv")
 SEARCH_CSV = os.path.join(TMP, "search.csv")
 CONTENT_CSV = os.path.join(TMP, "content.csv")
+SNAP3 = os.path.join(TMP, "snapshot-3.tsv")
+BAD_SNAP = os.path.join(TMP, "bad-snapshot.tsv")
 
 fails = []
 passes = [0]
@@ -267,6 +269,63 @@ def check_search_content_rules():
     ok(rc == 2 and "昨天" in err, "看不懂的时间写法报错退出（码 2）")
 
 
+def _rows(text):
+    """去掉「用时 N ms」那类每次都不同的行，剩下的才该逐字相同。"""
+    return [l for l in text.splitlines() if l.strip() and "用时" not in l]
+
+
+def check_from_snapshot():
+    """E9 的 `--from-snapshot`：同一份数据，两条路必须给出同一份答案。
+
+    这是「扫一次、查多次」的全部价值所在 —— 如果快照读出来的结果和实扫
+    不一样，那它只是把错误提速了。
+    """
+    print("\n⑤ --from-snapshot（E9 快照复用）")
+    rc, out, err = run("snapshot", TREE, "--out=" + SNAP3)
+    ok(rc == 0, "建立快照%s" % why(rc, err))
+    if rc != 0:
+        return
+
+    # 快照里记的根必须是**绝对路径**：相对路径会让 --from-snapshot 认不出卷
+    head = open(SNAP3, encoding="utf-8").read().splitlines()[:3]
+    root_line = [l for l in head if l.startswith("#root\t")]
+    ok(bool(root_line) and os.path.isabs(root_line[0].split("\t", 1)[1]),
+       "快照的 #root 是绝对路径：%s" % (root_line[0].split("\t", 1)[1] if root_line else "(缺失)"))
+
+    rc1, live, _ = run("search", TREE, "--text=bin")
+    rc2, snap, err2 = run("search", TREE, "--text=bin", "--from-snapshot=" + SNAP3)
+    ok(rc1 == 0 and rc2 == 0, "search 两条路都退出 0%s" % why(rc2, err2))
+    if rc1 == 0 and rc2 == 0:
+        ok(_rows(live) == _rows(snap), "search 的结果与实扫逐行相同")
+
+    rc1, live, _ = run("content", TREE, "--text=NEEDLE-Q7")
+    rc2, snap, err2 = run("content", TREE, "--text=NEEDLE-Q7", "--from-snapshot=" + SNAP3)
+    ok(rc1 == 0 and rc2 == 0, "content 两条路都退出 0%s" % why(rc2, err2))
+    if rc1 == 0 and rc2 == 0:
+        ok("命中 1 个文件" in snap, "content 从快照也能读到内容（路径是真实的）")
+
+    # rules 的样本必须是**快照根 + 它的一级子目录**，不是卷根 —— 拿卷根当样本
+    # 会变成 `C:\Users` 与 `C:\`，结论完全不同。
+    rc1, live, _ = run("rules", TREE, "--rule=abs=100K")
+    rc2, snap, err2 = run("rules", TREE, "--rule=abs=100K", "--from-snapshot=" + SNAP3)
+    ok(rc1 == 0 and rc2 == 0, "rules 两条路都退出 0%s" % why(rc2, err2))
+    if rc1 == 0 and rc2 == 0:
+        def trig(t):
+            m = re.search(r"结论：(\d+) 条会触发", t)
+            return m.group(1) if m else None
+        # 只比"会触发"的条数：快照只记文件，**空目录不会出现在重建的树里**，
+        # 所以样本总数可以比实扫少（这里树里就有一个空目录 B）。
+        ok(trig(live) is not None and trig(live) == trig(snap),
+           "rules 触发条数与实扫相同（%s）" % trig(snap))
+        ok(os.path.basename(TREE) in snap, "rules 的样本落在扫描根下，不是卷根")
+
+    # 坏快照必须报错，不能安静地给一棵空树
+    with open(BAD_SNAP, "w", encoding="utf-8") as f:
+        f.write("这不是快照\n")
+    rc, out, err = run("search", TREE, "--text=bin", "--from-snapshot=" + BAD_SNAP)
+    ok(rc != 0 and "快照" in err, "坏快照报错退出（码 %d）" % rc)
+
+
 def main():
     print("=" * 72)
     print("真实目录端到端对拍（F11 / F12 / E9）")
@@ -282,6 +341,7 @@ def main():
     check_snapshot()
     check_diff()
     check_search_content_rules()
+    check_from_snapshot()
 
     print("\n" + "=" * 72)
     if fails:

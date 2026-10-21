@@ -279,6 +279,12 @@ search / content 的条件语法（界面与 CLI 同一套）：
   扩展名 --exts=mp4,mkv                   （大小写随意，带不带点都行）
   看不懂的写法当场报错退出，不会静默当成「不设这个条件」。
 
+扫一次、查多次：search / content / rules 都支持 --from-snapshot=快照.tsv
+  先 cli\\filewatch.exe snapshot D:\\data --out=s.tsv 扫一次，
+  之后查询加 --from-snapshot=s.tsv 就跳过扫描（毫秒级出结果）。
+  快照只记 路径/体积/修改时间，所以空目录不会出现、占用大小按逻辑大小算；
+  路径与体积和实扫逐行一致。
+
 位置参数怎么解释：只有 c / C: / C:\\ 三种写法算「盘符」→ 扫整卷；
 其它一律当目录（相对路径按当前目录算），而且必须存在：
   cli\\filewatch.exe search crates --text=main   只扫 crates 这一个目录

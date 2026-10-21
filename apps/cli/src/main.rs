@@ -215,6 +215,18 @@ rules 选项（E9，规则试算 —— 不触发任何提醒，只回答"会不
   --rule=rate=10M/60s    速率阈值：没有时间跨度时如实标"判断不了"
   --top=N                拿最大的 N 个一级子目录当样本（默认 20，含根）
 
+search / content / rules 的公共选项：
+  --from-snapshot=FILE   从快照读树，**跳过扫描**：
+                           filewatch snapshot D:\data --out=s.tsv     ← 扫一次（几分钟）
+                           filewatch search D:\data --text=mp4 --from-snapshot=s.tsv
+                           filewatch content D:\data --text=TODO --from-snapshot=s.tsv
+                           filewatch rules D:\data --rule=abs=1G --from-snapshot=s.tsv
+                         快照只记 路径/体积/修改时间，所以重建出来的树：
+                           * 路径与体积和实扫**逐行一致**（e2e 有对拍）；
+                           * 没有"占用大小"，按逻辑大小算（稀疏/压缩文件会偏大）；
+                           * **空目录不出现**（快照只记文件）。
+                         给了这个参数时位置参数不参与扫描，只用于显示。
+
 平台差异：
   Linux：scan / monitor / dupes / snapshot 直接接受绝对路径：
          filewatch scan /home/me/projects
@@ -1477,12 +1489,10 @@ fn cmd_dupes(a: &Args) -> i32 {
             return 2;
         }
     };
-    let (drive, scan_root) = match split_target(&raw) {
+    // 与 search / report 同一套判定：`c` / `C:` / `C:\` 才算盘符，其它当目录
+    let (drive, scan_root) = match resolve_scan_target(&raw) {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", e);
-            return 2;
-        }
+        Err(code) => return code,
     };
     let opts = match dup_options(a) {
         Ok(o) => o,
@@ -1701,12 +1711,10 @@ fn cmd_snapshot(a: &Args) -> i32 {
             return 2;
         }
     };
-    let (drive, scan_root) = match split_target(&raw) {
+    // 与 search / report 同一套判定：`c` / `C:` / `C:\` 才算盘符，其它当目录
+    let (drive, scan_root) = match resolve_scan_target(&raw) {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", e);
-            return 2;
-        }
+        Err(code) => return code,
     };
     let created = unix_secs();
     let out: std::path::PathBuf = match a.get("out") {
@@ -1755,7 +1763,15 @@ fn cmd_snapshot(a: &Args) -> i32 {
         println!("· {}", w);
     }
     let remap = session.path_remap();
-    let display_root = cli_path(&raw);
+    // 快照里记的根必须是**扫描根的真实路径**，不是用户敲的那串字：
+    // 以前记的是 `crates`（相对路径），于是 `--from-snapshot` 从里面认不出卷，
+    // 而且拿去和别人给的快照对比时根也对不上。
+    let display_root = session
+        .cfg
+        .scan_root
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| drive.clone());
     let snap = Snapshot::capture(&session.tree, remap.as_ref(), &display_root, created, &snap_opts);
     match snap.save(&out) {
         Ok(_) => {}
@@ -2060,6 +2076,92 @@ fn resolve_scan_target(target: &str) -> Result<(String, Option<std::path::PathBu
     }
 }
 
+/// 一次查询的**数据来源**：现扫一棵树，或者从快照重建一棵（`--from-snapshot`）。
+///
+/// `search` / `content` / `rules` 需要的都只是"一棵能查的树"，差别只在树从哪来。
+/// 抽成一个类型是为了让「快照模式不做 `PathRemap`」这条规矩只有一处 ——
+/// 快照里的路径本来就是绝对路径，再换一次会把根拼两遍。
+enum QuerySource {
+    Live(Box<Session>),
+    Snapshot {
+        tree: Box<core_index::Tree>,
+        /// 快照根在树里的下标。重建的树以**卷根**为根，而 `rules` 的样本是
+        /// "扫描根 + 它的一级子目录" —— 拿卷根当样本会得出完全不同的结论。
+        root: u32,
+    },
+}
+
+impl QuerySource {
+    fn tree(&self) -> &core_index::Tree {
+        match self {
+            QuerySource::Live(s) => &s.tree,
+            QuerySource::Snapshot { tree, .. } => tree,
+        }
+    }
+    /// 快照模式返回 `None`：路径已经是真实的，不需要（也不能）再换
+    fn remap(&self) -> Option<core_monitor::PathRemap> {
+        match self {
+            QuerySource::Live(s) => s.path_remap(),
+            QuerySource::Snapshot { .. } => None,
+        }
+    }
+    /// 目录聚合的起点：现扫是树根，快照是快照记的那个根
+    fn root(&self) -> u32 {
+        match self {
+            QuerySource::Live(s) => s.tree.root,
+            QuerySource::Snapshot { root, .. } => *root,
+        }
+    }
+}
+
+/// 有 `--from-snapshot=` 就读快照（毫秒级），否则照旧现扫一遍。
+///
+/// 这条选项存在的理由很实际：大卷扫一次要几分钟，而"再问一个问题"不该
+/// 再等几分钟。快照里已经有 `path / size / mtime`，足够重建一棵能做名字搜索、
+/// 内容候选、规则试算的树。
+fn open_query_source(a: &Args) -> Result<QuerySource, i32> {
+    let p = match a.get("from-snapshot") {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return open_session_for(a).map(|(s, _)| QuerySource::Live(Box::new(s))),
+    };
+    let path = std::path::PathBuf::from(cli_path(p));
+    let snap = match Snapshot::load(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("读快照失败：{e}");
+            return Err(1);
+        }
+    };
+    // 卷键从快照自己的根推：Windows 是盘符，Linux 是挂载点
+    let (drive, _) = match split_target(&snap.root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("快照的根「{}」认不出卷：{}", snap.root, e);
+            return Err(2);
+        }
+    };
+    let (tree, root) = match core_scan::tree_from_snapshot(&snap, &drive) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(1);
+        }
+    };
+    eprintln!(
+        "从快照读取 {} 个条目（根 {}，建立于 {}）—— **不扫描磁盘**",
+        snap.entries.len(),
+        snap.root,
+        fmt_local_time(snap.created_unix)
+    );
+    if snap.truncated > 0 {
+        eprintln!(
+            "注意：这份快照当时就有 {} 个文件没记进来，结果会比真实情况少",
+            snap.truncated
+        );
+    }
+    Ok(QuerySource::Snapshot { tree: Box::new(tree), root })
+}
+
 fn open_session_for(a: &Args) -> Result<(Session, String), i32> {
     let target = a
         .positional
@@ -2274,21 +2376,11 @@ fn filter_summary(f: &core_index::SearchFilters) -> String {
     }
 }
 
-/// CSV 字段转义：带逗号 / 引号 / 换行的路径必须包起来，双引号翻倍。
-/// 各命令各写一份的话迟早有一份漏掉换行，所以放在这一处。
-
-/// 把命中路径过一遍 remap（与 GUI/Top-N 同一规则），返回 (路径, 是否换过)。
-fn remapped(session: &Session, raw: String) -> String {
-    match path_remap_of(&session.cfg).as_ref() {
-        Some(r) => r.apply(&raw),
-        None => raw,
-    }
-}
-
 /// `search` —— 在已扫出的索引里按文件名搜（E9）。
 ///
-/// 先扫描再搜是刻意的：CLI 的运行模型就是"一次一条命令"，与 GUI 的
-/// "常驻进程搜内存"不同。扫描本身占大头时间，搜索本身只有几十毫秒。
+/// 默认先扫一遍再搜：CLI 的运行模型就是"一次一条命令"，与 GUI 的
+/// "常驻进程搜内存"不同。扫描本身占大头时间，搜索只有几十毫秒 ——
+/// 所以大卷上反复查的时候用 `--from-snapshot=` 跳过扫描。
 fn cmd_search(a: &Args) -> i32 {
     let text = match a.get("text") {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
@@ -2313,14 +2405,14 @@ fn cmd_search(a: &Args) -> i32 {
             return 2;
         }
     };
-    let (session, _norm) = match open_session_for(a) {
+    let src = match open_query_source(a) {
         Ok(v) => v,
         Err(code) => return code,
     };
     eprintln!();
     let t0 = Instant::now();
     let out = match core_index::search_filtered(
-        &session.tree,
+        src.tree(),
         &core_index::Query { text: &text, mode, scope, limit },
         &filters,
     ) {
@@ -2370,8 +2462,14 @@ fn cmd_search(a: &Args) -> i32 {
     if let Some(f) = csv.as_mut() {
         writeln!(f, "path,bytes,is_dir,mtime").ok();
     }
+    // 只算一次 remap：每次 `apply` 都要重算前缀，放在循环里是白算
+    let remap = src.remap();
     for h in &out.hits {
-        let path = remapped(&session, h.path.clone());
+        // 快照模式下 remap 是 None —— 重建出来的路径本来就是绝对路径
+        let path = match remap.as_ref() {
+            Some(r) => r.apply(&h.path),
+            None => h.path.clone(),
+        };
         println!(
             "[{}] {:>10}  {}  {}",
             if h.is_dir { "目录" } else { "文件" },
@@ -2442,7 +2540,7 @@ fn cmd_content(a: &Args) -> i32 {
             return 2;
         }
     };
-    let (session, _norm) = match open_session_for(a) {
+    let src = match open_query_source(a) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -2450,14 +2548,14 @@ fn cmd_content(a: &Args) -> i32 {
     let t0 = Instant::now();
     // 挑候选：与界面同一套判定（含附加条件），超出 limit-files 就停
     let mut candidates: Vec<(u32, u64, i64)> = Vec::new();
-    for (i, node) in session.tree.arena.nodes.iter().enumerate() {
+    for (i, node) in src.tree().arena.nodes.iter().enumerate() {
         if candidates.len() >= limit_files {
             break;
         }
         if !node.in_use() || !node.is_file() || node.size > content::MAX_FILE_BYTES {
             continue;
         }
-        let name = session.tree.name(i as u32);
+        let name = src.tree().name(i as u32);
         if !content::is_text_name(name) || !filters.accepts(name, node.size, node.mtime) {
             continue;
         }
@@ -2489,13 +2587,13 @@ fn cmd_content(a: &Args) -> i32 {
     if csv.is_some() {
         writeln!(csv.as_mut().unwrap(), "path,bytes,mtime,line_no,text").ok();
     }
-    let remap = path_remap_of(&session.cfg);
+    let remap = src.remap();
     for (node, size, mtime) in candidates {
         if hits >= max_hits {
             truncated = true;
             break;
         }
-        let raw = session.tree.path_of(node);
+        let raw = src.tree().path_of(node);
         let path = match remap.as_ref() {
             Some(r) => r.apply(&raw),
             None => raw,
@@ -2570,27 +2668,28 @@ fn cmd_rules(a: &Args) -> i32 {
             return 2;
         }
     };
-    let (session, _norm) = match open_session_for(a) {
+    let src = match open_query_source(a) {
         Ok(v) => v,
         Err(code) => return code,
     };
     eprintln!();
-    let remap = path_remap_of(&session.cfg);
-    let root = session.tree.root;
+    let tree = src.tree();
+    let remap = src.remap();
+    let root = src.root();
     // 样本：根 + 一级子目录按体积降序取前 N 个
-    let index = core_index::tree::ChildIndex::build(&session.tree);
+    let index = core_index::tree::ChildIndex::build(tree);
     let kids = core_index::aggregate::sorted_children(
-        &session.tree,
+        tree,
         index.children(root),
         core_index::aggregate::SizeMode::Logical,
     );
     let mut samples: Vec<core_monitor::Sample> = Vec::new();
     for &i in kids.iter().take(top) {
-        let node = match session.tree.arena.get(i) {
+        let node = match tree.arena.get(i) {
             Some(n) if n.is_dir() => n,
             _ => continue,
         };
-        let raw = session.tree.path_of(i);
+        let raw = tree.path_of(i);
         let path = match remap.as_ref() {
             Some(r) => r.apply(&raw),
             None => raw,
@@ -2598,12 +2697,12 @@ fn cmd_rules(a: &Args) -> i32 {
         samples.push(core_monitor::Sample::instant(path, node.size));
     }
     {
-        let raw = session.tree.path_of(root);
+        let raw = tree.path_of(root);
         let path = match remap.as_ref() {
             Some(r) => r.apply(&raw),
             None => raw,
         };
-        let size = session.tree.arena.get(root).map(|n| n.size).unwrap_or(0);
+        let size = tree.arena.get(root).map(|n| n.size).unwrap_or(0);
         samples.push(core_monitor::Sample::instant(path, size));
     }
     let verdicts = core_monitor::simulate(&rules, &samples);

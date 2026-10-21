@@ -809,6 +809,150 @@ pub fn unescape(s: &str) -> String {
     out
 }
 
+/// 从快照重建一棵可查询的索引树（`--from-snapshot`）。
+///
+/// 快照只记 `路径 / 体积 / 修改时间`，**没有父子关系**，所以这里按路径分量重新
+/// 搭一棵树：目录节点的体积交给 [`core_index::aggregate::aggregate`] 聚合，
+/// 与真实扫描出来的是同一个口径。
+///
+/// 重建出来的树**以盘符（卷键）为根**，不是以 `snapshot.root` 为根：快照里的
+/// 路径本来就是绝对路径，按卷根挂回去之后 `Tree::path_of` 拼出来的就是原路径，
+/// 调用方**不需要**再走一次 `PathRemap`（再换一次会拼错）。
+///
+/// 两个已知取舍（都要在输出里说，不能假装一样）：
+///
+/// * 快照不存 `alloc`（占用大小），这里按逻辑大小填 —— 稀疏/压缩文件的"占用"
+///   在快照模式下与真实扫描有差异；
+/// * 快照只记文件，**空目录不会出现**在重建结果里（真实扫描看得见它们）。
+///
+/// 返回 `(树, 快照根的节点下标)`。第二个值不能省：重建出来的树以**卷根**为根，
+/// 而"扫描根"可能深好几层（`C://projects//a`）。`rules` 的样本是"扫描根 + 它的一级
+/// 子目录"，拿卷根当样本会得出完全不同的结论（实测：变成 `C://Users` 与 `C://`）。
+pub fn tree_from_snapshot(snap: &Snapshot, drive: &str) -> Result<(Tree, u32), String> {
+    use core_index::arena::{Node, NODE_DIR, NODE_IN_USE};
+    use std::collections::HashMap;
+
+    const ROOT: u32 = 5;
+    let prefix = core_io::paths::root_prefix(drive);
+    let mut tree = Tree::new(drive, snap.entries.len().saturating_mul(2).max(64));
+    tree.arena.ensure(ROOT);
+    tree.dir_file_counts.resize(ROOT as usize + 1, 0);
+    {
+        let off = tree.names.intern_str(".");
+        tree.arena.nodes[ROOT as usize] = Node {
+            parent: ROOT,
+            seq: 0,
+            flags: NODE_IN_USE | NODE_DIR,
+            size: 0,
+            alloc: 0,
+            mtime: 0,
+            name: off,
+        };
+    }
+    tree.root = ROOT;
+
+    // 快照根在树里对应的键（`/users/hy/proj` 这种小写形式）
+    let root_key = {
+        let rel = core_io::paths::strip_root_prefix(&snap.root, &prefix).unwrap_or("");
+        let mut k = String::new();
+        for p in rel.split(['\\', '/']).filter(|s| !s.is_empty()) {
+            k.push('/');
+            k.push_str(&p.to_lowercase());
+        }
+        k
+    };
+    let mut sample_root: u32 = ROOT;
+
+    let mut next: u32 = ROOT + 1;
+    // 键 = 小写相对路径（`/a/b`）。NTFS 大小写不敏感，两行 `C:\A\x` 与 `C:\a\y`
+    // 必须挂到同一个目录节点上，否则目录会被拆成两份、体积各算一半。
+    let mut dirs: HashMap<String, u32> = HashMap::new();
+    let mut files = 0u64;
+
+    for e in &snap.entries {
+        // 快照里的路径是绝对路径；剥掉卷根就是相对部分。
+        // `strip_root_prefix` 容忍分隔符混用（`C:/a` 与 `C:\a` 是同一条）。
+        let rel = match core_io::paths::strip_root_prefix(&e.path, &prefix) {
+            Some(r) => r,
+            // 不在这个卷下的行：快照被手工改过，或者卷键传错了。跳过而不是
+            // 挂到根上 —— 挂上去会凭空多出一堆"卷根下的怪目录"。
+            None => continue,
+        };
+        let parts: Vec<&str> = rel
+            .split(['\\', '/'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut parent = ROOT;
+        let mut acc = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            let last = i + 1 == parts.len();
+            acc.push('/');
+            acc.push_str(&part.to_lowercase());
+            if last {
+                if next == u32::MAX {
+                    break;
+                }
+                let idx = next;
+                next += 1;
+                tree.arena.ensure(idx);
+                if idx as usize >= tree.dir_file_counts.len() {
+                    tree.dir_file_counts.resize(idx as usize + 1, 0);
+                }
+                let off = tree.names.intern_str(part);
+                tree.arena.nodes[idx as usize] = Node {
+                    parent,
+                    seq: 0,
+                    flags: NODE_IN_USE,
+                    size: e.size,
+                    // 快照没有占用大小，按逻辑大小填（见文档）
+                    alloc: e.size,
+                    mtime: e.mtime,
+                    name: off,
+                };
+                files += 1;
+            } else {
+                parent = match dirs.get(&acc) {
+                    Some(&idx) => idx,
+                    None => {
+                        if next == u32::MAX {
+                            break;
+                        }
+                        let idx = next;
+                        next += 1;
+                        tree.arena.ensure(idx);
+                        if idx as usize >= tree.dir_file_counts.len() {
+                            tree.dir_file_counts.resize(idx as usize + 1, 0);
+                        }
+                        let off = tree.names.intern_str(part);
+                        tree.arena.nodes[idx as usize] = Node {
+                            parent,
+                            seq: 0,
+                            flags: NODE_IN_USE | NODE_DIR,
+                            size: 0,
+                            alloc: 0,
+                            mtime: 0,
+                            name: off,
+                        };
+                        if !root_key.is_empty() && acc == root_key {
+                            sample_root = idx;
+                        }
+                        dirs.insert(acc.clone(), idx);
+                        idx
+                    }
+                };
+            }
+        }
+    }
+
+    core_index::aggregate::aggregate(&mut tree);
+    tree.file_count = files;
+    Ok((tree, sample_root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,6 +975,62 @@ mod tests {
             entries,
             truncated: 0,
         }
+    }
+
+    // ── 快照 → 树（`--from-snapshot`）──────────────────────────────────────
+
+    /// 路径必须能原样拼回来，目录体积按子项聚合，大小写不同的同一目录要挂到一起。
+    #[test]
+    fn tree_from_snapshot_round_trips_paths() {
+        let s = snap(vec![
+            entry(r"C:\data\a\x.txt", 100, 111),
+            entry(r"C:\data\a\y.txt", 200, 222),
+            entry(r"C:\data\b.txt", 50, 333),
+            // 大小写不同 = NTFS 上的同一个目录：不能拆成两份，否则体积各算一半
+            entry(r"C:\DATA\A\z.txt", 7, 444),
+        ]);
+        let (t, sample_root) = tree_from_snapshot(&s, "C:").unwrap();
+        assert_eq!(t.file_count, 4);
+        assert_eq!(t.root, 5, "树以卷根为根");
+        assert!(t.path_of(sample_root).eq_ignore_ascii_case("C:\\"),
+                "快照根是卷根时，样本根就是卷根：{}", t.path_of(sample_root));
+
+        let paths: Vec<String> = (0..t.arena.len() as u32)
+            .filter(|&i| t.node(i).map(|n| n.is_file()).unwrap_or(false))
+            .map(|i| t.path_of(i))
+            .collect();
+        // 大小写以**先出现的写法**为准（NTFS 不敏感）：这里只断言路径能拼回来
+        assert!(paths.iter().any(|p| p.eq_ignore_ascii_case(r"C:\data\b.txt")), "{paths:?}");
+        assert_eq!(paths.len(), 4, "{paths:?}");
+
+        let dir_of = |want: &str| {
+            (0..t.arena.len() as u32).find(|&i| {
+                t.node(i).map(|n| n.is_dir()).unwrap_or(false)
+                    && t.path_of(i).eq_ignore_ascii_case(want)
+            })
+        };
+        let a = dir_of(r"C:\data\a").expect("应当有 data\\a 这个目录");
+        assert_eq!(t.node(a).unwrap().size, 307, "100 + 200 + 7");
+        let data = dir_of(r"C:\data").expect("应当有 data");
+        assert_eq!(t.node(data).unwrap().size, 357);
+        let roots = (0..t.arena.len() as u32)
+            .filter(|&i| {
+                t.node(i).map(|n| n.is_dir()).unwrap_or(false)
+                    && t.path_of(i).eq_ignore_ascii_case(r"C:\data\a")
+            })
+            .count();
+        assert_eq!(roots, 1, "大小写不同的同一目录只能有一个节点");
+    }
+
+    /// 不在这个卷下的行要**跳过**：挂到根上会凭空多出一堆"卷根下的怪目录"。
+    #[test]
+    fn tree_from_snapshot_skips_foreign_paths() {
+        let s = snap(vec![
+            entry(r"D:\other\x.txt", 10, 1),
+            entry(r"C:\ok\y.txt", 20, 2),
+        ]);
+        let (t, _) = tree_from_snapshot(&s, "C:").unwrap();
+        assert_eq!(t.file_count, 1, "D: 那行必须被跳过");
     }
 
     fn opts(f: impl FnOnce(&mut DiffOptions)) -> DiffOptions {

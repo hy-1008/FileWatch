@@ -477,7 +477,6 @@ filewatch content D:\src --text=TODO --exts=rs,ts --max-hits=50
 ```text
 filewatch rules D:\data --rule=abs=1G --rule=rate=10M/60s --top=20
 ```
-
 拿**现在的索引**算一遍这套规则会不会触发，**不发任何通知、不改任何状态**。
 样本 = 扫描根自身 + 最大的 N 个一级子目录（`--top=N`，默认 20）。
 
@@ -493,6 +492,29 @@ filewatch rules D:\data --rule=abs=1G --rule=rate=10M/60s --top=20
   只有 `abs` 能当场判。这跟界面「规则试算」里 `judgeable=false` 的处理一致：
   写「不会触发」会被读成"阈值设得很安全"。
 * 想看真的增长/速率，用 `monitor`（它才持有时间窗口）。
+
+### --from-snapshot：扫一次，查多次
+
+`search` / `content` / `rules` 默认都先扫一遍再查。大卷上扫一次要几分钟，
+而"再问一个问题"不该再等一遍 —— 给一个快照就够了：
+
+```powershell
+filewatch snapshot D:\data --out=s.tsv                                  # 扫一次
+filewatch search  D:\data --text=mp4 --min-size=100M --from-snapshot=s.tsv
+filewatch content D:\data --text=TODO --from-snapshot=s.tsv
+filewatch rules   D:\data --rule=abs=1G --from-snapshot=s.tsv
+```
+
+快照里只有 `路径 / 体积 / 修改时间`，所以重建出来的树有三条已知差异，输出里都写明了：
+
+| 项 | 实扫 | 从快照 |
+|---|---|---|
+| 路径与体积 | — | **逐行一致**（e2e 有对拍：`search` 两条路的结果必须完全相同） |
+| 占用大小 | 真实簇占用 | 按逻辑大小算（稀疏/压缩文件偏大） |
+| 空目录 | 看得见 | **不出现**（快照只记文件） |
+
+`rules` 的样本仍然是「快照记的那个根 + 它的一级子目录」，不是卷根 ——
+拿卷根当样本会得出完全不同的结论（实测会变成 `C:\Users` 与 `C:\`）。
 
 ---
 

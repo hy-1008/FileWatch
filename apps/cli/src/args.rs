@@ -57,6 +57,8 @@ const VALUE_KEYS: &[&str] = &[
     "max-size",
     "max-hits",
     "limit-files",
+    // E9：从快照读树，跳过扫描（search / content / rules）
+    "from-snapshot",
 ];
 
 #[derive(Debug, Default)]
