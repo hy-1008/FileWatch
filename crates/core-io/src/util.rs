@@ -165,6 +165,47 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// `(年, 月, 日)` → 「1970-01-01 起的天数」，[`civil_from_days`] 的逆运算。
+///
+/// 历史趋势要按**天**分组算增量：两条样本隔了几天，决定这次增量该摊到几天上。
+/// 只比较 `YYYY-MM-DD` 字符串做不到这一点（"差两天"看着和"差一天"一样）。
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Unix 秒 → **本地** 日序号（1970-01-01 起的天数）。
+///
+/// 这是"哪一天"的唯一口径：趋势曲线按它分组、基线按它算间隔。用 UTC 的
+/// `secs / 86400` 会在东八区把 0:00~8:00 的变化算进前一天 —— 那正是用户
+/// 深夜批量下载东西的时段。
+pub fn local_days(secs: i64) -> i64 {
+    let t = local_time(secs);
+    let b = t.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return secs.div_euclid(86_400);
+    }
+    let y = t[0..4].parse::<i64>().unwrap_or(1970);
+    let m = t[5..7].parse::<i64>().unwrap_or(1);
+    let d = t[8..10].parse::<i64>().unwrap_or(1);
+    days_from_civil(y, m, d)
+}
+
+/// Unix 秒 → **本地** `2026-10-14`。按日聚合时给人看的那一列。
+pub fn local_date(secs: i64) -> String {
+    let t = local_time(secs);
+    let b = t.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return "-".to_string();
+    }
+    t[..10].to_string()
+}
+
 /// Unix 秒 → `2026-10-14 13:15:00Z`。非正数（未设置/无意义）返回 `-`。
 pub fn unix_utc(secs: i64) -> String {
     if secs <= 0 {
@@ -451,5 +492,32 @@ mod local_time_tests {
         assert_eq!(&out[..8], format!("{}{}{}", &time[0..4], &time[5..7], &time[8..10]));
         assert_eq!(&out[9..], format!("{}{}{}", &time[11..13], &time[14..16], &time[17..19]));
         assert_eq!(local_stamp(0), "00000000-000000");
+    }
+
+    /// 两个方向的日期换算必须互为逆运算 —— 历史的"隔了几天"完全靠它，
+    /// 差一天就会把 3 天的增量摊成 2 天，基线因此整体偏低。
+    #[test]
+    fn civil_conversions_round_trip() {
+        for z in [-1_000i64, -1, 0, 1, 365, 20_000, 20_600] {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z, "z={z} → {y}-{m}-{d}");
+        }
+        // 已知锚点：1970-01-01 是第 0 天，2000-03-01 是第 11017 天
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+    }
+
+    /// `local_days` 必须与 `local_date` 同源：一个给人看、一个给算法用，
+    /// 两者对不上就说明有一处自己又在算日期了。
+    #[test]
+    fn local_days_agrees_with_local_date() {
+        let a = 1_760_000_000i64;
+        let b = a + 86_400;
+        let da = local_date(a);
+        let db = local_date(b);
+        assert_eq!(da.len(), 10, "{da}");
+        assert_eq!(local_days(b) - local_days(a), 1, "{da} → {db}");
+        let (y, m, d) = civil_from_days(local_days(a));
+        assert_eq!(format!("{y:04}-{m:02}-{d:02}"), da);
     }
 }

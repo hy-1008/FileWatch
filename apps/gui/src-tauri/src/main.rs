@@ -32,6 +32,7 @@ mod analyze;
 mod autostart;
 mod commands;
 mod elevate;
+mod history;
 mod monitor;
 mod independent;
 mod prefs;
@@ -124,6 +125,9 @@ fn main() {
             commands::rules_simulate,
             // E3 单文件离线 HTML 报告
             analyze::export_report,
+            // E6 目录历史（趋势 + 基线异常）：只读一个小文件，不扫描
+            history::history_view,
+            history::history_record,
             // 详情与定位
             commands::node_names,
             commands::node_detail,

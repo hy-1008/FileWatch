@@ -13,6 +13,7 @@
 //! | `monitor` | 实时增量 + 阈值预警 | M2 / M3 |
 //! | `dupes` | 重复文件三级去重（体积 → 部分哈希 → 全哈希）+ 逐字节复核 | F12 |
 //! | `snapshot` / `diff` | 快照落盘 与 「这一周谁变大了」 | F11 |
+//! | `history` | 目录级历史采样 + 基线异常 | E6 |
 //! | `selftest` | 免管理员的全链路自检 | 全部 |
 //!
 //! ## 设计约束
@@ -37,6 +38,7 @@ use core_io::util::{human_size, unix_ms, unix_secs};
 use core_monitor::debounce::PendingEvent;
 use core_monitor::rules::Alert;
 use core_monitor::{PathRemap, Rule, RuleKind, TickOutcome};
+use std::path::{Path, PathBuf};
 use core_scan::{
     collect_candidates, find_duplicates, groups_to_csv, rows_to_csv, signed_size, DiffOptions,
     DiffOrder, DupOptions, DupProgress, DupReport, DupStage, FsSource, ScanBackend, ScanPhase,
@@ -72,6 +74,7 @@ fn main() {
         "diff" => cmd_diff(&a),
         "report" => cmd_report(&a),
         "sensitive" | "secrets" => cmd_sensitive(&a),
+        "history" | "hist" => cmd_history(&a),
         "selftest" | "self-test" | "check" => cmd_selftest(&a),
         "" | "help" | "-h" | "--help" => {
             print_help();
@@ -119,6 +122,7 @@ fn print_help() {
   diff <旧快照> <新快照>      对比两次快照，看这段时间谁变大了（F11）
   report <盘符|目录> [选项]   导出单文件离线 HTML 报告（概览 + 面积图 + 三张榜）
   sensitive <盘符|目录>       按文件名/扩展名盘点敏感文件（不读内容）
+  history <盘符|目录> [选项]  目录级历史：趋势与「今天长得不正常吗」（E6）
   selftest [--verbose]        免管理员的全链路自检
   help / version
 
@@ -2114,6 +2118,224 @@ fn cmd_sensitive(a: &Args) -> i32 {
     0
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E6 目录历史
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `history` —— 记录一个样本，或读历史看趋势与基线异常。
+///
+/// 两个动作刻意分开：
+/// * `--record` 才扫描（扫描是重活），并把样本追加进历史；
+/// * 不带它只读文件、出报表 —— 想看一眼趋势不该先等一次全盘扫描。
+fn cmd_history(a: &Args) -> i32 {
+    let root = a
+        .positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| core_io::paths::DEFAULT_VOLUME.to_string());
+    let path = match a.get("file") {
+        Some(p) => PathBuf::from(cli_path(p)),
+        None => core_scan::history::default_path(&root),
+    };
+    let days = match a.num("days", core_scan::history::DEFAULT_LOOKBACK as usize) {
+        Ok(n) => n as u32,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let depth = match a.num("depth", 3) {
+        Ok(n) => n as u32,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let top = match a.num("top", 12) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+
+    let mut hist = match core_scan::history::History::load(&path) {
+        Ok(h) => h,
+        Err(e) => {
+            // 坏文件**不覆盖**：先改名留证，再从空历史开始。
+            // 直接覆盖等于把用户几个月的数据扔了，而且他连哪一步弄坏的都不知道。
+            let bad = path.with_extension(format!("tsv.bad-{}", fmt_local_stamp(unix_secs())));
+            eprintln!("历史文件读不出来：{e}");
+            eprintln!("已改名保留为 {}，本次从空历史开始", bad.display());
+            let _ = std::fs::rename(&path, &bad);
+            core_scan::history::History::default()
+        }
+    };
+
+    if a.has("record") {
+        let (session, norm) = match open_session_for(a) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        // 显示用的根取**扫描根**（`--root=` 或含分隔符的位置参数），
+        // 不是盘符：`history D://projects` 记的历史，根就该是那个目录。
+        let label = core_io::paths::to_native(
+            &session
+                .cfg
+                .scan_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| norm.clone()),
+        );
+        if hist.root.is_empty() {
+            hist.root = label.clone();
+        }
+        if hist.root != label {
+            eprintln!(
+                "注意：历史文件里的根是「{}」，这次扫的是「{}」—— 会记进同一份历史，趋势可能对不上",
+                hist.root, label
+            );
+        }
+        let remap = path_remap_of(&session.cfg);
+        let sample = core_scan::history::capture(
+            &session.tree,
+            remap.as_ref(),
+            unix_secs(),
+            depth,
+            core_scan::history::MAX_DIRS,
+        );
+        let dirs = sample.dirs.len();
+        let buckets = sample.dirs_total;
+        hist.push(sample);
+        if let Err(e) = hist.save(&path) {
+            eprintln!("保存历史失败：{e}");
+            return 1;
+        }
+        println!(
+            "已记录：{} 个目录（共 {} 个桶，按体积取前 {}）",
+            dirs,
+            buckets,
+            core_scan::history::MAX_DIRS
+        );
+        println!();
+    }
+
+    print_history(&hist, &path, days, top);
+    0
+}
+
+fn print_history(h: &core_scan::history::History, path: &Path, days: u32, top: usize) {
+    println!("═══ FileWatch 目录增长历史 ═══");
+    println!("历史文件 : {}", path.display());
+    if h.samples.is_empty() {
+        println!();
+        println!("还没有任何样本。");
+        println!("  filewatch history <路径> --record    让它在这次扫描后开始记录");
+        println!();
+        println!("提示：界面在「性能模式」下会按周期自动记录（同一根 30 分钟最多一次）。");
+        return;
+    }
+
+    let first = h.samples.first().map(|s| s.at_unix).unwrap_or(0);
+    let last = h.samples.last().map(|s| s.at_unix).unwrap_or(0);
+    println!(
+        "根       : {}",
+        if h.root.is_empty() { "（未记录）" } else { &h.root }
+    );
+    println!(
+        "样本     : {} 个（{} → {}）{}",
+        h.samples.len(),
+        fmt_local_time(first),
+        fmt_local_time(last),
+        if h.dropped > 0 {
+            format!("，跳过 {} 个不完整样本", h.dropped)
+        } else {
+            String::new()
+        }
+    );
+    if let Some(s) = h.samples.last() {
+        println!(
+            "最新     : {} 总 {} / {} 个文件，记了 {} / {} 个目录",
+            fmt_local_time(s.at_unix),
+            human_size(s.total),
+            s.files,
+            s.dirs.len(),
+            s.dirs_total
+        );
+    }
+
+    // ── 最近几天的总量 ──────────────────────────────────────────────
+    let daily = h.daily_totals();
+    if daily.len() >= 2 {
+        println!();
+        println!("最近{}天的总量：", daily.len().min(8));
+        let tail = &daily[daily.len().saturating_sub(8)..];
+        for w in tail.windows(2) {
+            let (_, v0) = w[0];
+            let (d1, v1) = w[1];
+            let delta = v1 as i64 - v0 as i64;
+            let sign = if delta >= 0 { "+" } else { "−" };
+            let (y, m, dd) = core_io::util::civil_from_days(d1);
+            println!(
+                "  {:04}-{:02}-{:02}  {:>10}  {}{}",
+                y,
+                m,
+                dd,
+                human_size(v1),
+                sign,
+                human_size(delta.unsigned_abs())
+            );
+        }
+    }
+
+    // ── 基线异常 ────────────────────────────────────────────────────
+    let list = core_scan::history::anomalies(h, days, top);
+    println!();
+    println!("今天 vs 前 {} 天基线（日增量）：", days);
+    if list.is_empty() {
+        println!("  没有发现异常增长。");
+        return;
+    }
+    println!(
+        "  {:<44} {:>10} {:>10} {:>8} {:>6}",
+        "目录", "今天", "基线均值", "σ", "z"
+    );
+    for x in &list {
+        let sign = if x.delta >= 0 { "+" } else { "−" };
+        let z = match x.z {
+            Some(z) => format!("{z:.1}"),
+            // 不能显示 0：0 的意思是"和基线一样"，而这里的意思是"还不知道"
+            None => format!("差{}天", x.days_needed),
+        };
+        println!(
+            "  {:<44} {:>9}{:>9} {:>10} {:>8} {:>6}",
+            tail_chars(&x.dir, 44),
+            sign,
+            human_size(x.delta.unsigned_abs()),
+            human_size(x.base_mean.unsigned_abs()),
+            human_size(x.base_sd.unsigned_abs()),
+            z
+        );
+    }
+    if list.iter().any(|x| x.z.is_none()) {
+        println!();
+        println!(
+            "「差 N 天」= 基线还不够 {} 天，判不了。现在给一个 z 值只是更精致的猜测。",
+            core_scan::history::MIN_BASELINE_DAYS
+        );
+    }
+}
+
+/// 取路径末尾 `n` 个字符（保尾：目录名比盘符有信息量）。
+fn tail_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    let skip = count - n + 1;
+    format!("…{}", s.chars().skip(skip).collect::<String>())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // selftest

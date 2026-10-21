@@ -970,3 +970,50 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
   flex: 1 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* ── E6 增长趋势 ───────────────────────────────────────────────────────────
+ * 折线用内联 SVG（零依赖、可截图比对）。`.trend-chart` 也是 flex 列的子项，
+ * 必须 `flex: 0 0 auto` —— 否则会被压扁（归因卡踩过一次）。
+ */
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.bad { color: var(--crit); border-color: var(--crit); }
+
+.trend-chart {
+  flex: 0 0 auto;
+  padding: 6px 10px 0;
+  margin: 2px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+/* 按 viewBox 比例缩放：高度跟着宽度走，文字不会被拉变形 */
+.trend-svg { display: block; width: 100%; height: auto; }
+.trend-grid { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; }
+.trend-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+.trend-area { fill: color-mix(in srgb, var(--accent) 14%, transparent); stroke: none; }
+.trend-dot { fill: var(--accent); }
+.trend-axis { fill: var(--text-faint); font-size: 11px; }
+.trend-empty { padding: 20px 12px; font-size: 12px; color: var(--text-dim); }
+.trend-empty .hint { margin-left: 6px; }
+
+/* 异常表：目录 / 今天 / 基线均值 / σ / z */
+.xhead, .xrow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 104px 96px 82px 76px;
+  gap: 10px;
+  align-items: center;
+  padding: 0 10px;
+  min-width: 560px;
+}
+.xhead {
+  position: sticky; top: 0; z-index: 1;
+  height: 26px; font-size: 11px; color: var(--text-faint);
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+}
+.xhead .d, .xrow .d { text-align: right; font-variant-numeric: tabular-nums; }
+.xrow { height: var(--row); border-radius: 3px; font-size: 12px; }
+.xrow:hover { background: var(--bg-hover); }
+.xrow .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xrow .up { color: var(--warn); }
+.xrow .hint { font-size: 11px; }

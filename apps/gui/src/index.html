@@ -216,6 +216,7 @@
         <!-- 风险清单：只按文件名/扩展名匹配，不读内容。放在最后是因为它
              不参与"看空间"的主流程，而是一个偶尔做一次的盘点动作。 -->
         <button id="view-tab-risk" class="tab" type="button">风险清单</button>
+        <button id="view-tab-trend" class="tab" type="button">增长趋势</button>
         <span class="spacer"></span>
         <span id="view-hint" class="hint"></span>
       </div>
@@ -423,6 +424,25 @@
             命中不等于"有问题"，它只是指出值得看一眼的位置；扫描全程只读。</span>
         </div>
         <div id="risk-list" class="list"></div>
+      </div>
+
+      <!-- E6 增长趋势。口径必须写在页面上（与规则试算的"判不了"同一条原则）：
+           基线不够天数时给的是"差 N 天"，不是 z=0。 -->
+      <div id="view-trend" class="view hidden">
+        <div class="tool">
+          <button id="trend-record" class="primary" type="button"
+                  title="把当前索引存成一个历史样本（不再重新扫描）">记录一次</button>
+          <span id="trend-state" class="badge">—</span>
+          <span class="spacer"></span>
+          <span id="trend-summary" class="hint"></span>
+        </div>
+        <div class="tool thin">
+          <span class="hint">一天取一个点（当天最后一个样本）。「今天」= 最近一个有样本的日子，
+            基线取前 7 天的日增量均值与 σ。<b>不足 3 天基线时不给 z 值</b>，只显示还差几天。
+            性能模式下每次扫描后自动记一次（同一目标 30 分钟最多一次）。</span>
+        </div>
+        <div id="trend-chart" class="trend-chart"></div>
+        <div id="trend-list" class="list"></div>
       </div>
     </section>
 

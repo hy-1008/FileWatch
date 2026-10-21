@@ -342,6 +342,11 @@ pub fn spawn_scan(
             Ok(s) => {
                 // 摘要在 `s` 被 move 进 Loaded 之前算完
                 let summary = summarize(&s, t0.elapsed().as_millis() as u64);
+                // E6：扫描成功后顺手记一个历史样本（性能模式 + 节流，见 history.rs）。
+                // 必须赶在 `s` 被 move 进 Loaded 之前 —— 之后树就归状态锁管了，
+                // 再借一次要么加锁要么拿不到。放在这里还有个好处：**任何**一次
+                // 成功的扫描都算数据点，包括用户手动点的那次。
+                crate::history::auto_record(&app, &s);
                 let loaded = Loaded::new(s);
                 let shared = app.state::<Shared>();
                 match shared.inner().lock() {

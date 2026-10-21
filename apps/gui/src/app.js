@@ -1454,6 +1454,7 @@ const VIEW_HINTS = {
   diff: '方向固定为「快照 → 现在的扫描结果」',
   search: '搜索在内存索引里做 · 不重新遍历磁盘',
   risk: '按文件名与扩展名匹配 · 不读文件内容 · 只读不修改',
+  trend: '一天一个点 · 基线不足 3 天不给 z 值 · 只读不修改',
 };
 
 function setView(v) {
@@ -1463,15 +1464,19 @@ function setView(v) {
   document.getElementById('view-diff').classList.toggle('hidden', v !== 'diff');
   document.getElementById('view-search').classList.toggle('hidden', v !== 'search');
   document.getElementById('view-risk').classList.toggle('hidden', v !== 'risk');
+  document.getElementById('view-trend').classList.toggle('hidden', v !== 'trend');
   document.getElementById('view-tab-map').classList.toggle('on', v === 'map');
   document.getElementById('view-tab-dup').classList.toggle('on', v === 'dup');
   document.getElementById('view-tab-diff').classList.toggle('on', v === 'diff');
   document.getElementById('view-tab-search').classList.toggle('on', v === 'search');
   document.getElementById('view-tab-risk').classList.toggle('on', v === 'risk');
+  document.getElementById('view-tab-trend').classList.toggle('on', v === 'trend');
   document.getElementById('view-hint').textContent = VIEW_HINTS[v] || '';
   if (v === 'map') refreshLayout().catch(() => {});
   // 切到搜索页就把光标放进输入框：进这个页签的下一步一定是打字
   if (v === 'search') document.getElementById('search-text').focus();
+  // 趋势页要现读一次历史：文件很小，但必须是最新的（别人可能刚在 CLI 里记过）
+  if (v === 'trend') refreshTrend().catch(() => {});
 }
 
 /* ── F12 重复文件 ───────────────────────────────────────────────────────
@@ -2300,6 +2305,163 @@ function renderDiffAttr(v) {
 }
 
 
+/* ── E6 增长趋势 ────────────────────────────────────────────────────────
+ *
+ * 数据全在后端算好（`history_view`），这里只画：
+ * 一张按日的总量折线 + 一张"今天 vs 前 N 天基线"的表。
+ *
+ * 两条规矩：
+ * 1. **没有 z 值就说没有**。基线不足 3 天时后端给 `z: null`，这里显示"差 N 天"，
+ *    绝不能拿 0 顶上 —— 0 的意思是"和基线一样"，而实际情况是"还不知道"。
+ * 2. 折线只有一天的数据时不画线，直接说"还成不了线"。一个孤零零的点看起来
+ *    像是"持平"，比空着更误导。
+ */
+
+const trend = { view: null, error: null, busy: false };
+
+async function refreshTrend() {
+  try {
+    trend.view = await call('history_view', {});
+    trend.error = null;
+  } catch (e) {
+    trend.error = String(e);
+  }
+  renderTrend();
+}
+
+async function recordTrend() {
+  if (trend.busy) return;
+  trend.busy = true;
+  const btn = document.getElementById('trend-record');
+  btn.disabled = true;
+  try {
+    trend.view = await call('history_record');
+    trend.error = null;
+  } catch (e) {
+    trend.error = String(e);
+  }
+  trend.busy = false;
+  btn.disabled = false;
+  renderTrend();
+}
+
+/** 折线：一行内联 SVG，零依赖。`days` 是 `[{date, total}]`。 */
+function trendChart(v) {
+  const pts = (v && v.days) || [];
+  if (!pts.length) {
+    return `<div class="trend-empty">还没有样本。
+      <span class="hint">点「记录一次」开始记；性能模式下每次扫描后会自动记。</span></div>`;
+  }
+  if (pts.length === 1) {
+    return `<div class="trend-empty">只有 1 天数据（${esc(pts[0].date)} · ${humanSize(pts[0].total)}），还成不了线。
+      <span class="hint">再过一天就有了。</span></div>`;
+  }
+  // H 比绘图区多留一截给底部的日期标签：标签压在面积图上会看不清
+  const W = 1000, H = 208, PX = 46, PY = 24;
+  const vals = pts.map((p) => p.total);
+  const lo = Math.min(...vals);
+  const hi = Math.max(...vals);
+  const span = Math.max(1, hi - lo);
+  const x = (i) => PX + (W - PX * 2) * (i / (pts.length - 1));
+  const y = (val) => H - PY - (H - PY * 2) * ((val - lo) / span);
+
+  const line = pts.map((p, i) => `${x(i).toFixed(1)},${y(p.total).toFixed(1)}`).join(' ');
+  const area = `${PX},${H - PY} ${line} ${W - PX},${H - PY}`;
+  const dots = pts
+    .map((p, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(p.total).toFixed(1)}" r="2.4"
+      class="trend-dot"><title>${esc(p.date)} · ${humanSize(p.total)}</title></circle>`)
+    .join('');
+  // 只标首尾日期与最高/最低值：每天都标会糊成一团
+  const label = (i, anchor) => `<text x="${x(i).toFixed(1)}" y="${H - 6}"
+      class="trend-axis" text-anchor="${anchor}">${esc(pts[i].date.slice(5))}</text>`;
+  // 不用 preserveAspectRatio="none"：那会把文字标签一起拉伸变形。
+  // 让它按 viewBox 的比例缩放，高度随宽度走。
+  return `<svg class="trend-svg" viewBox="0 0 ${W} ${H}" role="img"
+      aria-label="总量趋势：${pts.length} 天">
+    <line x1="${PX}" y1="${y(hi).toFixed(1)}" x2="${W - PX}" y2="${y(hi).toFixed(1)}" class="trend-grid"/>
+    <line x1="${PX}" y1="${y(lo).toFixed(1)}" x2="${W - PX}" y2="${y(lo).toFixed(1)}" class="trend-grid"/>
+    <text x="4" y="${(y(hi) + 4).toFixed(1)}" class="trend-axis">${humanSize(hi)}</text>
+    <text x="4" y="${(y(lo) + 4).toFixed(1)}" class="trend-axis">${humanSize(lo)}</text>
+    <polygon points="${area}" class="trend-area"/>
+    <polyline points="${line}" class="trend-line"/>
+    ${dots}
+    ${label(0, 'start')}
+    ${label(pts.length - 1, 'end')}
+  </svg>`;
+}
+
+function renderTrend() {
+  const v = trend.view;
+  const chart = document.getElementById('trend-chart');
+  const list = document.getElementById('trend-list');
+  const state = document.getElementById('trend-state');
+  const sum = document.getElementById('trend-summary');
+
+  if (trend.error) {
+    state.className = 'badge bad';
+    state.textContent = '读不出来';
+    sum.textContent = trend.error;
+    chart.replaceChildren();
+    list.replaceChildren();
+    return;
+  }
+  if (!v) {
+    state.className = 'badge';
+    state.textContent = '—';
+    sum.textContent = '';
+    return;
+  }
+
+  state.className = 'badge ' + (v.samples ? 'ok' : '');
+  state.textContent = v.samples ? `${v.samples} 个样本` : '还没有样本';
+  sum.textContent = [
+    v.span,
+    v.latest,
+    v.samples ? `记了 ${v.dirs_kept} / ${v.dirs_total} 个目录` : '',
+    `${v.file_kb} KB`,
+    v.auto ? '自动记录：开' : '自动记录：关（不在性能模式）',
+    v.dropped ? `跳过 ${v.dropped} 个不完整样本` : '',
+  ].filter(Boolean).join('　');
+
+  chart.innerHTML = trendChart(v);
+
+  // ── 异常表 ──────────────────────────────────────────────────────────
+  list.replaceChildren();
+  const head = document.createElement('div');
+  head.className = 'xhead';
+  head.innerHTML = '<span>目录</span><span class="d">今天</span><span class="d">基线均值</span>'
+    + '<span class="d">σ</span><span class="d">z</span>';
+  list.appendChild(head);
+
+  if (!v.anomalies.length) {
+    const p = document.createElement('div');
+    p.className = 'mon-empty';
+    p.textContent = v.samples < 2
+      ? '至少要有两天的样本才能比较。'
+      : '没有发现异常增长（今天没有明显超出前 7 天基线的目录）。';
+    list.appendChild(p);
+    return;
+  }
+
+  for (const a of v.anomalies) {
+    const row = document.createElement('div');
+    row.className = 'xrow';
+    row.title = a.dir;
+    const z = a.z === null || a.z === undefined
+      ? `<span class="hint">差 ${a.days_needed} 天</span>`
+      : `<b>${a.z.toFixed(1)}</b>`;
+    row.innerHTML =
+      `<span class="p">${esc(a.dir)}</span>` +
+      `<span class="d up">${signedSize(a.delta)}</span>` +
+      `<span class="d">${humanSize(Math.abs(a.base_mean))}</span>` +
+      `<span class="d">${humanSize(Math.abs(a.base_sd))}</span>` +
+      `<span class="d">${z}</span>`;
+    // 右键与其它列表一致：目录还在就能定位；不在了交给后端兜底
+    ContextMenu.bind(row, { kind: 'attrdir', row: { dir: a.dir, delta: a.delta, files: 0 } });
+    list.appendChild(row);
+  }
+}
+
 /* ── E5 风险清单 ─────────────────────────────────────────────────────────
  *
  * 纯内存遍历（零 IO），所以同步命令、不做进度条。
@@ -2491,6 +2653,8 @@ function wireViews() {
   document.getElementById('view-tab-diff').onclick = () => setView('diff');
   document.getElementById('view-tab-search').onclick = () => setView('search');
   document.getElementById('view-tab-risk').onclick = () => setView('risk');
+  document.getElementById('view-tab-trend').onclick = () => setView('trend');
+  document.getElementById('trend-record').onclick = recordTrend;
 
   document.getElementById('risk-run').onclick = runRisk;
   for (const id of ['risk-min-size', 'risk-limit']) {

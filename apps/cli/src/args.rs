@@ -45,6 +45,10 @@ const VALUE_KEYS: &[&str] = &[
     // F11 快照对比
     "max-entries",
     "min-delta",
+    // E6 目录历史
+    "file",
+    "days",
+    "depth",
 ];
 
 #[derive(Debug, Default)]

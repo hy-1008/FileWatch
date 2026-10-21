@@ -954,6 +954,43 @@ function main() {
      '页面上必须写明"不读文件内容"（否则"没找到"会被读成"没有风险"）');
   ok(/Severity::High/.test(sensitiveRs), '命中必须分级（全平铺的清单没人看得完）');
 
+  /* ── E6 增长趋势 ─────────────────────────────────────────────────────
+   * 三条不能让步的：
+   * 1. 基线不够时**不给 z 值**（`Option<f64>`），不是给 0 —— 0 的意思是
+   *    "和基线一样"，而"还不知道"给 0 会被读成"很安全"；
+   * 2. 历史文件的路径只能由引擎一处给（`history::default_path`），
+   *    CLI 与界面各写一份的话，命令行记的样本界面看不见；
+   * 3. 一天只取一个点（当天最后一个样本），否则采样密度会带偏斜率。
+   */
+  for (const id of ['view-tab-trend', 'view-trend', 'trend-record', 'trend-state',
+                    'trend-summary', 'trend-chart', 'trend-list']) {
+    ok(htmlIds.has(id), `index.html 缺少 #${id}`);
+    ok(usedIds.has(id), `app.js 没有接线 #${id}`);
+  }
+  ok(/setView\('trend'\)/.test(appjs) && /refreshTrend\(\)/.test(appjs),
+     '趋势页必须能被切到，且切过去要读一次历史');
+  ok(/call\('history_view'/.test(appjs) && /call\('history_record'/.test(appjs),
+     '趋势页必须调后端 history_view / history_record');
+  const historyRs = fs.readFileSync(path.join(ENGINE, 'core-scan', 'src', 'history.rs'), 'utf8');
+  const guiHistoryRs = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'history.rs'), 'utf8');
+  ok(/pub const MAGIC: &str = "#filewatch-history"/.test(historyRs),
+     '历史文件要有自己的魔数（不能把随便一个 TSV 当历史解析）');
+  ok(/pub fn default_path/.test(historyRs) && /history::default_path/.test(guiHistoryRs),
+     '历史文件位置只能由 core-scan::history::default_path 一处给（CLI 与界面共用）');
+  ok(/pub z: Option<f64>/.test(historyRs),
+     '基线不足时 z 必须是 None（给 0 会被读成"和基线一样"）');
+  ok(/MIN_BASELINE_DAYS/.test(historyRs) && /judgeable/.test(historyRs),
+     '必须区分"判不了"与"不异常"');
+  ok(/daily_totals/.test(historyRs) && /BTreeMap/.test(historyRs),
+     '一天只能取一个点（按日分组后取当天最后一个样本）');
+  ok(/pub fn save/.test(historyRs) && /\.part/.test(historyRs),
+     '历史落盘必须先写 .part 再改名（半截文件会让趋势凭空掉下去）');
+  ok(/crate::history::auto_record/.test(fs.readFileSync(COMMANDS_RS, 'utf8')),
+     '扫描成功后必须调 history::auto_record（否则"自动历史"只是句口号）');
+  ok(/history::history_view/.test(mainRs) && /history::history_record/.test(mainRs),
+     '两个命令必须在 tauri 的 invoke_handler 里注册');
+
   /* ── 结果 ────────────────────────────────────────────────────────── */
   console.log('='.repeat(72));
   console.log('界面规则校验（admin-rule.js / view-rule.js + DOM 接线 + 版面结构）');

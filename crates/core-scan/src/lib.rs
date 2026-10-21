@@ -17,6 +17,7 @@
 //! | [`snapshot`] | 扫描快照落盘 / 读取 + 两次快照的 diff | F11 |
 //! | [`attribution`] | 把 diff 的变化行重新聚合成「哪块地方在长」 | F11 / E1 |
 //! | [`report`] | 单文件离线 HTML 报告（概览 + 面积图 + Top 榜） | E3 |
+//! | [`history`] | 目录级历史（每天一个小样本）+ 基线异常 | E6 |
 //! | [`incremental`] | USN 增量会话：拉页 → 归一化 → 回读大小 | M2 |
 //! | [`session`] | **统一入口**：选后端 → 全量 → 建增量 → 注册监控 | M1~M3 |
 //!
@@ -47,6 +48,7 @@ pub mod content;
 pub mod dedup;
 pub mod dirwatch;
 pub mod full_scan;
+pub mod history;
 pub mod incremental;
 pub mod paths;
 pub mod report;
