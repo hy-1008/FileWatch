@@ -17,6 +17,9 @@
    树里特意放了**同体积但内容不同**的文件，用来确认它真的被内容哈希筛掉。
 2. `snapshot` —— 文件数 / 总字节，与 `os.walk` 对拍。
 3. `diff`    —— 四类变更计数与净变化，与手算值对拍。
+4. `search` / `content` / `rules`（E9）—— 过滤后的命中数、内容命中行、
+   规则触发条数，都与 `os.walk` 独立算出来的数对拍；顺带看 CSV 里的时间
+   是不是和屏幕上同一个口径（曾经 CSV 写 Unix 秒、屏幕写本地时间）。
 
 用法：
     python tools/e2e_real.py            # 用默认 release 产物
@@ -25,6 +28,7 @@
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
 from safe_test_dir import SafeTestDir
@@ -40,6 +44,8 @@ SNAP1 = os.path.join(TMP, "snapshot-1.tsv")
 SNAP2 = os.path.join(TMP, "snapshot-2.tsv")
 DUP_CSV = os.path.join(TMP, "duplicates.csv")
 DIFF_CSV = os.path.join(TMP, "diff.csv")
+SEARCH_CSV = os.path.join(TMP, "search.csv")
+CONTENT_CSV = os.path.join(TMP, "content.csv")
 
 fails = []
 passes = [0]
@@ -190,9 +196,80 @@ def check_diff():
     ok(expect in out, "净变化 = %s（手算 %d B）" % (expect, net))
 
 
+def py_files():
+    """独立实现：相对路径 + 体积。搜索结果的对拍基准。"""
+    out = []
+    for dp, _dn, fns in os.walk(TREE):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            out.append((os.path.relpath(p, TREE), os.path.getsize(p)))
+    return out
+
+
+def check_search_content_rules():
+    """E9 的三个 CLI 入口。命中数一律与 os.walk 独立算出来的数对拍 ——
+    少一个/多一个都不报错，只会安静地给个看起来合理的数字。"""
+    print("\n④ search / content / rules（E9）")
+    marker = "NEEDLE-Q7 here"
+    write("G/note.txt", (marker + "\nsecond line\n").encode("utf-8"))
+
+    # ── search：体积下界 + 扩展名白名单
+    rc, out, err = run("search", TREE, "--text=bin", "--min-size=100K", "--exts=bin")
+    ok(rc == 0, "search 退出码 0（实际 %d）%s" % (rc, why(rc, err)))
+    if rc == 0:
+        want = [r for r, s in py_files()
+                if "bin" in os.path.basename(r) and s >= 102400
+                and r.rsplit(".", 1)[-1].lower() == "bin"]
+        ok("命中 %d 个" % len(want) in out,
+           "体积下界 + 扩展名：命中数与 os.walk 一致（%d）" % len(want))
+
+    # ── search：体积上界 + CSV
+    rc, out, err = run("search", TREE, "--text=bin", "--max-size=5K", "--csv=" + SEARCH_CSV)
+    ok(rc == 0, "search --max-size 退出码 0（实际 %d）%s" % (rc, why(rc, err)))
+    if rc == 0:
+        want = [r for r, s in py_files() if "bin" in os.path.basename(r) and s <= 5120]
+        ok("命中 %d 个" % len(want) in out,
+           "体积上界：命中数与 os.walk 一致（%d）" % len(want))
+        rows = [l for l in open(SEARCH_CSV, encoding="utf-8").read().splitlines() if l.strip()]
+        ts = [l.rsplit(",", 1)[1] for l in rows[1:]]
+        ok(bool(ts) and all(re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", t) for t in ts),
+           "CSV 的时间与屏幕同一口径（本地时间，不是 Unix 秒）：%s" % (ts[:1] or "(无数据行)"))
+
+    # ── content：只有一个文件里有这个词
+    rc, out, err = run("content", TREE, "--text=" + marker, "--csv=" + CONTENT_CSV)
+    ok(rc == 0, "content 退出码 0（实际 %d）%s" % (rc, why(rc, err)))
+    if rc == 0:
+        ok("命中 1 个文件" in out, "content 命中文件数 = 1（只有 note.txt 里有这个词）")
+        ok(marker in out, "命中行原文被打印出来（带行号）")
+        ok("note.txt" in out, "命中的是 note.txt")
+        body = open(CONTENT_CSV, encoding="utf-8").read()
+        ok(marker in body and "note.txt" in body, "content CSV 记下了文件与命中行")
+
+    # ── rules：abs 阈值按当前体积当场判
+    rc, out, err = run("rules", TREE, "--rule=abs=100K")
+    ok(rc == 0, "rules 退出码 0（实际 %d）%s" % (rc, why(rc, err)))
+    if rc == 0:
+        per_dir = {}
+        for r, s in py_files():
+            top = r.split(os.sep)[0] if os.sep in r else "."
+            per_dir[top] = per_dir.get(top, 0) + s
+        per_dir["."] = sum(s for _r, s in py_files())  # 扫描根自己也是样本
+        want = sum(1 for v in per_dir.values() if v >= 102400)
+        ok("结论：%d 条会触发" % want in out,
+           "abs 规则触发条数与 os.walk 一致（%d）" % want)
+        ok("判断不了" not in out or "rate" in out,
+           "abs 规则没有「判断不了」（只有速率规则才会）")
+
+    # ── 看不懂的写法必须当场报错，不能静默当成"不设这个条件"
+    rc, out, err = run("search", TREE, "--text=bin", "--min-size=10P")
+    ok(rc == 2 and "10P" in err, "看不懂的体积写法报错退出（码 2，不是静默忽略）")
+    rc, out, err = run("search", TREE, "--text=bin", "--after=昨天")
+    ok(rc == 2 and "昨天" in err, "看不懂的时间写法报错退出（码 2）")
+
+
 def main():
     print("=" * 72)
-    print("真实目录端到端对拍（F11 / F12）")
+    print("真实目录端到端对拍（F11 / F12 / E9）")
     print("=" * 72)
     print("被测程序 %s" % EXE)
     print("工作目录 %s" % TREE)
@@ -204,6 +281,7 @@ def main():
     check_dupes()
     check_snapshot()
     check_diff()
+    check_search_content_rules()
 
     print("\n" + "=" * 72)
     if fails:

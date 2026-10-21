@@ -49,6 +49,14 @@ const VALUE_KEYS: &[&str] = &[
     "file",
     "days",
     "depth",
+    // E9 搜索 / 内容搜索（界面同名输入框传的就是这些文本）
+    "text",
+    "scope",
+    "after",
+    "before",
+    "max-size",
+    "max-hits",
+    "limit-files",
 ];
 
 #[derive(Debug, Default)]

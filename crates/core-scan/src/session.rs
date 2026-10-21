@@ -601,7 +601,7 @@ mod tests {
         let mut t = core_index::Tree::new("C:", 16);
         t.root = 5;
         t.arena.ensure(12);
-        let mut set = |t: &mut core_index::Tree, idx: u32, parent: u32, dir: bool, size: u64| {
+        let set = |t: &mut core_index::Tree, idx: u32, parent: u32, dir: bool, size: u64| {
             if let Some(n) = t.arena.get_mut(idx) {
                 *n = Node {
                     parent,

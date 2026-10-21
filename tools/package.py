@@ -261,6 +261,15 @@ cli/ 子目录里是同一个引擎的命令行前端，适合脚本化：
   cli\\filewatch.exe report D:\\projects --out=r.html   单文件离线报告
   cli\\filewatch.exe sensitive C:                     按文件名盘点敏感文件
   cli\\filewatch.exe history C: --record              记一次目录历史（趋势 / 基线异常）
+  cli\\filewatch.exe search D:\\photos --text=mp4 --min-size=100M --exts=mp4,mkv
+  cli\\filewatch.exe content D:\\src --text=TODO --exts=rs,ts      纯文本内容搜索
+  cli\\filewatch.exe rules D:\\data --rule=abs=1G --rule=rate=10M/60s   规则试算
+
+search / content 的条件语法（界面与 CLI 同一套）：
+  体积   --min-size=10M / --max-size=1G   （1024 进制，也接受纯字节）
+  时间   --after=7d / --before=2026-06-30 （相对 7d/12h/30m/2w 或绝对日期，本地时区）
+  扩展名 --exts=mp4,mkv                   （大小写随意，带不带点都行）
+  看不懂的写法当场报错退出，不会静默当成「不设这个条件」。
 
 详细说明见项目仓库的 README.md。
 """

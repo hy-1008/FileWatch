@@ -75,6 +75,9 @@ fn main() {
         "report" => cmd_report(&a),
         "sensitive" | "secrets" => cmd_sensitive(&a),
         "history" | "hist" => cmd_history(&a),
+        "search" | "find" => cmd_search(&a),
+        "content" | "grep" => cmd_content(&a),
+        "rules" | "simulate" => cmd_rules(&a),
         "selftest" | "self-test" | "check" => cmd_selftest(&a),
         "" | "help" | "-h" | "--help" => {
             print_help();
@@ -123,6 +126,9 @@ fn print_help() {
   report <盘符|目录> [选项]   导出单文件离线 HTML 报告（概览 + 面积图 + 三张榜）
   sensitive <盘符|目录>       按文件名/扩展名盘点敏感文件（不读内容）
   history <盘符|目录> [选项]  目录级历史：趋势与「今天长得不正常吗」（E6）
+  search <盘符|目录> [选项]   在已扫出的索引里按文件名搜（E8/E9）
+  content <盘符|目录> [选项]  在纯文本文件的内容里搜（不解析 Office）
+  rules <盘符|目录> [选项]    规则试算：拿现在的索引算一遍会不会触发
   selftest [--verbose]        免管理员的全链路自检
   help / version
 
@@ -183,6 +189,31 @@ diff 选项：
   --by-abs               按变化幅度排序（默认按增量降序，即"谁变大了"）
   --by-path              按路径排序
   --csv=FILE             把差异行写成 CSV
+
+search 选项（E9，与界面搜索同一套条件语法）：
+  --text=关键词          必填；支持包含 / 模糊 / 正则（--mode）
+  --mode=contains|fuzzy|regex   匹配方式（默认 contains）
+  --scope=files|dirs|both       搜文件 / 文件夹 / 两者（默认 files）
+  --limit=N              最多列出多少条（默认 50，计数不受影响）
+  --min-size=10M         体积下界；--max-size=1G 上界（1024 进制）
+  --after=7d             修改时间起点；--before=2026-06-30 终点
+                         （相对：7d / 12h / 30m / 2w；绝对：2026-01-01 [12:30]，本地时间）
+  --exts=mp4,mkv         扩展名白名单（大小写随意，带不带点都行）
+  --csv=FILE             把命中写成 CSV（路径,字节,是否目录,修改时间）
+
+content 选项（E9，纯文本类：txt / 日志 / CSV / 源码…；不含 Office）：
+  --text=关键词          必填；--regex 把它当简化正则解析
+  --limit-files=N        最多读多少个候选文件（默认 20000）
+  --max-hits=N           最多列出多少个命中文件（默认 200）
+  --min-size / --max-size / --after / --before / --exts
+                         与 search 同一套（候选阶段就筛掉，白读的文件不读）
+  --csv=FILE             把命中写成 CSV（路径,字节,修改时间,行号,行内容）
+
+rules 选项（E9，规则试算 —— 不触发任何提醒，只回答"会不会"）：
+  --rule=abs=1G          绝对体积阈值（可重复多条，同 monitor）
+  --rule=grow=500M       增长量阈值：CLI 刚起跑没有基线，恒得 0
+  --rule=rate=10M/60s    速率阈值：没有时间跨度时如实标"判断不了"
+  --top=N                拿最大的 N 个一级子目录当样本（默认 20，含根）
 
 平台差异：
   Linux：scan / monitor / dupes / snapshot 直接接受绝对路径：
@@ -2118,6 +2149,467 @@ fn cmd_sensitive(a: &Args) -> i32 {
     0
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E9 搜索 / 内容搜索 / 规则试算 —— 与界面的同名功能共用引擎的那一份实现
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 三个新命令共用的过滤器解析。
+///
+/// 写法**只有一份**：体积走 [`parse_size`]（与阈值规则同源），时间走
+/// [`core_index::SearchFilters::parse_when`]（与界面同一处）。CLI 在这里
+/// 自己再写一套解析的话，用户在界面上学会的 `7d` 到终端就不认了。
+fn cli_search_filters(a: &Args) -> Result<core_index::SearchFilters, String> {
+    let size_of = |key: &str| -> Result<Option<u64>, String> {
+        match a.get(key) {
+            None => Ok(None),
+            Some(s) if s.trim().is_empty() => Ok(None),
+            Some(s) => parse_size(s.trim()).map(Some).ok_or_else(|| {
+                format!("--{key} 需要体积，如 10M / 512K / 1073741824，收到「{s}」")
+            }),
+        }
+    };
+    let when_of = |key: &str| -> Result<Option<i64>, String> {
+        match a.get(key) {
+            None => Ok(None),
+            Some(s) if s.trim().is_empty() => Ok(None),
+            Some(s) => {
+                core_index::SearchFilters::parse_when(s.trim(), unix_secs())
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!(
+                            "--{key} 看不懂。写法示例：7d / 12h / 2026-01-01 / 2026-01-01 12:30，收到「{s}」"
+                        )
+                    })
+            }
+        }
+    };
+    Ok(core_index::SearchFilters {
+        min_size: size_of("min-size")?,
+        max_size: size_of("max-size")?,
+        after: when_of("after")?,
+        before: when_of("before")?,
+        exts: core_index::SearchFilters::parse_exts(a.get("exts").unwrap_or("")),
+    })
+}
+
+/// 把过滤器翻译成给人看的一行（回显用，不做换算）。
+fn filter_summary(f: &core_index::SearchFilters) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = f.min_size {
+        parts.push(format!("体积 ≥ {}", human_size(v)));
+    }
+    if let Some(v) = f.max_size {
+        parts.push(format!("体积 ≤ {}", human_size(v)));
+    }
+    if let Some(v) = f.after {
+        parts.push(format!("修改于 {} 起", fmt_local_time(v)));
+    }
+    if let Some(v) = f.before {
+        parts.push(format!("修改于 {} 止", fmt_local_time(v)));
+    }
+    if !f.exts.is_empty() {
+        parts.push(format!("扩展名 {}", f.exts.join(",")));
+    }
+    if parts.is_empty() {
+        "无条件".to_string()
+    } else {
+        parts.join("　")
+    }
+}
+
+/// CSV 字段转义：带逗号 / 引号 / 换行的路径必须包起来，双引号翻倍。
+/// 各命令各写一份的话迟早有一份漏掉换行，所以放在这一处。
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// 把命中路径过一遍 remap（与 GUI/Top-N 同一规则），返回 (路径, 是否换过)。
+fn remapped(session: &Session, raw: String) -> String {
+    match path_remap_of(&session.cfg).as_ref() {
+        Some(r) => r.apply(&raw),
+        None => raw,
+    }
+}
+
+/// `search` —— 在已扫出的索引里按文件名搜（E9）。
+///
+/// 先扫描再搜是刻意的：CLI 的运行模型就是"一次一条命令"，与 GUI 的
+/// "常驻进程搜内存"不同。扫描本身占大头时间，搜索本身只有几十毫秒。
+fn cmd_search(a: &Args) -> i32 {
+    let text = match a.get("text") {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => {
+            eprintln!("需要 --text=关键词（在已扫出的索引里按文件名搜）");
+            return 2;
+        }
+    };
+    let mode = core_index::MatchMode::parse(a.get("mode").unwrap_or("contains"));
+    let scope = core_index::Scope::parse(a.get("scope").unwrap_or("files"));
+    let limit = match a.num("limit", 50) {
+        Ok(n) => n.max(1),
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let filters = match cli_search_filters(a) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let (session, _norm) = match open_session_for(a) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    eprintln!();
+    let t0 = Instant::now();
+    let out = match core_index::search_filtered(
+        &session.tree,
+        &core_index::Query { text: &text, mode, scope, limit },
+        &filters,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    println!("═══ FileWatch 文件搜索 ═══");
+    println!(
+        "「{}」（{} / {}）　条件：{}",
+        text,
+        match mode {
+            core_index::MatchMode::Contains => "包含",
+            core_index::MatchMode::Fuzzy => "模糊",
+            core_index::MatchMode::Regex => "正则",
+        },
+        match scope {
+            core_index::Scope::Files => "文件",
+            core_index::Scope::Dirs => "文件夹",
+            core_index::Scope::Both => "两者",
+        },
+        filter_summary(&filters)
+    );
+    println!(
+        "命中 {} 个{}　比过 {} 个节点，用时 {} ms",
+        out.matched,
+        if out.truncated { "（已达上限，只列这些）" } else { "" },
+        out.scanned,
+        t0.elapsed().as_millis()
+    );
+    if out.hits.is_empty() {
+        return 0;
+    }
+    println!();
+    let mut csv = match a.get("csv") {
+        Some(p) => match std::fs::File::create(cli_path(p)) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("创建 CSV 失败：{e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    if let Some(f) = csv.as_mut() {
+        writeln!(f, "path,bytes,is_dir,mtime").ok();
+    }
+    for h in &out.hits {
+        let path = remapped(&session, h.path.clone());
+        println!(
+            "[{}] {:>10}  {}  {}",
+            if h.is_dir { "目录" } else { "文件" },
+            human_size(h.size),
+            fmt_local_time(h.mtime),
+            path
+        );
+        if let Some(f) = csv.as_mut() {
+            writeln!(
+                f,
+                // 落盘给人看（Excel 里打开），所以时间写本地文本而不是 Unix 秒：
+                // 同一个数字在屏幕上和 CSV 里长得不一样，是最容易被读错的一种错。
+                "{},{},{},{}",
+                csv_field(&path),
+                h.size,
+                h.is_dir,
+                fmt_local_time(h.mtime)
+            )
+            .ok();
+        }
+    }
+    if let Some(p) = a.get("csv") {
+        println!();
+        println!("CSV 已写入 {p}");
+    }
+    0
+}
+
+/// `content` —— 在纯文本文件的内容里搜（E9）。
+///
+/// 候选挑选与 GUI 的 ContentHub 相同口径：白名单 + 体积上限 + 附加条件，
+/// **先筛后读盘**。逐文件打印最多 [`core_scan::content::MAX_LINES_PER_FILE`]
+/// 条命中行，与界面一致。
+fn cmd_content(a: &Args) -> i32 {
+    use core_scan::content::{self, Pattern};
+    let text = match a.get("text") {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => {
+            eprintln!("需要 --text=关键词（在文件内容里找，只搜纯文本类）");
+            return 2;
+        }
+    };
+    let pattern = match Pattern::new(&text, a.has("regex")) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let limit_files = match a.num("limit-files", 20_000) {
+        Ok(n) => n.max(1),
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let max_hits = match a.num("max-hits", 200) {
+        Ok(n) => n.max(1),
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let filters = match cli_search_filters(a) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let (session, _norm) = match open_session_for(a) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    eprintln!();
+    let t0 = Instant::now();
+    // 挑候选：与界面同一套判定（含附加条件），超出 limit-files 就停
+    let mut candidates: Vec<(u32, u64, i64)> = Vec::new();
+    for (i, node) in session.tree.arena.nodes.iter().enumerate() {
+        if candidates.len() >= limit_files {
+            break;
+        }
+        if !node.in_use() || !node.is_file() || node.size > content::MAX_FILE_BYTES {
+            continue;
+        }
+        let name = session.tree.name(i as u32);
+        if !content::is_text_name(name) || !filters.accepts(name, node.size, node.mtime) {
+            continue;
+        }
+        candidates.push((i as u32, node.size, node.mtime));
+    }
+    let total = candidates.len();
+    println!("═══ FileWatch 内容搜索 ═══");
+    println!(
+        "「{}」{}　条件：{}",
+        text,
+        if a.has("regex") { "（正则）" } else { "" },
+        filter_summary(&filters)
+    );
+    println!(
+        "候选 {} 个纯文本文件（上限 {limit_files}），命中上限 {max_hits}",
+        total
+    );
+    println!("注意：不含 Office 文档（docx/xlsx/pptx 是压缩包，引擎不解析）。");
+    println!();
+    let mut hits = 0usize;
+    let mut truncated = false;
+    let mut csv = match a.get("csv") {
+        Some(p) => std::fs::File::create(cli_path(p)).map(Some).unwrap_or_else(|e| {
+            eprintln!("创建 CSV 失败：{e}");
+            None
+        }),
+        None => None,
+    };
+    if csv.is_some() {
+        writeln!(csv.as_mut().unwrap(), "path,bytes,mtime,line_no,text").ok();
+    }
+    let remap = path_remap_of(&session.cfg);
+    for (node, size, mtime) in candidates {
+        if hits >= max_hits {
+            truncated = true;
+            break;
+        }
+        let raw = session.tree.path_of(node);
+        let path = match remap.as_ref() {
+            Some(r) => r.apply(&raw),
+            None => raw,
+        };
+        let lines = content::search_file(std::path::Path::new(&path), &pattern);
+        if lines.is_empty() {
+            continue;
+        }
+        hits += 1;
+        println!("{}　{:>10}　{}", path, human_size(size), fmt_local_time(mtime));
+        for l in &lines {
+            println!("    {:>5}  {}", l.line_no, l.text);
+        }
+        if let Some(f) = csv.as_mut() {
+            for l in &lines {
+                writeln!(
+                    f,
+                    // 同上：时间写本地文本，屏幕与 CSV 一个口径
+                    "{},{},{},{},{}",
+                    csv_field(&path),
+                    size,
+                    fmt_local_time(mtime),
+                    l.line_no,
+                    csv_field(&l.text)
+                )
+                .ok();
+            }
+        }
+    }
+    println!();
+    println!(
+        "命中 {} 个文件（读过 {} 个候选，用时 {} ms）{}",
+        hits,
+        total,
+        t0.elapsed().as_millis(),
+        if truncated { "，已达上限" } else { "" }
+    );
+    if let Some(p) = a.get("csv") {
+        println!("CSV 已写入 {p}");
+    }
+    0
+}
+
+/// `rules` —— 规则试算（E9）：拿**现在的索引**算一遍这套规则会不会触发。
+///
+/// 样本 = 扫描根自身 + 最大的 N 个一级子目录（`Sample::instant`：没有监控
+/// 基线）。于是 abs 规则当场就能判；grow 恒得 0（刚起跑，没有增量）；
+/// rate 如实标"判断不了" —— 与界面「规则试算」同一份引擎代码
+/// （[`core_monitor::simulate`]），两种前端不可能给出两套数。
+fn cmd_rules(a: &Args) -> i32 {
+    let rules: Vec<Rule> = {
+        let mut v = Vec::new();
+        for s in a.get_all("rule") {
+            match parse_rule(s) {
+                Ok(r) => v.push(r),
+                Err(e) => {
+                    eprintln!("规则错误：{}", e);
+                    return 2;
+                }
+            }
+        }
+        v
+    };
+    if rules.is_empty() {
+        eprintln!("需要至少一条 --rule=abs=1G / grow=500M / rate=10M/60s");
+        return 2;
+    }
+    let top = match a.num("top", 20) {
+        Ok(n) => n.max(1),
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let (session, _norm) = match open_session_for(a) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    eprintln!();
+    let remap = path_remap_of(&session.cfg);
+    let root = session.tree.root;
+    // 样本：根 + 一级子目录按体积降序取前 N 个
+    let index = core_index::tree::ChildIndex::build(&session.tree);
+    let kids = core_index::aggregate::sorted_children(
+        &session.tree,
+        index.children(root),
+        core_index::aggregate::SizeMode::Logical,
+    );
+    let mut samples: Vec<core_monitor::Sample> = Vec::new();
+    for &i in kids.iter().take(top) {
+        let node = match session.tree.arena.get(i) {
+            Some(n) if n.is_dir() => n,
+            _ => continue,
+        };
+        let raw = session.tree.path_of(i);
+        let path = match remap.as_ref() {
+            Some(r) => r.apply(&raw),
+            None => raw,
+        };
+        samples.push(core_monitor::Sample::instant(path, node.size));
+    }
+    {
+        let raw = session.tree.path_of(root);
+        let path = match remap.as_ref() {
+            Some(r) => r.apply(&raw),
+            None => raw,
+        };
+        let size = session.tree.arena.get(root).map(|n| n.size).unwrap_or(0);
+        samples.push(core_monitor::Sample::instant(path, size));
+    }
+    let verdicts = core_monitor::simulate(&rules, &samples);
+    println!("═══ FileWatch 规则试算 ═══");
+    println!(
+        "样本：{} 个一级子目录 + 扫描根　规则 {} 条",
+        samples.len() - 1,
+        rules.len()
+    );
+    println!(
+        "说明：CLI 没有监控基线 —— grow 恒为 0（刚起跑），rate 标「判断不了」；"
+    );
+    println!("      abs 按当前体积当场判。与界面「规则试算」同一份引擎代码。");
+    println!();
+    let mut fires = 0usize;
+    let mut unjudgeable = 0usize;
+    for v in &verdicts {
+        let label = rules
+            .get(v.rule_index)
+            .map(rule_label)
+            .unwrap_or_default();
+        if !v.judgeable {
+            unjudgeable += 1;
+            println!(
+                "[判断不了] {}　{}　没有时间跨度，速率规则要跑满一个窗口才有意义",
+                label, v.path
+            );
+        } else if v.fires {
+            fires += 1;
+            println!(
+                "[会触发]  {}　{}　实测 {}，超出 {}",
+                label,
+                v.path,
+                human_size(v.observed),
+                human_size(v.gap as u64)
+            );
+        } else {
+            println!(
+                "[不会触发] {}　{}　实测 {}，差 {}",
+                label,
+                v.path,
+                human_size(v.observed),
+                human_size((-v.gap) as u64)
+            );
+        }
+    }
+    println!();
+    println!(
+        "结论：{} 条会触发 / {} 条判断不了 / 共 {} 条结论",
+        fires,
+        unjudgeable,
+        verdicts.len()
+    );
+    0
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // E6 目录历史
