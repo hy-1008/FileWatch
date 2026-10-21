@@ -118,6 +118,12 @@ fn main() {
             // F13 内容搜索（后台线程 + content:progress / content:done / content:error）
             search::content_search_start,
             search::content_search_status,
+            // E5 敏感文件盘点（纯索引遍历，零 IO）
+            commands::sensitive_scan,
+            // E4 规则试算（绝对阈值有效；增量/速率要跑起来才有意义）
+            commands::rules_simulate,
+            // E3 单文件离线 HTML 报告
+            analyze::export_report,
             // 详情与定位
             commands::node_names,
             commands::node_detail,

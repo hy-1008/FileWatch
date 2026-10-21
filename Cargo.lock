@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "core-index"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "core-io",
  "core-ntfs",
@@ -12,11 +12,11 @@ dependencies = [
 
 [[package]]
 name = "core-io"
-version = "0.1.1"
+version = "0.1.3"
 
 [[package]]
 name = "core-monitor"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "core-index",
  "core-io",
@@ -25,39 +25,40 @@ dependencies = [
 
 [[package]]
 name = "core-ntfs"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "core-io",
 ]
 
 [[package]]
 name = "core-scan"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "core-index",
  "core-io",
  "core-monitor",
  "core-ntfs",
  "core-usn",
+ "core-viz",
 ]
 
 [[package]]
 name = "core-usn"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "core-io",
 ]
 
 [[package]]
 name = "core-viz"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "core-index",
 ]
 
 [[package]]
 name = "filewatch"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "core-index",
  "core-io",

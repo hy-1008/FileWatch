@@ -846,3 +846,127 @@ button.perm.ok:hover { background: rgba(87,201,138,.12); }
 }
 
 .hidden { display: none !important; }
+
+/* ── E1 增长归因 ──────────────────────────────────────────────────────────
+ * 三个榜并排：目录 / 类型 / 时段。用网格而不是 flex，是因为"时段"这一列
+ * 的内容长度差得最远（时间字符串 vs 体积），auto 列宽会让三列各自跳。
+ */
+.attr {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.5fr) minmax(160px, 1fr) minmax(160px, 1fr);
+  gap: 14px;
+  padding: 10px 12px 12px;
+  margin: 2px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  overflow: auto;
+  /* 关键：父级是 flex 列，默认 flex-shrink:1 会把这张卡挤扁 ——
+     实测挤到 110px 时最后一行的字直接被裁掉。归因卡高度按内容走，
+     只在窗口真的很矮时才让内部滚动。 */
+  flex: 0 0 auto;
+  max-height: min(42vh, 340px);
+}
+.attr-col { min-width: 0; }
+.attr h3 {
+  margin: 0 0 6px; font-size: 11px; font-weight: 500; color: var(--text-dim);
+  display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+}
+.attr h3 .hint { font-size: 10px; }
+.attr-h3-sub { margin-top: 10px !important; }
+.attr-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "name val" "track track" "sub sub";
+  gap: 1px 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid transparent;
+}
+.attr-name {
+  grid-area: name; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 12px; line-height: 1.35;
+}
+.attr-val {
+  grid-area: val; font-size: 12px; line-height: 1.35; font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.attr-val.up { color: var(--warn); }
+.attr-val.down { color: var(--accent); }
+.attr-track {
+  grid-area: track; height: 3px; margin: 1px 0 1px;
+  background: var(--bg-hover); border-radius: 2px; overflow: hidden;
+}
+.attr-track i { display: block; height: 100%; background: var(--warn); }
+.attr-track i.down { background: var(--accent); }
+.attr-sub { grid-area: sub; font-size: 10px; line-height: 1.25; color: var(--text-faint); }
+.attr-empty, .attr-note {
+  margin: 2px 0; font-size: 11px; color: var(--text-faint); line-height: 1.5;
+}
+
+/* ── E5 风险清单 ──────────────────────────────────────────────────────────
+ * 六列：级别 / 分类 / 文件名 / 大小 / 修改时间 / 所在目录。
+ * 与搜索结果的五列不同，所以单独一套网格（共用会让两边都得迁就对方）。
+ */
+.rhead, .rrow {
+  display: grid;
+  grid-template-columns: 44px 168px minmax(140px, 1.5fr) 92px 108px minmax(100px, 1.2fr);
+  gap: 10px; align-items: center; padding: 0 10px; white-space: nowrap;
+  min-width: 720px;
+}
+.rhead {
+  position: sticky; top: 0; z-index: 1; height: 26px;
+  color: var(--text-faint); font-size: 11px;
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+}
+.rhead .d, .rrow .d { text-align: right; }
+.rrow { height: var(--row); border-radius: 3px; }
+.rrow:hover { background: var(--bg-hover); }
+.rrow .k { font-size: 11px; }
+.rrow .k.high { color: var(--crit); }
+.rrow .k.medium { color: var(--warn); }
+.rrow .k.low { color: var(--text-dim); }
+.rrow .cat { font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }
+.rrow .n { overflow: hidden; text-overflow: ellipsis; }
+.rrow .t { color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+.rrow .p { overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
+
+/* ── E4 规则试算结果 ─────────────────────────────────────────────────────── */
+.sim {
+  margin: 2px 0 6px; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-panel); max-height: 170px; overflow: auto;
+}
+.sim-row {
+  display: grid; grid-template-columns: 96px minmax(0, 1fr) 84px 132px;
+  gap: 8px; align-items: center; padding: 2px 0; font-size: 11px;
+}
+.sim-row .p { overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
+.sim-row .ok { color: var(--ok); }
+.sim-row .bad { color: var(--crit); }
+.sim-row.fire { background: color-mix(in srgb, var(--crit) 8%, transparent); border-radius: 3px; }
+
+/* ── E2 详情面板：属性标签与"系统查询"分区 ───────────────────────────────── */
+.detail-sec {
+  margin: 8px 0 3px; font-size: 10px; color: var(--text-faint);
+  border-top: 1px solid var(--border); padding-top: 6px;
+}
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; }
+.tag {
+  font-size: 10px; padding: 0 5px; line-height: 16px; border-radius: 8px;
+  background: var(--bg-hover); color: var(--text-dim);
+}
+.detail-note { margin: 2px 0; font-size: 11px; color: var(--text-faint); line-height: 1.5; }
+.drift { color: var(--warn); font-size: 11px; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+
+/* 增长归因的折叠按钮：与预警区同一套（图标掉头表示"已收起"）。
+   这里不用父级 .collapsed 类，因为折叠时隐藏的是卡片本身、标题行要留着，
+   所以状态直接挂在按钮上。 */
+#diff-attr-toggle.collapsed svg { transform: rotate(180deg); }
+/* 一行装下：标题 + 摘要 + 折叠按钮。摘要可以缩、可以省略，但不许换行 ——
+   换行后这条"收起时唯一的信息行"会变成两行，白占掉一格高度。 */
+#diff-attr-head { gap: 6px; flex-wrap: nowrap; }
+#diff-attr-head #diff-attr-sum {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}

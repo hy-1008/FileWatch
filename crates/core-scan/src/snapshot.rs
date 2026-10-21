@@ -121,6 +121,10 @@ impl Snapshot {
         opts: &SnapshotOptions,
         on: &mut Progress<'_>,
     ) -> Snapshot {
+        // 根路径先归一到本平台的分隔符：命令行可以写 `--root=C:/a/b`，
+        // 而 `Tree::path_of` 拼出来的是反斜杠版本。不归一的话，两份快照里
+        // 同一个根会显示成两种写法，对比时被判成"根不同"，归因也切不出目录。
+        let root = &core_io::paths::to_native(root);
         let total = tree
             .arena
             .nodes
@@ -479,6 +483,11 @@ pub struct DiffOptions {
     /// `rows` 最多多少行（0 = 不限）
     pub top: usize,
     pub order: DiffOrder,
+    /// 要不要顺带算增长归因（`None` = 不算）。
+    ///
+    /// 归因必须用**全量**变化行，而全量只在归并结束时存在一次（`rows` 随后会被
+    /// `top` 截断），所以它只能在这里开，不能事后补算 —— 见 [`crate::attribution`]。
+    pub attr: Option<crate::attribution::AttrOptions>,
 }
 
 impl Default for DiffOptions {
@@ -487,6 +496,7 @@ impl Default for DiffOptions {
             min_delta: 0,
             top: 100,
             order: DiffOrder::ByGrowth,
+            attr: None,
         }
     }
 }
@@ -520,6 +530,11 @@ pub struct DiffReport {
     /// 快照本身是否被截断过（截断的快照对比结果不可信，必须提示）
     pub old_truncated: u64,
     pub new_truncated: u64,
+    /// 增长归因（`DiffOptions::attr` 为 `Some` 时才有）。
+    ///
+    /// 与 `rows` 的截断**无关**：它算的是全量变化行，所以"前 300 行"和
+    /// "哪些目录在长"是两份互补的答案。
+    pub attribution: Option<crate::attribution::Attribution>,
 }
 
 /// 对比两份快照。
@@ -615,6 +630,14 @@ pub fn diff_with(
         - rep.shrank_bytes as i64
         - rep.removed_bytes as i64;
     rep.rows_total = all.len() as u64;
+
+    // 归因必须在 `all` 被排序/截断**之前**算：它要全量，而全量只在这里存在。
+    // 此刻 `all` 还是归并出来的路径顺序（同一目录的行相邻），对归因的
+    // HashMap 也更友好。
+    if let Some(ao) = opts.attr {
+        let root = if !new.root.is_empty() { &new.root } else { &old.root };
+        rep.attribution = Some(crate::attribution::build(root, &all, &ao));
+    }
 
     match opts.order {
         DiffOrder::ByGrowth => all.sort_by(|a, b| {

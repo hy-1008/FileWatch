@@ -21,6 +21,9 @@
             <button id="select-folder" type="button">选择文件夹…</button>
             <button id="menu-scan" type="button">扫描当前目录</button>
             <div class="menu-divider"></div>
+            <button id="menu-report" type="button"
+                    title="把当前扫描结果导成一个自包含的 HTML：概览 + 目录面积图 + 最大文件 / 目录 / 类型三张榜。断网也能打开，可以直接转发。">导出 HTML 报告…</button>
+            <div class="menu-divider"></div>
             <button id="menu-refresh" type="button">刷新磁盘列表</button>
           </div>
         </details>
@@ -151,6 +154,15 @@
           <span>阈值规则 <button type="button" class="rule-help mini" aria-label="阈值规则说明">?</button></span>
           <textarea id="mon-rules" rows="2" placeholder="abs=1G / grow=500M / rate=10M/60s　每行一条"></textarea>
         </label>
+        <!-- 规则试算（E4）。写规则的门槛不在语法在判断：abs=1G 到底会不会
+             立刻刷屏、grow=500M 是不是比这台机器一天的正常写入还低。
+             解析器只能答"语法对不对"，这一行答"会不会报"。 -->
+        <div class="row">
+          <button id="mon-simulate" class="mini" type="button"
+                  title="用当前索引试算这套规则：绝对阈值立刻有效；增量 / 速率规则要监控跑起来才有意义">规则试算</button>
+          <span id="mon-sim-hint" class="hint"></span>
+        </div>
+        <div id="mon-sim" class="sim hidden"></div>
 
         <label class="f"><span>轮询间隔</span>
           <span><input id="mon-interval" type="text" value="500" size="5"> ms</span>
@@ -201,6 +213,9 @@
         <button id="view-tab-dup" class="tab" type="button">重复文件</button>
         <button id="view-tab-diff" class="tab" type="button">快照对比</button>
         <button id="view-tab-search" class="tab" type="button">文件搜索</button>
+        <!-- 风险清单：只按文件名/扩展名匹配，不读内容。放在最后是因为它
+             不参与"看空间"的主流程，而是一个偶尔做一次的盘点动作。 -->
+        <button id="view-tab-risk" class="tab" type="button">风险清单</button>
         <span class="spacer"></span>
         <span id="view-hint" class="hint"></span>
       </div>
@@ -314,6 +329,20 @@
           <span id="diff-stage" class="hint"></span>
         </div>
         <div class="tool thin"><span id="diff-summary" class="hint"></span></div>
+        <!-- 增长归因（E1）：三个榜。数据由后端在 diff 里顺带算好（要全量行，
+             前 300 行的表给不出"哪个目录在长"），这里只负责画。
+             标题栏与卡片分开：折叠起来时标题行还要在（它带一句摘要），
+             否则一整块直接消失，用户会以为这个功能没了。 -->
+        <div id="diff-attr-head" class="tool thin hidden">
+          <span class="hint">增长归因</span>
+          <span id="diff-attr-sum" class="hint"></span>
+          <button id="diff-attr-toggle" class="mini icon" type="button"
+                  aria-expanded="true" aria-label="折叠或展开增长归因"
+                  title="折叠增长归因（把高度让给下面的差异明细）">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.1 6 8 10.1 11.9 6"/></svg>
+          </button>
+        </div>
+        <div id="diff-attr" class="attr hidden"></div>
         <div id="diff-list" class="list"></div>
       </div>
 
@@ -371,6 +400,29 @@
         </div>
         <div id="search-list" class="list"></div>
         <div id="content-list" class="list"></div>
+      </div>
+
+      <!-- E5 风险清单。刻意把口径写在页面上：只看文件名与扩展名、不读内容。
+           "没找到" 不等于 "没有风险"，这句话必须出现在用户看得见的地方。 -->
+      <div id="view-risk" class="view hidden">
+        <div class="tool">
+          <label class="f"><span>忽略小于</span>
+            <input id="risk-min-size" class="num" type="text" value="0" size="6"
+                   title="小于这个体积的文件不列出来：0 / 1K / 1M">
+          </label>
+          <label class="f"><span>最多</span>
+            <input id="risk-limit" class="num" type="text" value="500" size="5">
+          </label>
+          <button id="risk-run" class="primary" type="button">盘点</button>
+          <span id="risk-state" class="badge">未盘点</span>
+          <span class="spacer"></span>
+          <span id="risk-summary" class="hint"></span>
+        </div>
+        <div class="tool thin">
+          <span class="hint">按文件名与扩展名匹配（私钥 / 密码库 / 云凭据 / 证件…），<b>不读文件内容</b>。
+            命中不等于"有问题"，它只是指出值得看一眼的位置；扫描全程只读。</span>
+        </div>
+        <div id="risk-list" class="list"></div>
       </div>
     </section>
 

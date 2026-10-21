@@ -247,9 +247,15 @@ impl Tree {
         self.dir_file_counts.get(idx as usize).copied().unwrap_or(0)
     }
 
-    /// 拼接完整路径（形如 `C:\Windows\System32`）。
+    /// 拼接完整路径（Windows `C:\Windows\System32` / Linux `/home/me/docs`）。
     ///
     /// 深度上限 64，遇环立即停止——**绝不因损坏数据死循环**。
+    ///
+    /// 前缀由 [`core_io::paths::root_prefix`] 给出（卷键 → 带尾分隔符的根），
+    /// 分隔符取 `MAIN_SEPARATOR`。把这条口径收在外面，是因为它必须与
+    /// `core-scan::paths::join_path`、`dirwatch::normalize_root`、
+    /// `PathRemap` 完全一致：任何一处用了不同的分隔符，
+    /// 路径索引查表就会**静默失效**（表现为"事件未解析"，不报错）。
     pub fn path_of(&self, idx: u32) -> String {
         const MAX: usize = 64;
         let mut parts: Vec<&str> = Vec::with_capacity(16);
@@ -269,15 +275,14 @@ impl Tree {
             guard += 1;
         }
         parts.reverse();
-        let mut s = self.drive.clone();
-        s.push('\\');
+        let mut s = core_io::paths::root_prefix(&self.drive);
         // 根目录本身的 `$FILE_NAME` 就是 "."，它不该出现在路径里
         let joined = parts
             .iter()
             .filter(|p| !p.is_empty() && **p != ".")
             .cloned()
             .collect::<Vec<_>>()
-            .join("\\");
+            .join(core_io::paths::SEP_STR);
         if joined.is_empty() {
             return s; // 卷根
         }

@@ -2,14 +2,14 @@
 //!
 //! # 为什么需要
 //!
-//! `$MFT` 直读是按**整卷**做的，索引树里每条路径的前缀就是盘符
-//! （`C:\Users\x\a.bin`），这正是磁盘上的真实路径。
+//! `$MFT` 直读是按**整卷**做的，索引树里每条路径的前缀就是卷根
+//! （`C:\Users\x\a.bin` 或 `/home/me/a.bin`），这正是磁盘上的真实路径。
 //!
 //! 但降级模式的目录遍历可以指定一个**深目录**做扫描根
-//! （`--root=D:\projects`）。这时 `Tree::path_of` 拼出来的前缀**仍然**是盘符 ——
-//! 于是拿到的是 `C:\incoming\a.bin`，一个磁盘上并不存在的路径。
+//! （`--root=/home/me/projects`）。这时 `Tree::path_of` 拼出来的前缀**仍然**是
+//! 卷根 —— 于是拿到的是 `/incoming/a.bin`，一个磁盘上并不存在的路径。
 //!
-//! 补一次前缀替换就能还原：`D:\projects\incoming\a.bin`。
+//! 补一次前缀替换就能还原：`/home/me/projects/incoming/a.bin`。
 //!
 //! # 为什么必须同时用在「显示」和「落盘」两处
 //!
@@ -17,7 +17,9 @@
 //! 写的是一堆不存在的路径 —— 用户拿日志回溯问题时才发现对不上。
 //! 所以 CLI 的变更行/预警行和引擎的流水落盘都走这一个实现。
 
-/// `from`（合成的盘根前缀）→ `to`（真实扫描根）。
+use core_io::paths;
+
+/// `from`（合成的卷根前缀）→ `to`（真实扫描根）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathRemap {
     from: String,
@@ -25,42 +27,44 @@ pub struct PathRemap {
 }
 
 impl PathRemap {
-    /// 用「盘符」与「真实扫描根」构造。
+    /// 用「卷键」与「真实扫描根」构造。
     ///
     /// `scan_root` 为空（去掉分隔符后什么都不剩）时返回 `None` —— 没有可替换的东西。
-    /// 扫描根本身就是盘根、或与盘符相同的情形**不**特殊处理：那样替换前后完全等价
+    /// 扫描根本身就是卷根、或与卷键相同的情形**不**特殊处理：那样替换前后完全等价
     /// （`C:\a` → `C:\a`），多一层判断只是多一个出错的地方。
     ///
-    /// `to` 里的正斜杠会被归一成反斜杠：Windows 两种分隔符都认，但
-    /// `C:/a\b` 这种混合形态只是难读 —— 而调用方拿到的路径可能被 shell
-    /// 做过转换（实测 git-bash 会把 `C:\x` 传成 `C:/x`）。
+    /// 分隔符归一：Windows 上把 `/` 换成 `\`（`C:/a\b` 这种混合形态只是难读，
+    /// 而调用方拿到的路径可能被 shell 做过转换 —— 实测 git-bash 会把
+    /// `C:\x` 传成 `C:/x`）；Linux 上不动 `\`（那是合法的文件名字符，
+    /// 换了就等于改名）。
     pub fn new(drive: &str, scan_root: &str) -> Option<PathRemap> {
-        let mut to = scan_root
-            .trim_end_matches(['\\', '/'])
-            .replace('/', "\\");
+        let mut to = scan_root.trim_end_matches(['\\', '/']).to_string();
+        if cfg!(windows) {
+            to = to.replace('/', "\\");
+        }
         if to.is_empty() {
             return None;
         }
-        // 盘根要**保留**尾反斜杠。`C:` 在 Windows 上的语义是「C 盘的当前目录」，
-        // 与 `C:\` 不是一个东西；而索引树里的盘根路径正是 `C:\`。
-        // 削掉尾杠会让扫描根为盘根时输出退化成 `C:` —— 与全项目
-        // 「盘根带尾杠」的约定（`dirwatch::normalize_root`）正好相反。
-        if to.len() == 2 && to.ends_with(':') {
-            to.push('\\');
+        // 卷根要**保留**尾分隔符。`C:` 在 Windows 上的语义是「C 盘的当前目录」，
+        // 与 `C:\` 不是一个东西；而索引树里的卷根路径正是 `C:\`（Linux 上是 `/`）。
+        // 削掉尾分隔符会让扫描根为卷根时输出退化成 `C:` —— 与全项目
+        // 「卷根带尾分隔符」的约定（`dirwatch::normalize_root`）正好相反。
+        if paths::is_volume_root(&to) {
+            to = paths::root_prefix(&to);
         }
-        let from = format!("{}\\", drive.trim_end_matches(['\\', '/']));
+        let from = paths::root_prefix(drive);
         Some(PathRemap { from, to })
     }
 
     /// 把合成路径换回真实路径。不属于该前缀的路径原样返回。
     ///
     /// **幂等**：已经落在真实根下的路径会原样返回。这不是可有可无的洁癖 ——
-    /// `C:\...\proj` 这样的真实路径同样以盘根开头，不加这道判断就会被再改一次，
-    /// 变成 `C:\...\proj\Users\...\proj`。曾经真的发生过（预警行路径自我 append），
+    /// 真实路径同样以卷根开头，不加这道判断就会被再改一次，变成
+    /// `C:\...\proj\Users\...\proj`。曾经真的发生过（预警行路径自我 append），
     /// 而且只在那一条显示路径上出错，最难发现。
     pub fn apply(&self, p: &str) -> String {
         // 已经是真的 → 不动。判断必须落在**路径分量边界**上：
-        // 否则根是 `C:\a\proj` 时，`C:\a\projectX` 会被误认为「已在根下」。
+        // 否则根是 `/a/proj` 时，`/a/projectX` 会被误认为「已在根下」。
         if p.len() >= self.to.len() {
             let head_ok = p
                 .get(..self.to.len())
@@ -68,7 +72,7 @@ impl PathRemap {
                 .unwrap_or(false);
             if head_ok {
                 let rest = &p[self.to.len()..];
-                if rest.is_empty() || rest.starts_with('\\') {
+                if rest.is_empty() || rest.starts_with(paths::SEP) {
                     return p.to_string();
                 }
             }
@@ -83,13 +87,13 @@ impl PathRemap {
         }
         let tail = &p[self.from.len()..];
         if tail.is_empty() {
-            // 被映射的就是盘根本身 → 直接给出扫描根
+            // 被映射的就是卷根本身 → 直接给出扫描根
             return self.to.clone();
         }
-        if self.to.ends_with('\\') {
+        if self.to.ends_with(paths::SEP) {
             format!("{}{}", self.to, tail)
         } else {
-            format!("{}\\{}", self.to, tail)
+            paths::join(&self.to, tail)
         }
     }
 
@@ -99,8 +103,8 @@ impl PathRemap {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, windows))]
+mod windows_tests {
     use super::*;
 
     #[test]
@@ -110,11 +114,11 @@ mod tests {
             r.apply(r"C:\incoming\a.bin"),
             r"C:\Users\me\Downloads\incoming\a.bin"
         );
-        // 盘根本身映射成扫描根
+        // 卷根本身映射成扫描根
         assert_eq!(r.apply(r"C:\"), r"C:\Users\me\Downloads");
         // 大小写不敏感（Windows 路径语义）
         assert_eq!(r.apply(r"c:\docs\x"), r"C:\Users\me\Downloads\docs\x");
-        // 不属于该盘符的路径原样返回
+        // 不属于该卷的路径原样返回
         assert_eq!(r.apply(r"D:\other\x"), r"D:\other\x");
         // 非字符边界 / 超短输入不得 panic
         assert_eq!(r.apply(""), "");
@@ -129,7 +133,7 @@ mod tests {
         assert!(PathRemap::new("C:", "/").is_none());
     }
 
-    /// 扫描根与盘根相同 → 替换是恒等的（不特殊处理，但结果必须正确）
+    /// 扫描根与卷根相同 → 替换是恒等的（不特殊处理，但结果必须正确）
     #[test]
     fn drive_root_scan_root_is_identity() {
         let r = PathRemap::new("C:", r"C:\").expect("应建立重映射");
@@ -153,7 +157,7 @@ mod tests {
 
     /// 幂等：真实路径不能被二次替换。
     ///
-    /// 真实路径同样以盘根开头，所以「匹配前缀就替换」会把它再改一遍 ——
+    /// 真实路径同样以卷根开头，所以「匹配前缀就替换」会把它再改一遍 ——
     /// `C:\a\proj` → `C:\a\proj\a\proj`。这条曾经在预警行上真的发生过。
     #[test]
     fn apply_is_idempotent() {
@@ -183,5 +187,46 @@ mod tests {
         // 真正的分量边界（`\` 或串尾）才算
         assert_eq!(r.apply(r"C:\a\proj\"), r"C:\a\proj\");
         assert_eq!(r.apply(r"C:\a\proj"), r"C:\a\proj");
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_root_prefix_into_scan_root() {
+        let r = PathRemap::new("/", "/home/me/projects").expect("应建立重映射");
+        assert_eq!(
+            r.apply("/incoming/a.bin"),
+            "/home/me/projects/incoming/a.bin"
+        );
+        // `/` 不能拼出 `//`
+        assert!(!r.apply("/x").contains("//"), "{}", r.apply("/x"));
+    }
+
+    /// 卷根就是扫描根 → 恒等；而且**绝不**出现 `//`。
+    #[test]
+    fn root_scan_root_is_identity() {
+        let r = PathRemap::new("/", "/").expect("应建立重映射");
+        assert_eq!(r.apply("/etc/hosts"), "/etc/hosts");
+        assert_eq!(r.apply("/"), "/");
+        assert_eq!(r.root(), "/");
+    }
+
+    #[test]
+    fn idempotent_on_real_paths() {
+        let r = PathRemap::new("/", "/home/me/proj").expect("应建立重映射");
+        let once = r.apply("/incoming/x.bin");
+        assert_eq!(once, "/home/me/proj/incoming/x.bin");
+        assert_eq!(r.apply(&once), once);
+        // 分量边界：`/home/me/projectX` 不算已在 `/home/me/proj` 下
+        assert!(r.apply("/home/me/projectX").starts_with("/home/me/proj/"));
+    }
+
+    #[test]
+    fn empty_root_has_nothing_to_remap() {
+        assert!(PathRemap::new("/", "").is_none());
+        assert!(PathRemap::new("/", "/").is_none());
     }
 }

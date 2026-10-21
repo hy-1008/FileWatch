@@ -18,12 +18,8 @@ use core_index::arena::{Node, NODE_DIR, NODE_IN_USE, NODE_REPARSE};
 use core_index::Tree;
 use core_io::volumes;
 use std::collections::HashMap;
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-/// `FILE_ATTRIBUTE_REPARSE_POINT`
-const FA_REPARSE_POINT: u32 = 0x0000_0400;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TraverseOptions {
@@ -72,14 +68,6 @@ impl TraverseStats {
             core_io::util::human_size(self.total_size)
         )
     }
-}
-
-#[inline]
-fn align_up(v: u64, a: u64) -> u64 {
-    if a == 0 {
-        return v;
-    }
-    v.div_ceil(a) * a
 }
 
 /// 用目录递归遍历做全量扫描（降级模式）。
@@ -184,8 +172,9 @@ where
                 }
             };
 
-            let attrs = md.file_attributes();
-            let is_reparse = attrs & FA_REPARSE_POINT != 0;
+            // 平台差异收在 `core_io::fsmeta` 里：Windows 读 `dwFileAttributes`，
+            // Linux 由 `st_mode` 合成同名位（见该模块的说明）。
+            let is_reparse = core_io::fsmeta::is_reparse(&md);
             let is_dir = md.is_dir();
 
             if is_dir && is_reparse && opts.skip_reparse {
@@ -223,9 +212,14 @@ where
             //   这是降级路径的已知精度取舍，README「已知限制」有列出。
 
             let logical = if is_dir { 0 } else { md.len() };
-            // 遍历模式拿不到真实的「分配簇数」，按簇大小向上取整近似
-            let alloc = if is_dir { 0 } else { align_up(logical, cluster) };
-            let mtime = core_usn::record::filetime_to_unix(md.last_write_time() as i64);
+            // 占用大小：Linux 用内核给的 `st_blocks`（稀疏文件会小于逻辑大小，
+            // 这正是要如实呈现的）；Windows 没有等价字段，按簇向上取整估算。
+            let alloc = if is_dir {
+                0
+            } else {
+                core_io::fsmeta::allocated(&md, logical, cluster)
+            };
+            let mtime = core_io::fsmeta::mtime_unix(&md);
 
             let noff = tree.names.intern_str(&name);
             tree.arena.nodes[idx as usize] = Node {
@@ -272,13 +266,12 @@ where
 mod tests {
     use super::*;
 
+    /// 对齐口径只有一份实现（`core_io::util::align_up`），这里只做存在性检查：
+    /// 遍历的占用估算与快照/重复文件用的是同一个函数。
     #[test]
-    fn align_up_rounds_to_cluster() {
-        assert_eq!(align_up(0, 4096), 0);
-        assert_eq!(align_up(1, 4096), 4096);
-        assert_eq!(align_up(4096, 4096), 4096);
-        assert_eq!(align_up(4097, 4096), 8192);
-        assert_eq!(align_up(100, 0), 100);
+    fn cluster_alignment_uses_the_shared_helper() {
+        assert_eq!(core_io::util::align_up(1, 4096), 4096);
+        assert_eq!(core_io::util::align_up(4097, 4096), 8192);
     }
 
     #[test]

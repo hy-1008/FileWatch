@@ -34,5 +34,5 @@ pub use engine::{
 };
 pub use pathremap::PathRemap;
 pub use queue::RingQueue;
-pub use rules::{Alert, Rule, RuleConfig, RuleEngine, RuleKind, Target};
+pub use rules::{simulate, Alert, Rule, RuleConfig, RuleEngine, RuleKind, Sample, Target, Verdict};
 pub use spec::{parse_ms, parse_rule, parse_rules, parse_size, rule_shape};

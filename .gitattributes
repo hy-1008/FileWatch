@@ -9,6 +9,9 @@
 *.html text eol=lf
 *.md text eol=lf
 *.py text eol=lf
+# 脚本必须是 LF：CRLF 的 shebang 在 Linux/WSL 里会变成
+# `bash: ./x.sh: /usr/bin/env: bad interpreter`（那个 \r 是文件名的最后一个字符）
+*.sh text eol=lf
 LICENSE text eol=lf
 
 # 二进制：别让 git 试图合并或转换它们

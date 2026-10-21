@@ -97,12 +97,12 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
-function fmtTime(unixSec) {
-  if (!unixSec) return '—';
-  const d = new Date(unixSec * 1000);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
+/* 时间只走 `fwLocalTime`（定义在 view-rule.js，带 Invalid Date 与范围保护）。
+ *
+ * 这里原来另有一份 `fmtTime`：同样的功能，但没有 Invalid Date 保护 ——
+ * 遇到坏掉的时间戳（例如垃圾 FILETIME 读出来的巨大负数）会直接印出
+ * `NaN-NaN-NaN NaN:NaN`，而它恰好被「详情」「重复文件」「增长归因」用着。
+ * 两份实现迟早分叉，所以只留一份。 */
 
 let toastTimer = null;
 function toast(msg, isErr) {
@@ -303,6 +303,7 @@ function wireMenus() {
   });
   document.getElementById('select-folder').onclick = chooseFolder;
   document.getElementById('menu-scan').onclick = scanCurrentFolder;
+  document.getElementById('menu-report').onclick = exportReport;
   document.getElementById('menu-refresh').onclick = () => {
     document.getElementById('file-menu').open = false; loadVolumes();
   };
@@ -695,6 +696,39 @@ function renderDetail(info) {
   }
   box.className = 'detail';
   ContextMenu.bind(box, { kind: 'node', node: info.node });
+
+  // 索引里的 MFT 属性位与现场 stat 的属性位是**两套位**，不能混着解：
+  // 前者来自扫描时的 $FILE_NAME / $STANDARD_INFORMATION，后者是此刻的
+  // dwFileAttributes。分两行显示，就是为了不让人把"扫描时压缩"读成"现在压缩"。
+  const mftTags = attrChips(info.flags, FW_NODE_BITS);
+  const diskTags = info.disk ? attrChips(info.disk.attributes, FW_ATTR_BITS) : '';
+
+  let diskBlock = '';
+  if (!info.disk) {
+    diskBlock = `<p class="detail-note">文件现在读不到（可能已被删除或没有权限）。`
+      + `下面的数字来自扫描那一刻的索引。</p>`;
+  } else {
+    const d = info.disk;
+    // 现场大小与索引不同时要说出来：这正是"扫描之后它又被写过"的证据。
+    // **目录不比**：索引里目录的 size 是"子孙合计"，而 stat 拿到的是目录项
+    // 自己的 4 KB —— 两者永远不等，标出来只会让每个目录都看起来"变过"。
+    const drift = !info.is_dir && d.size !== info.size
+      ? `<span class="drift">现已 ${humanSize(d.size)}</span>` : '';
+    // 硬链接数：Windows 的 `std` 不提供这个字段（`fsmeta::nlink` 返回 0）。
+    // 显示"0 个"是在撒谎，所以 0 就整行不出现。
+    const linkRow = d.nlink > 0
+      ? `<tr><td>硬链接</td><td>${d.nlink.toLocaleString()} 个${d.nlink > 1 ? '（删一个名字不会释放空间）' : ''}</td></tr>`
+      : '';
+    diskBlock =
+      `<div class="detail-sec">系统查询（点击时）</div>` +
+      `<table>` +
+      `<tr><td>创建</td><td>${d.ctime ? esc(fwLocalTime(d.ctime)) : '—'}</td></tr>` +
+      linkRow +
+      `<tr><td>逻辑大小</td><td>${humanSize(d.size)} ${drift}</td></tr>` +
+      `</table>` +
+      (diskTags ? `<div class="chips">${diskTags}</div>` : '');
+  }
+
   box.innerHTML =
     `<table>` +
     `<tr><td>名称</td><td>${esc(info.name === '.' ? info.path : info.name)}</td></tr>` +
@@ -703,9 +737,14 @@ function renderDetail(info) {
     `<tr><td>占用</td><td>${humanSize(info.alloc)}</td></tr>` +
     (info.is_dir ? `<tr><td>子项</td><td>${info.children.toLocaleString()} 个，含 ${info.files.toLocaleString()} 个文件</td></tr>` : '') +
     `<tr><td>深度</td><td>${info.depth}</td></tr>` +
-    `<tr><td>修改</td><td>${fmtTime(info.mtime)}</td></tr>` +
+    `<tr><td>修改</td><td>${fwLocalTime(info.mtime)}</td></tr>` +
+    // 引用号：改名不变、移动不变，只有删除重建才变 —— 用它判断"还是不是同一个文件"
+    `<tr><td>引用号</td><td class="mono" title="序列号 ${info.seq} · 记录号 ${info.node}">${esc(info.frn)}</td></tr>` +
     `<tr><td>路径</td><td>${esc(info.path)}</td></tr>` +
-    `</table>`;
+    `</table>` +
+    `<div class="detail-sec">MFT 属性（扫描时）</div>` +
+    (mftTags ? `<div class="chips">${mftTags}</div>` : '<p class="detail-note">没有特殊属性。</p>') +
+    diskBlock;
 }
 
 /* ── F0 管理员权限（进入软件时申请）─────────────────────────────────────
@@ -1386,6 +1425,7 @@ function wireMonitor() {
   document.getElementById('mon-start').onclick = startMonitor;
   document.getElementById('mon-stop').onclick = stopMonitor;
   document.getElementById('mon-export').onclick = exportCsv;
+  document.getElementById('mon-simulate').onclick = runSimulate;
   document.getElementById('mon-use-focus').onclick = () => fillPaths('focus');
   document.getElementById('mon-use-vol').onclick = () => fillPaths('volume');
 
@@ -1413,6 +1453,7 @@ const VIEW_HINTS = {
   dup: '三级筛选：体积 → 首尾各 4 KiB 哈希 → 全文件哈希 → 逐字节复核',
   diff: '方向固定为「快照 → 现在的扫描结果」',
   search: '搜索在内存索引里做 · 不重新遍历磁盘',
+  risk: '按文件名与扩展名匹配 · 不读文件内容 · 只读不修改',
 };
 
 function setView(v) {
@@ -1421,10 +1462,12 @@ function setView(v) {
   document.getElementById('view-dup').classList.toggle('hidden', v !== 'dup');
   document.getElementById('view-diff').classList.toggle('hidden', v !== 'diff');
   document.getElementById('view-search').classList.toggle('hidden', v !== 'search');
+  document.getElementById('view-risk').classList.toggle('hidden', v !== 'risk');
   document.getElementById('view-tab-map').classList.toggle('on', v === 'map');
   document.getElementById('view-tab-dup').classList.toggle('on', v === 'dup');
   document.getElementById('view-tab-diff').classList.toggle('on', v === 'diff');
   document.getElementById('view-tab-search').classList.toggle('on', v === 'search');
+  document.getElementById('view-tab-risk').classList.toggle('on', v === 'risk');
   document.getElementById('view-hint').textContent = VIEW_HINTS[v] || '';
   if (v === 'map') refreshLayout().catch(() => {});
   // 切到搜索页就把光标放进输入框：进这个页签的下一步一定是打字
@@ -1540,7 +1583,7 @@ function renderDupList() {
       row.className = 'dfile';
       row.title = f.path;
       row.innerHTML = `<span class="p">${esc(f.path)}</span>`
-        + `<span class="d">${fmtTime(f.mtime)}</span>`;
+        + `<span class="d">${fwLocalTime(f.mtime)}</span>`;
       el.appendChild(row);
     }
     box.appendChild(el);
@@ -1671,6 +1714,7 @@ function renderDiff() {
       + '之后改动了磁盘，再填上那份快照的路径点「对比」。';
     sum.className = 'hint';
   }
+  renderDiffAttr(v);
   renderDiffList();
 }
 
@@ -2064,11 +2108,396 @@ async function backfillDup() {
   renderDup();
 }
 
+/* ── E1 增长归因 ─────────────────────────────────────────────────────────
+ *
+ * 三个榜的数据由**后端在 diff 里算好**（要全量变化行，前 300 行的明细表给不出
+ * "哪个目录在长"）。这里只负责画，不重新聚合 —— 否则同一份快照在界面和
+ * CSV / CLI 里会得出两套数。
+ */
+
+/** 带正负号的体积。`−` 用减号（U+2212）而不是连字符：和数字并排时才不会看成破折号。 */
+function signedSize(n) {
+  if (!n) return '0 B';
+  return (n > 0 ? '+' : '−') + humanSize(Math.abs(n));
+}
+
+/** 路径保尾截断（后端的 `truncate_keep_tail` 同口径：信息在最后几段）。 */
+function tailPath(s, n) {
+  if (!s || s.length <= n) return s || '';
+  return '…' + s.slice(s.length - n);
+}
+
+let attrCollapsed = false;
+
+/** 造一行：名字 / 数值 / 归一化横条 / 副标题。 */
+function attrLine(name, value, ratio, sub, mono) {
+  const row = document.createElement('div');
+  row.className = 'attr-line';
+  row.title = name;
+
+  const n = document.createElement('span');
+  n.className = 'attr-name' + (mono ? ' mono' : '');
+  n.textContent = name;
+
+  const v = document.createElement('span');
+  const down = value.startsWith('−');
+  v.className = 'attr-val ' + (down ? 'down' : 'up');
+  v.textContent = value;
+
+  const track = document.createElement('span');
+  track.className = 'attr-track';
+  const bar = document.createElement('i');
+  if (down) bar.className = 'down';
+  // ratio = null 表示这一列不该画条（例如时段列里刚归零的桶）
+  if (ratio !== null && Number.isFinite(ratio)) bar.style.width = `${(ratio * 100).toFixed(1)}%`;
+  track.appendChild(bar);
+
+  const s = document.createElement('span');
+  s.className = 'attr-sub';
+  s.textContent = sub;
+
+  row.append(n, v, track, s);
+  return row;
+}
+
+function attrCol(title, hintText) {
+  const col = document.createElement('div');
+  col.className = 'attr-col';
+  const h = document.createElement('h3');
+  h.textContent = title;
+  if (hintText) {
+    const s = document.createElement('span');
+    s.className = 'hint';
+    s.textContent = hintText;
+    h.appendChild(s);
+  }
+  col.appendChild(h);
+  return col;
+}
+
+function attrEmpty(text) {
+  const p = document.createElement('p');
+  p.className = 'attr-empty';
+  p.textContent = text;
+  return p;
+}
+
+/** 折叠/展开归因卡。状态只在本次会话里记 —— 这张卡只在"刚比过一次"之后存在，
+ *  存进偏好会变成"下次打开时莫名其妙是收起的"。 */
+function toggleDiffAttr() {
+  attrCollapsed = !attrCollapsed;
+  const btn = document.getElementById('diff-attr-toggle');
+  btn.setAttribute('aria-expanded', String(!attrCollapsed));
+  btn.classList.toggle('collapsed', attrCollapsed);
+  const box = document.getElementById('diff-attr');
+  // 折叠时连"有没有内容"都不用问：直接收掉，标题行留着
+  box.classList.toggle('hidden', attrCollapsed);
+}
+
+function renderDiffAttr(v) {
+  const box = document.getElementById('diff-attr');
+  const head = document.getElementById('diff-attr-head');
+  const sum = document.getElementById('diff-attr-sum');
+  const a = v && v.attr;
+  const hasUp = a && a.dirs_up.length;
+  const hasDown = a && a.dirs_down.length;
+  const hasExt = a && a.exts.some((e) => e.delta !== 0);
+  if (!a || (!hasUp && !hasDown && !hasExt)) {
+    box.classList.add('hidden');
+    head.classList.add('hidden');
+    box.replaceChildren();
+    return;
+  }
+  head.classList.remove('hidden');
+  box.classList.toggle('hidden', attrCollapsed);
+
+  // 收起后这一行就是全部信息：谁在长、长了多少、总共动了多少目录
+  const top = a.dirs_up[0];
+  sum.textContent = top
+    ? `增长最多：${tailPath(top.dir, 40)} ${signedSize(top.delta)}　共 ${a.dirs_total.toLocaleString()} 个目录有变化`
+    : `共 ${a.dirs_total.toLocaleString()} 个目录有变化，没有变大的`;
+
+  box.replaceChildren();
+
+  // ── 目录 ────────────────────────────────────────────────────────────
+  const colDir = attrCol('增长最多的目录', `聚合到 ${a.dir_depth} 层 · 共 ${a.dirs_total.toLocaleString()} 个目录有变化`);
+  if (!hasUp) {
+    colDir.appendChild(attrEmpty('没有变大的目录。'));
+  } else {
+    // 条形按**本列最大增量**归一：同一列里比才有意义
+    const upMax = Math.max(1, ...a.dirs_up.map((d) => d.delta));
+    for (const d of a.dirs_up.slice(0, 5)) {
+      const row = attrLine(tailPath(d.dir, 46), signedSize(d.delta), d.delta / upMax,
+        `${d.files.toLocaleString()} 个文件`, false);
+      row.title = d.dir;
+      // 右键与快照明细行同一套：目录可能已经不存在了，所以"定位/打开"交给后端兜底
+      ContextMenu.bind(row, { kind: 'attrdir', row: d });
+      colDir.appendChild(row);
+    }
+  }
+  if (hasDown) {
+    const sub = document.createElement('h3');
+    sub.className = 'attr-h3-sub';
+    sub.textContent = '减少最多';
+    colDir.appendChild(sub);
+    const downMax = Math.max(1, ...a.dirs_down.slice(0, 2).map((d) => Math.abs(d.delta)));
+    for (const d of a.dirs_down.slice(0, 2)) {
+      const row = attrLine(tailPath(d.dir, 46), signedSize(d.delta), Math.abs(d.delta) / downMax,
+        `${d.files.toLocaleString()} 个文件`, false);
+      row.title = d.dir;
+      ContextMenu.bind(row, { kind: 'attrdir', row: d });
+      colDir.appendChild(row);
+    }
+  }
+  box.appendChild(colDir);
+
+  // ── 类型 ────────────────────────────────────────────────────────────
+  const colExt = attrCol('按类型', '变化幅度最大的五类');
+  // 榜是按增量降序来的，直接取前几个会全是"新增"，把"减少得最厉害的"漏掉
+  const extTop = a.exts
+    .filter((e) => e.delta !== 0)
+    .slice()
+    .sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta))
+    .slice(0, 5);
+  if (!extTop.length) {
+    colExt.appendChild(attrEmpty('没有按类型的变化。'));
+  } else {
+    const extMax = Math.max(1, ...extTop.map((e) => Math.abs(e.delta)));
+    for (const e of extTop) {
+      const name = e.ext || '(无扩展名)';
+      const text = `${name}\t${signedSize(e.delta)}\t${e.files.toLocaleString()} 个文件`;
+      const row = attrLine(name, signedSize(e.delta), Math.abs(e.delta) / extMax,
+        `${e.files.toLocaleString()} 个文件`, false);
+      row.title = text;
+      ContextMenu.bind(row, { kind: 'attrcopy', text });
+      colExt.appendChild(row);
+    }
+  }
+  box.appendChild(colExt);
+
+  // ── 时段 ────────────────────────────────────────────────────────────
+  const colTime = attrCol('变化最集中的时段', '按文件修改时间');
+  const burstTop = a.bursts.slice(0, 3);
+  if (!burstTop.length) {
+    colTime.appendChild(attrEmpty('快照里没有可用的时间。'));
+  } else {
+    const burstMax = Math.max(1, ...burstTop.map((b) => Math.abs(b.delta)));
+    for (const b of burstTop) {
+      const t = fwLocalTime(b.hour_unix);
+      const text = `${t}\t${signedSize(b.delta)}\t${b.files.toLocaleString()} 个文件`;
+      const row = attrLine(t, signedSize(b.delta), Math.abs(b.delta) / burstMax,
+        `${b.files.toLocaleString()} 个文件`, true);
+      row.title = text;
+      ContextMenu.bind(row, { kind: 'attrcopy', text });
+      colTime.appendChild(row);
+    }
+  }
+  const note = document.createElement('p');
+  note.className = 'attr-note';
+  note.textContent = '删除的行没有"删除时间"这个信息，它归到文件最后修改的那个小时。';
+  colTime.appendChild(note);
+  box.appendChild(colTime);
+}
+
+
+/* ── E5 风险清单 ─────────────────────────────────────────────────────────
+ *
+ * 纯内存遍历（零 IO），所以同步命令、不做进度条。
+ * 页面上的口径必须写死：只看文件名与扩展名。"没找到" 不等于 "没有风险"。
+ */
+const risk = { view: null, error: null, running: false };
+
+async function runRisk() {
+  if (!state.summary) { risk.error = '先扫描一个盘或目录：风险清单是在索引里过规则。'; renderRisk(); return; }
+  risk.running = true;
+  risk.error = null;
+  renderRisk();
+  const min = document.getElementById('risk-min-size').value.trim();
+  const limit = document.getElementById('risk-limit').value.trim();
+  try {
+    risk.view = await call('sensitive_scan', {
+      min,
+      limit: limit ? Number(limit) : null,
+    });
+  } catch (e) {
+    risk.error = typeof e === 'string' ? e : (e && e.message) || String(e);
+  } finally {
+    risk.running = false;
+    renderRisk();
+  }
+}
+
+/** Windows 属性位 → 中文。只列"看得懂而且有意义"的那几个。 */
+const FW_ATTR_BITS = [
+  [0x0001, '只读'], [0x0002, '隐藏'], [0x0004, '系统'], [0x0020, '存档'],
+  [0x0100, '临时'], [0x0200, '稀疏'], [0x0400, '重解析点'],
+  [0x0800, '压缩'], [0x1000, '离线'], [0x2000, '未建索引'], [0x4000, '加密'],
+];
+
+/** 索引里的 `NODE_*` 位 → 中文（来自 MFT 解析，不是现场 stat）。 */
+const FW_NODE_BITS = [
+  [0x0004, '硬链接'], [0x0008, '重解析点'], [0x0010, '压缩'],
+  [0x0020, '稀疏'], [0x0040, '含 ADS'], [0x0080, '数据驻留'],
+  [0x0100, '属性列表溢出'], [0x0200, '孤儿节点'],
+];
+
+function attrChips(bits, table) {
+  return table.filter(([bit]) => bits & bit).map(([, name]) => `<span class="tag">${name}</span>`).join('');
+}
+
+function renderRisk() {
+  const badge = document.getElementById('risk-state');
+  const sum = document.getElementById('risk-summary');
+  const box = document.getElementById('risk-list');
+  const v = risk.view;
+
+  badge.textContent = risk.running ? '盘点中' : risk.error ? '失败' : v ? `${v.matched.toLocaleString()} 条` : '未盘点';
+  badge.className = 'badge' + (v && !risk.error ? ' mft' : '');
+
+  if (risk.error) {
+    sum.textContent = risk.error;
+    sum.className = 'hint note-warn';
+  } else if (!v) {
+    sum.textContent = '点「盘点」过一遍索引。';
+    sum.className = 'hint';
+  } else if (!v.matched) {
+    sum.textContent = `按 ${v.rules} 条规则扫过 ${v.scanned.toLocaleString()} 个文件，没有命中（用时 ${v.elapsed_ms} ms）`;
+    sum.className = 'hint';
+  } else {
+    sum.textContent = `${v.matched.toLocaleString()} 条命中`
+      + (v.truncated ? `，只列前 ${v.rows.length.toLocaleString()} 条` : '')
+      + `　按 ${v.rules} 条规则扫过 ${v.scanned.toLocaleString()} 个文件，用时 ${v.elapsed_ms} ms`;
+    sum.className = 'hint';
+  }
+
+  box.innerHTML = '';
+  if (!v || !v.rows.length) {
+    box.innerHTML = `<div class="mon-empty">${v ? '没有命中。这不等于「没有风险」：只看文件名与扩展名，\n文件内容里有没有密钥它不知道。' : '还没有盘点。'}</div>`;
+    return;
+  }
+
+  const head = document.createElement('div');
+  head.className = 'rhead';
+  head.innerHTML = '<span>级别</span><span>分类</span><span>文件名</span>'
+    + '<span class="d">大小</span><span>修改时间</span><span>所在目录</span>';
+  box.appendChild(head);
+
+  for (const h of v.rows) {
+    const row = document.createElement('div');
+    row.className = 'rrow';
+    const dir = h.path.length > h.name.length
+      ? h.path.slice(0, h.path.length - h.name.length).replace(/[\\/]+$/, '')
+      : '';
+    row.title = `${h.path}\n${h.why}`;
+    row.innerHTML =
+      `<span class="k ${h.severity}">${esc(h.severity_cn)}</span>` +
+      `<span class="cat">${esc(h.category)}</span>` +
+      `<span class="n">${esc(fwMiddleEllipsis(h.name, 48))}</span>` +
+      `<span class="d">${humanSize(h.size)}</span>` +
+      `<span class="t">${esc(fwLocalTime(h.mtime))}</span>` +
+      `<span class="p">${esc(dir || '—')}</span>`;
+    ContextMenu.bind(row, { kind: 'node', node: h.node });
+    row.ondblclick = async () => {
+      try {
+        const parent = await call('node_parent', { node: h.node });
+        monShow(false); setView('map'); await goto(parent); await pickNode(h.node);
+      } catch (e) { /* call() 已提示 */ }
+    };
+    box.appendChild(row);
+  }
+}
+
+/* ── E4 规则试算 ─────────────────────────────────────────────────────────
+ *
+ * 只对当前索引负责：绝对阈值现在就能判，增量/速率必须有监控起点。
+ * 所以后端把基线设成"现在"，judgeable=false 的那几条要**明确说不能判**，
+ * 而不是显示"不会触发" —— 后者会被当成"阈值设得很安全"。
+ */
+async function runSimulate() {
+  const hint = document.getElementById('mon-sim-hint');
+  const rules = document.getElementById('mon-rules').value;
+  const paths = document.getElementById('mon-paths').value
+    .split('\n').map((s) => s.trim()).filter(Boolean);
+  // 没填目标时用当前视图根：绝大多数场景就是"我想盯这个目录"
+  if (!paths.length && state.focus != null) {
+    const p = cachedPath(state.focus);
+    if (p) paths.push(p);
+  }
+  if (!paths.length) { hint.textContent = '先填一个监控目标，或在左侧选一个目录'; return; }
+  hint.textContent = '试算中…';
+  try {
+    const v = await call('rules_simulate', { paths, rules });
+    renderSim(v);
+  } catch (e) {
+    hint.textContent = typeof e === 'string' ? e : '试算失败';
+  }
+}
+
+function renderSim(v) {
+  const box = document.getElementById('mon-sim');
+  const hint = document.getElementById('mon-sim-hint');
+  if (!v) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+
+  hint.textContent = v.fires
+    ? `会立刻触发 ${v.fires} 条`
+    : (v.verdicts.some((x) => !x.judgeable) ? '绝对阈值都没超（增量/速率要跑起来才算）' : '按当前数据都不会触发');
+
+  const ruleText = (i) => (v.rules[i] ? v.rules[i].text : `#${i + 1}`);
+  const rows = v.verdicts.map((x) => {
+    let right;
+    if (!x.judgeable) {
+      right = '<span class="dim">要跑满一个窗口才能判断</span>';
+    } else if (x.fires) {
+      right = `<span class="bad">超出 ${humanSize(Math.abs(x.gap))}</span>`;
+    } else {
+      right = `<span class="ok">还差 ${humanSize(Math.abs(x.gap))}</span>`;
+    }
+    return `<div class="sim-row${x.fires ? ' fire' : ''}">`
+      + `<span class="mono">${esc(ruleText(x.rule_index))}</span>`
+      + `<span class="p" title="${esc(x.path)}">${esc(tailPath(x.path, 40))}</span>`
+      + `<span class="${x.judgeable ? '' : 'dim'}">${x.judgeable ? humanSize(x.observed) : '—'}</span>`
+      + right
+      + '</div>';
+  }).join('');
+
+  const missing = v.missing.length
+    ? `<p class="attr-note">这些路径不在索引里，没参与试算：${esc(v.missing.join('、'))}</p>`
+    : '';
+  box.innerHTML = rows + missing;
+}
+
+/* ── E3 导出单文件 HTML 报告 ─────────────────────────────────────────────
+ *
+ * 落盘位置由用户选**文件夹**、文件名由后端拼（与快照 / CSV 一套规矩：
+ * 里面带 UTC 时间戳，和正文里的生成时间对得上）。
+ */
+async function exportReport() {
+  if (!state.summary) { toast('先扫描一个盘或目录再导出报告', true); return; }
+  let dir;
+  try {
+    dir = await call('choose_path', { kind: 'folder', title: '把 HTML 报告存到哪个文件夹' });
+  } catch (e) { return; }
+  if (!dir) return;
+  try {
+    const out = await call('export_report', { path: dir, top: 30 });
+    toast(`报告已导出：${out}`);
+  } catch (e) { /* call() 已提示 */ }
+}
+
 function wireViews() {
   document.getElementById('view-tab-map').onclick = () => setView('map');
   document.getElementById('view-tab-dup').onclick = () => setView('dup');
   document.getElementById('view-tab-diff').onclick = () => setView('diff');
   document.getElementById('view-tab-search').onclick = () => setView('search');
+  document.getElementById('view-tab-risk').onclick = () => setView('risk');
+
+  document.getElementById('risk-run').onclick = runRisk;
+  for (const id of ['risk-min-size', 'risk-limit']) {
+    document.getElementById(id).onkeydown = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); runRisk(); }
+    };
+  }
 
   document.getElementById('dup-start').onclick = startDup;
   document.getElementById('dup-export').onclick = dupExport;
@@ -2082,6 +2511,7 @@ function wireViews() {
     pickInto('diff-save-path', 'folder', '把快照存到哪个文件夹');
   document.getElementById('diff-csv-pick').onclick = () =>
     pickInto('diff-csv', 'folder', '把差异 CSV 存到哪个文件夹');
+  document.getElementById('diff-attr-toggle').onclick = toggleDiffAttr;
   document.getElementById('diff-order').onchange = () => {
     // 已经比过一次的话，换个排序就重排一遍（后端重跑 diff 很快，数据都在内存里）
     if (diff.view) compareSnapshot();
@@ -2170,6 +2600,9 @@ async function boot() {
   backfillMonitor().catch(() => {});
   backfillDup().catch(() => {});
   backfillDiff().catch(() => {});
+  // 风险清单没有"后台作业"，开场画一次空状态就行 —— 但必须画：
+  // 页签上的徽标与提示语由这个函数负责，不画就是"未盘点"三个字都没有。
+  renderRisk();
 
   document.getElementById('refresh-vols').onclick = loadVolumes;
   document.getElementById('drives-toggle').onclick = toggleDrives;

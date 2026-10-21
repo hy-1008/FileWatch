@@ -18,10 +18,13 @@ use core_viz::{LayoutResult, Rect};
 /// 文件名写 2026」这种一年只错一次、因而极难复现的问题。
 /// 换算属于「把人看不懂的值变成人看得懂的文本」，与 `human_size` 同类，
 /// 所以和它放在一起。
-pub use core_io::util::unix_utc as fmt_unix_utc;
+/// **本地**时间（`2026-10-14 21:15:00`）。终端上显示的时间是给人看的，
+/// 用户对表的是任务栏，不是 UTC —— 差 8 小时就是"时间不对"。
+/// `unix_utc` 仍然保留（`--json` 之类需要机器可读、时区无关的地方用它）。
+pub use core_io::util::local_time as fmt_local_time;
 
-/// `20261014-131500`：给文件名用的紧凑时间戳（同一份换算，见上）。
-pub use core_io::util::unix_stamp as fmt_unix_stamp;
+/// `20261014-211500`：给文件名用的紧凑时间戳（本地，与上面同一份换算）。
+pub use core_io::util::local_stamp as fmt_local_stamp;
 
 /// 毫秒时间戳（相对起点）→ `mm:ss.mmm`，用于监控日志行首。
 pub fn fmt_offset_ms(ms: u64) -> String {
@@ -300,11 +303,17 @@ mod tests {
     use super::*;
 
     /// 时间格式化的用例**搬到了 `core_io::util`**（那里是唯一实现）。
-    /// 这里只留一条"转出去的名字没接错"的冒烟断言。
+    /// 这里只留一条"转出去的名字没接错"的冒烟断言 —— 只验形状，
+    /// 不验具体时刻：本地时间依赖运行这台机器的时区。
     #[test]
     fn time_helpers_are_reexported_not_reimplemented() {
-        assert_eq!(fmt_unix_utc(1_609_459_200), "2021-01-01 00:00:00Z");
-        assert_eq!(fmt_unix_stamp(1_609_459_200), "20210101-000000");
+        let t = fmt_local_time(1_609_459_200);
+        assert_eq!(t.len(), 19, "{t}");
+        assert_eq!(&t[4..5], "-", "{t}");
+        assert_eq!(&t[10..11], " ", "{t}");
+        let s = fmt_local_stamp(1_609_459_200);
+        assert_eq!(s.len(), 15, "{s}");
+        assert_eq!(&s[8..9], "-", "{s}");
     }
 
     #[test]

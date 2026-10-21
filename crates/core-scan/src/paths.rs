@@ -24,14 +24,9 @@ use core_monitor::{PathRemap, PendingEvent};
 /// 看起来琐碎，但它是「盘根一律保留尾反斜杠」这条约定的唯一落点：
 /// 少了它，根目录下的每个文件都会多一个反斜杠。
 pub fn join_path(dir: &str, name: &str) -> String {
-    if dir.is_empty() {
-        return name.to_string();
-    }
-    if dir.ends_with('\\') {
-        format!("{dir}{name}")
-    } else {
-        format!("{dir}\\{name}")
-    }
+    // 唯一实现：分隔符与"卷根带尾分隔符"的约定都在 `core_io::paths` 里
+    // （Windows `\` / Linux `/`），这里只做转发。
+    core_io::paths::join(dir, name)
 }
 
 /// 事件所属的**合成**路径（前缀是盘符，尚未重映射）。

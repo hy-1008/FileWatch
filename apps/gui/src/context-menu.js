@@ -152,6 +152,26 @@ async function contextItems(descriptor) {
       ...(row.target_path ? [item('target', '查看所属监控…', () => contextMonitor(row.target_path))] : []),
     ] };
   }
+  // 增长归因的目录行：目录可能已经不存在了（这正是"删掉了"的意思），
+  // 所以"打开/定位"交给后端兜底（找不到就退到仍存在的上级）。
+  if (descriptor.kind === 'attrdir') {
+    const row = descriptor.row;
+    return { title: row.dir, items: [
+      item('locate', '在面积图中定位所在目录', () => contextLocate(row.dir), state.focus === null),
+      item('reveal', '在文件资源管理器中打开', () => contextExplore(row.dir)),
+      item('select', '在资源管理器中定位', () => contextReveal(row.dir)),
+      separator(),
+      item('copy-path', '复制完整路径', () => contextCopy(row.dir)),
+      item('copy-line', '复制这一行的归因', () => contextCopy(
+        `${signedText(row.delta)}\t${row.files} 个文件\t${row.dir}`)),
+    ] };
+  }
+  // 类型 / 时段行没有独立路径，只能复制这一行
+  if (descriptor.kind === 'attrcopy') {
+    return { title: descriptor.text, items: [
+      item('copy-line', '复制这一行', () => contextCopy(descriptor.text)),
+    ] };
+  }
   if (descriptor.kind === 'diffrow') {
     const row = descriptor.row;
     return { title: row.path, items: [

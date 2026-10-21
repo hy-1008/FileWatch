@@ -395,7 +395,7 @@ fn stamp_name(stem: &str, ext: &str) -> String {
     format!(
         "filewatch-{}-{}.{}",
         stem,
-        core_io::util::unix_stamp(core_io::util::unix_secs()),
+        core_io::util::local_stamp(core_io::util::unix_secs()),
         ext
     )
 }
@@ -438,7 +438,7 @@ pub struct SnapshotInfo {
     pub path: String,
     pub root: String,
     pub created_unix: i64,
-    /// 好看的时间（UTC）
+    /// 好看的时间（**本地**）
     pub created_text: String,
     pub entries: u64,
     pub truncated: u64,
@@ -448,11 +448,14 @@ pub struct SnapshotInfo {
     pub bytes_on_disk: u64,
 }
 
-/// 默认落盘路径：桌面 + `filewatch-<类型>-<UTC 时间戳>.<扩展名>`。
+/// 默认落盘路径：桌面 + `filewatch-<类型>-<本地时间戳>.<扩展名>`。
 ///
-/// 三个导出（快照 / 重复文件 / 差异 CSV）共用它。**时间戳由引擎给**
-/// （[`core_io::util::unix_stamp`]）：前端自己 `new Date()` 拼的话就是本地时区，
-/// 而快照正文里的时间是 UTC，两边会在同一个文件名上对不上。
+/// 三个导出（快照 / 重复文件 / 差异 CSV）共用它。**时间戳由后端给**
+/// （[`core_io::util::local_stamp`]）：前端自己 `new Date()` 拼也能得到本地时间，
+/// 但那样时间口径就分成了两份，改一处漏一处迟早会在同一个文件名上对不上。
+///
+/// 用**本地**时间而不是 UTC：这个文件名是给用户认的（"这是晚上九点那份"），
+/// 而资源管理器、任务栏都是本地时间。
 ///
 /// 未知的 `kind` 直接报错，不兜底成某个默认值 —— 兜底只会让前端拼错名字时
 /// 静默导出到"另一个看起来也对"的文件。
@@ -750,7 +753,7 @@ pub fn snapshot_save(
                 path: out.to_string_lossy().to_string(),
                 root: snap.root.clone(),
                 created_unix: snap.created_unix,
-                created_text: core_io::util::unix_utc(snap.created_unix),
+                created_text: core_io::util::local_time(snap.created_unix),
                 entries: snap.len() as u64,
                 truncated: snap.truncated,
                 total_size,
@@ -791,6 +794,53 @@ pub struct DiffRowDto {
     pub ctime: i64,
 }
 
+/// 目录归因的一行。
+#[derive(Debug, Clone, Serialize)]
+pub struct DirDeltaDto {
+    pub dir: String,
+    pub delta: i64,
+    pub added: u64,
+    pub removed: u64,
+    pub grew: u64,
+    pub shrank: u64,
+    pub files: u32,
+}
+
+/// 类型归因的一行。
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtDeltaDto {
+    pub ext: String,
+    pub delta: i64,
+    pub added: u64,
+    pub removed: u64,
+    pub files: u32,
+}
+
+/// 时段归因的一行。
+#[derive(Debug, Clone, Serialize)]
+pub struct BurstDto {
+    pub hour_unix: i64,
+    pub delta: i64,
+    pub files: u32,
+}
+
+/// 增长归因（E1）的界面版。字段名与引擎一一对应，不做重命名 ——
+/// 一旦两边叫法不同，改引擎的人就不知道界面在等什么。
+#[derive(Debug, Clone, Serialize)]
+pub struct AttributionDto {
+    pub dir_depth: u32,
+    pub total_delta: i64,
+    pub files: u64,
+    pub dirs_total: u32,
+    /// 增长榜（降序）
+    pub dirs_up: Vec<DirDeltaDto>,
+    /// 减少榜（最负的在前）
+    pub dirs_down: Vec<DirDeltaDto>,
+    /// 全部扩展名（按 delta 降序，不截断）
+    pub exts: Vec<ExtDeltaDto>,
+    pub bursts: Vec<BurstDto>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffView {
     pub summary: String,
@@ -812,6 +862,9 @@ pub struct DiffView {
     pub net_delta: i64,
     pub rows_total: u64,
     pub rows: Vec<DiffRowDto>,
+    /// 增长归因（E1）。`None` = 这次对比没算（不会出现在界面的对比流程里，
+    /// 留 `Option` 是为了 CSV / 老调用方不必被迫消费它）。
+    pub attr: Option<AttributionDto>,
     /// 两份快照的扫描根不同 —— 结果很可能没有意义，界面要显眼提示
     pub root_mismatch: bool,
     /// 旧快照存的时候就被截断过，丢了多少条。
@@ -851,6 +904,9 @@ pub fn snapshot_compare(
             Some("path") => DiffOrder::ByPath,
             _ => DiffOrder::ByGrowth,
         },
+        // 归因与明细是互补的两份答案，界面上总是两个都显示 ——
+        // 所以这里无条件开（开销是归并过程中的一次哈希累加，可以忽略）。
+        attr: Some(core_scan::AttrOptions::default()),
     };
     if hub.is_running() {
         return Err("已有一次快照作业在进行中".into());
@@ -970,8 +1026,8 @@ fn diff_view(old: &Snapshot, new: &Snapshot, rep: &DiffReport) -> DiffView {
     let root_mismatch = !old.root.is_empty() && !new.root.is_empty() && old.root != new.root;
     DiffView {
         summary: diff_summary_cn(rep),
-        old_created: core_io::util::unix_utc(old.created_unix),
-        new_created: core_io::util::unix_utc(new.created_unix),
+        old_created: core_io::util::local_time(old.created_unix),
+        new_created: core_io::util::local_time(new.created_unix),
         old_root: old.root.clone(),
         new_root: new.root.clone(),
         old_total: rep.old_total,
@@ -1005,6 +1061,58 @@ fn diff_view(old: &Snapshot, new: &Snapshot, rep: &DiffReport) -> DiffView {
             .collect(),
         // CSV 由引擎生成：界面「导出」按钮与 CLI 的 `--csv` 必须一模一样
         csv: rows_to_csv(&rep.rows),
+        attr: rep.attribution.as_ref().map(|a| AttributionDto {
+            dir_depth: a.dir_depth,
+            total_delta: a.total_delta,
+            files: a.files,
+            dirs_total: a.dirs_total,
+            dirs_up: a
+                .dirs_up
+                .iter()
+                .map(|d| DirDeltaDto {
+                    dir: d.dir.clone(),
+                    delta: d.delta,
+                    added: d.added,
+                    removed: d.removed,
+                    grew: d.grew,
+                    shrank: d.shrank,
+                    files: d.files,
+                })
+                .collect(),
+            dirs_down: a
+                .dirs_down
+                .iter()
+                .map(|d| DirDeltaDto {
+                    dir: d.dir.clone(),
+                    delta: d.delta,
+                    added: d.added,
+                    removed: d.removed,
+                    grew: d.grew,
+                    shrank: d.shrank,
+                    files: d.files,
+                })
+                .collect(),
+            exts: a
+                .exts
+                .iter()
+                .map(|e| ExtDeltaDto {
+                    ext: e.ext.clone(),
+                    delta: e.delta,
+                    added: e.added,
+                    removed: e.removed,
+                    files: e.files,
+                })
+                .collect(),
+            bursts: a
+                .bursts
+                .iter()
+                .map(|b| BurstDto {
+                    hour_unix: b.hour_unix,
+                    delta: b.delta,
+                    files: b.files,
+                })
+                .collect(),
+        }),
         root_mismatch,
         old_truncated: rep.old_truncated,
         new_truncated: rep.new_truncated,
@@ -1019,6 +1127,45 @@ pub fn diff_export_csv(path: String, body: String) -> Result<usize, String> {
     let n = body.lines().count().saturating_sub(1);
     write_text_file(&p, &body)?;
     Ok(n)
+}
+
+/// 导出单文件 HTML 报告（E3）。
+///
+/// 排版在引擎里（`core_scan::report`），这里只负责取当前索引 + 落盘 ——
+/// 与 CLI 的 `filewatch report` 是同一份模板，所以两边的数字与版面必须一致。
+///
+/// 同步执行：它只是一次内存遍历 + 一次写文件。真机上百万级的卷大约 1 秒，
+/// 而挂进度条要动事件的时序（用户点完立刻看到"已导出"更符合这条操作的性质）。
+#[tauri::command]
+pub fn export_report(
+    state: State<'_, Shared>,
+    path: String,
+    top: Option<usize>,
+) -> Result<String, String> {
+    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    if st.scanning {
+        return Err("正在扫描：报告要基于稳定的索引树，扫完再导".into());
+    }
+    let l = st.loaded()?;
+    let tree = l.tree();
+    let root = l
+        .session
+        .cfg
+        .scan_root
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tree.path_of(tree.root));
+    let ext = core_index::ExtensionTable::build(tree);
+    let opts = core_scan::report::ReportOptions {
+        root,
+        created_unix: core_io::util::unix_secs(),
+        top: top.unwrap_or(30).max(1),
+        ..Default::default()
+    };
+    let html = core_scan::report::build_html(tree, &ext, l.session.path_remap().as_ref(), &opts);
+    let target = export_target(&path, "report", "html")?;
+    write_text_file(&target, &html)?;
+    Ok(target)
 }
 
 #[cfg(test)]

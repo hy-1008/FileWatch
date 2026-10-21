@@ -9,24 +9,13 @@
 use crate::winapi::{self, DWORD, HANDLE};
 use std::io;
 
-// ── CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 26, METHOD_BUFFERED, FILE_ANY_ACCESS) ──
-//    = (0x09 << 16) | (26 << 2) | 0 = 0x0009_0068
-pub const FSCTL_GET_NTFS_FILE_RECORD: DWORD = 0x0009_0068;
-
-// ── CTL_CODE(..., 44, METHOD_NEITHER, FILE_ANY_ACCESS) = 0x0009_00B3 ─────────
-pub const FSCTL_ENUM_USN_DATA: DWORD = 0x0009_00B3;
-
-// ── CTL_CODE(..., 46, METHOD_NEITHER, FILE_ANY_ACCESS) = 0x0009_00BB ─────────
-pub const FSCTL_READ_USN_JOURNAL: DWORD = 0x0009_00BB;
-
-// ── CTL_CODE(..., 57, METHOD_NEITHER, FILE_ANY_ACCESS) = 0x0009_00E7 ─────────
-pub const FSCTL_CREATE_USN_JOURNAL: DWORD = 0x0009_00E7;
-
-// ── CTL_CODE(..., 61, METHOD_BUFFERED, FILE_ANY_ACCESS) = 0x0009_00F4 ────────
-pub const FSCTL_QUERY_USN_JOURNAL: DWORD = 0x0009_00F4;
-
-// ── CTL_CODE(..., 45, METHOD_BUFFERED, FILE_ANY_ACCESS) = 0x0009_00B4 ────────
-pub const FSCTL_DELETE_USN_JOURNAL: DWORD = 0x0009_00B4;
+// 控制码**定义**在 `crate::consts`（它们是固定数字，Linux 侧也要能用同一套
+// 语义去判断"哪个功能不可用"）。这里重导出，保持 `core_io::ioctl::FSCTL_*`
+// 这条既有路径不变。
+pub use crate::consts::{
+    FSCTL_CREATE_USN_JOURNAL, FSCTL_DELETE_USN_JOURNAL, FSCTL_ENUM_USN_DATA,
+    FSCTL_GET_NTFS_FILE_RECORD, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
+};
 
 /// 一次 `DeviceIoControl` 调用。输入/输出缓冲均为可变切片。
 ///

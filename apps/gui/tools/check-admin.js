@@ -850,6 +850,110 @@ function main() {
   ok(!readsDom(RULE_JS), 'admin-rule.js 不应访问 document / window');
   ok(!readsDom(VIEW_RULE_JS), 'view-rule.js 不应访问 document / window');
 
+  /* ── E1 增长归因 ────────────────────────────────────────────────────
+   * 归因必须由后端在 diff 里算（要全量行，明细表只有前 300 行）。
+   * 前端只画不聚合 —— 一旦在这里二次聚合，界面与 CSV/CLI 就会给出两套数。 */
+  const ENGINE = path.join(__dirname, '..', '..', '..', 'crates');
+  const snapshotRs = fs.readFileSync(path.join(ENGINE, 'core-scan', 'src', 'snapshot.rs'), 'utf8');
+  const reportRs = fs.readFileSync(path.join(ENGINE, 'core-scan', 'src', 'report.rs'), 'utf8');
+  const rulesRs = fs.readFileSync(path.join(ENGINE, 'core-monitor', 'src', 'rules.rs'), 'utf8');
+  const sensitiveRs = fs.readFileSync(path.join(ENGINE, 'core-index', 'src', 'sensitive.rs'), 'utf8');
+  const ntfsFilenameRs = fs.readFileSync(path.join(ENGINE, 'core-ntfs', 'src', 'filename.rs'), 'utf8');
+  const cliRs = fs.readFileSync(path.join(__dirname, '..', '..', 'cli', 'src', 'main.rs'), 'utf8');
+
+  ok(htmlIds.has('diff-attr') && usedIds.has('diff-attr'), '#diff-attr 必须在且被接线');
+  ok(/renderDiffAttr\(v\)/.test(appjs), 'renderDiff 必须调 renderDiffAttr（否则归因卡永远不出现）');
+  ok(/pub attr: Option<crate::attribution::AttrOptions>/.test(snapshotRs)
+     && /pub attribution: Option<crate::attribution::Attribution>/.test(snapshotRs),
+     'DiffOptions.attr / DiffReport.attribution 必须由引擎提供');
+  ok(/attr: Some\(core_scan::AttrOptions::default\(\)\)/.test(analyzeRs),
+     '界面的对比必须打开归因（否则后端不算，卡片永远空）');
+  ok(/pub struct AttributionDto/.test(analyzeRs) && /pub attr: Option<AttributionDto>/.test(analyzeRs),
+     'DiffView 必须带 attr 字段供前端渲染');
+
+  /* ── E2 详情面板的 MFT 字段 ───────────────────────────────────────────
+   * FRN 是 64 位，过 JSON 到 JS 会掉精度（超过 2^53）。
+   * 所以它必须是字符串 —— 用数字会显示成一个"看起来合理但错误"的值。 */
+  ok(/pub frn: String/.test(commandsRs),
+     'NodeInfo.frn 必须是十六进制字符串（u64 过 JSON 到 JS 会掉精度）');
+  ok(/pub (?:const )?fn make_frn/.test(ntfsFilenameRs),
+     'FRN 必须由 core-ntfs::filename::make_frn 拼（位布局只一处）');
+  ok(/FW_NODE_BITS/.test(appjs) && /FW_ATTR_BITS/.test(appjs),
+     '索引位与系统属性位是两套，前端要分两张表解（不能混）');
+  ok(/detail-sec/.test(appjs) && /MFT 属性（扫描时）/.test(appjs),
+     '详情面板必须说清"哪个数字来自扫描、哪个来自点击时"');
+
+  /* ── E3 单文件 HTML 报告 ────────────────────────────────────────────── */
+  ok(htmlIds.has('menu-report'), 'index.html 缺少 #menu-report');
+  ok(usedIds.has('menu-report'), 'app.js 没有接线 #menu-report（菜单项点了没反应）');
+  ok(/exportReport/.test(appjs) && /call\('export_report'/.test(appjs),
+     '菜单项必须调后端 export_report');
+  ok(/core_scan::report::build_html/.test(analyzeRs),
+     '界面的报告必须走引擎模板（与 CLI 同一份，否则两边版面对不上）');
+  ok(/core_scan::build_html/.test(cliRs), 'CLI 的 report 也必须走同一份模板');
+  // 只看模板本身：`#[cfg(test)]` 里的断言里当然会提到 http://
+  const reportTpl = reportRs.split('#[cfg(test)]')[0];
+  ok(!/https?:\/\//.test(reportTpl),
+     '报告模板里不许出现外链（"断网可看"是这个功能的全部意义）');
+  ok(/pub fn escape_html/.test(reportRs) && /escape_html\(/.test(reportRs),
+     '报告必须转义文件名（名字里有 < 会把整页解析断掉）');
+
+  /* ── E4 规则试算 ────────────────────────────────────────────────────── */
+  ok(htmlIds.has('mon-simulate') && usedIds.has('mon-simulate'), '#mon-simulate 必须在且被接线');
+  ok(htmlIds.has('mon-sim') && usedIds.has('mon-sim'), '#mon-sim 必须在且被接线');
+  ok(/call\('rules_simulate'/.test(appjs), '试算必须调后端 rules_simulate');
+  ok(/pub fn simulate/.test(rulesRs) && /pub struct Verdict/.test(rulesRs),
+     '规则试算必须在引擎里（judgeable / gap 的口径与 evaluate 一致）');
+  ok(/judgeable/.test(appjs), '前端必须区分"不会触发"与"判断不了"');
+  ok(/Rate => \{[\s\S]{0,200}window_ms == 0/.test(rulesRs) || /elapsed_ms == 0/.test(rulesRs),
+     '速率规则必须看时间跨度（没有窗口时判不了，而不是判成"不触发"）');
+
+  /* ── 时间口径：只许一份实现，且必须挡住坏时间戳 ────────────────────
+   * 曾经有两份（`fmtTime` / `fwLocalTime`），前者没有 Invalid Date 保护，
+   * 于是一批时间显示成 `NaN-NaN-NaN`。这类"两条路各自演化"的问题只能靠
+   * 静态断言钉住。 */
+  ok(!/function fmtTime\s*\(/.test(appjs),
+     '不许再有第二份时间格式化（fmtTime）：时间只走 fwLocalTime');
+  const viewJs = fs.readFileSync(VIEW_RULE_JS, 'utf8');
+  ok(/Number\.isNaN\(d\.getTime\(\)\)/.test(viewJs) && /y < 1601 \|\| y > 2200/.test(viewJs),
+     'fwLocalTime 必须挡住 Invalid Date 与超出文件系统范围的时间戳');
+  // 后端的时间格式化也只剩一份本地实现
+  const coreUtilRs = fs.readFileSync(path.join(ENGINE, 'core-io', 'src', 'util.rs'), 'utf8');
+  ok(/pub fn local_time/.test(coreUtilRs) && /pub fn local_stamp/.test(coreUtilRs),
+     'core-io 必须提供 local_time / local_stamp（本地时区口径的唯一实现）');
+  ok(/SystemTimeToTzSpecificLocalTime/.test(coreUtilRs),
+     'Windows 上本地时间必须走 SystemTimeToTzSpecificLocalTime（含夏令时）');
+
+  /* ── 归因卡的折叠与右键 ────────────────────────────────────────────── */
+  for (const id of ['diff-attr-head', 'diff-attr-toggle', 'diff-attr-sum']) {
+    ok(htmlIds.has(id), `index.html 缺少 #${id}`);
+    ok(usedIds.has(id), `app.js 没有接线 #${id}`);
+  }
+  ok(/function toggleDiffAttr/.test(appjs) && /attrCollapsed/.test(appjs),
+     '归因卡必须能折叠（标题行留着，否则整块消失像是功能没了）');
+  ok(/diff-attr-toggle'\)\.onclick = toggleDiffAttr/.test(appjs),
+     '折叠按钮必须接上 toggleDiffAttr');
+  ok(/'attrdir'/.test(appjs) && /'attrdir'/.test(ctxjs),
+     '归因的目录行必须能右键（菜单类型要在 context-menu.js 里实现）');
+  ok(/'attrcopy'/.test(appjs) && /'attrcopy'/.test(ctxjs),
+     '类型 / 时段行右键要能复制这一行');
+
+  /* ── E5 风险清单 ────────────────────────────────────────────────────── */
+  for (const id of ['view-tab-risk', 'view-risk', 'risk-min-size', 'risk-limit',
+                    'risk-run', 'risk-state', 'risk-summary', 'risk-list']) {
+    ok(htmlIds.has(id), `index.html 缺少 #${id}`);
+    ok(usedIds.has(id), `app.js 没有接线 #${id}`);
+  }
+  ok(/view-tab-risk/.test(appjs) && /setView\('risk'\)/.test(appjs),
+     '风险清单必须能被切到（页签 → setView）');
+  ok(/call\('sensitive_scan'/.test(appjs), '盘点必须调后端 sensitive_scan');
+  ok(/core_index::sensitive::scan\(/.test(commandsRs), 'sensitive_scan 必须走引擎（规则表只有一份）');
+  ok(/pub const RULES/.test(sensitiveRs) && /pub fn classify/.test(sensitiveRs),
+     '规则表与匹配口径必须在 core-index::sensitive');
+  ok(/不读文件内容/.test(html),
+     '页面上必须写明"不读文件内容"（否则"没找到"会被读成"没有风险"）');
+  ok(/Severity::High/.test(sensitiveRs), '命中必须分级（全平铺的清单没人看得完）');
+
   /* ── 结果 ────────────────────────────────────────────────────────── */
   console.log('='.repeat(72));
   console.log('界面规则校验（admin-rule.js / view-rule.js + DOM 接线 + 版面结构）');

@@ -123,8 +123,8 @@ pub fn run(verbose: bool) -> Report {
         // ── 真实磁盘（尽力而为） ───────────────────────────────────────
         ("目录遍历扫描真实临时目录", t_traverse_real),
         ("面积图布局接真实树", t_layout_on_real_tree),
-        ("ReadDirectoryChangesW 通知解析", t_dirwatch_parse),
-        ("ReadDirectoryChangesW 实机投递", t_dirwatch_live),
+        ("目录通知：动作码与解码", t_dirwatch_parse),
+        ("目录通知：实机投递", t_dirwatch_live),
         ("降级模式端到端：扫描→事件→增量", t_degraded_live),
     ];
 
@@ -1164,6 +1164,18 @@ fn t_layout_on_real_tree() -> Outcome {
     )
 }
 
+/// 通知解析：Windows 验字节链解析，Linux 验动作映射。
+///
+/// 两边的"难点"不一样，所以不能共用一个断言：
+///
+/// * Windows 的 `FILE_NOTIFY_INFORMATION` 是**变长记录链**，`NextEntryOffset`
+///   只保证 4 字节对齐，按结构体强转就是 UB —— 必须逐字节读。这里的测试
+///   就是拿"非 4 字节对齐的记录"去撞它。
+/// * Linux 的 `struct inotify_event` 是定长头 + 变长名字，解析不难；
+///   难的是**掩码到五个动作码的映射**（CREATE/DELETE/MOVED_FROM/MOVED_TO/
+///   MODIFY），以及"目录被移动/创建时要补 watch"。前者用真实文件操作验，
+///   后者由 `t_dirwatch_live` 与 `t_degraded_live` 覆盖。
+#[cfg(windows)]
 fn t_dirwatch_parse() -> Outcome {
     // 手拼两条 FILE_NOTIFY_INFORMATION（非 UTF-16 对齐，考验按字节读）
     let mut buf: Vec<u8> = Vec::new();
@@ -1197,6 +1209,75 @@ fn t_dirwatch_parse() -> Outcome {
         "通知解析",
         n == 2 && got[0].rel == "新建 文件夹" && got[1].rel == "gone.bin",
         format!("解析 {} 条：{:?}；垃圾输入已安全忽略", n, got),
+    )
+}
+
+/// Linux 版：用真实文件操作把五个动作码各撞一遍。
+///
+/// 断言的是"内核事件 → 统一动作码"这条映射，而不是解析器的字节偏移
+/// （后者由 `dirwatch/linux.rs` 的单元测试覆盖）。
+#[cfg(not(windows))]
+fn t_dirwatch_parse() -> Outcome {
+    use core_io::consts::{
+        FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_RENAMED_NEW_NAME,
+        FILE_ACTION_RENAMED_OLD_NAME, FILE_ACTION_REMOVED,
+    };
+
+    let owned = match core_io::test_dir::TestDir::new("fw-selftest-inotify") {
+        Ok(d) => d,
+        Err(e) => return Outcome::Skip(format!("无法创建测试目录：{e}")),
+    };
+    let base = owned.path().to_path_buf();
+    let mut w = match core_scan::DirWatcher::start(&base, 64 * 1024, true) {
+        Ok(w) => w,
+        Err(e) => return Outcome::Skip(format!("inotify 不可用（{e}）—— 常见于受限容器")),
+    };
+
+    // 新增 → 改名 → 修改 → 删除，四类动作各来一次
+    let a = base.join("a.bin");
+    let b = base.join("b.bin");
+    let _ = std::fs::write(&a, b"x");
+    let _ = std::fs::rename(&a, &b);
+    let _ = std::fs::write(&b, b"yy");
+    let _ = std::fs::remove_file(&b);
+
+    let mut got = Vec::new();
+    for _ in 0..60 {
+        w.drain(512, &mut got);
+        let seen = |act: u32| got.iter().any(|e| e.action == act);
+        if seen(FILE_ACTION_ADDED)
+            && seen(FILE_ACTION_RENAMED_OLD_NAME)
+            && seen(FILE_ACTION_RENAMED_NEW_NAME)
+            && seen(FILE_ACTION_REMOVED)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let received = w.received();
+    let watched = w.watched_dirs();
+    w.stop();
+
+    let seen = |act: u32| got.iter().any(|e| e.action == act);
+    let ok = seen(FILE_ACTION_ADDED)
+        && seen(FILE_ACTION_RENAMED_OLD_NAME)
+        && seen(FILE_ACTION_RENAMED_NEW_NAME)
+        && seen(FILE_ACTION_MODIFIED)
+        && seen(FILE_ACTION_REMOVED);
+    check(
+        "通知解析",
+        ok,
+        format!(
+            "watch {} 个目录，收 {} 条通知；新增={} 改名旧={} 改名新={} 修改={} 删除={}；样本 {:?}",
+            watched,
+            received,
+            seen(FILE_ACTION_ADDED),
+            seen(FILE_ACTION_RENAMED_OLD_NAME),
+            seen(FILE_ACTION_RENAMED_NEW_NAME),
+            seen(FILE_ACTION_MODIFIED),
+            seen(FILE_ACTION_REMOVED),
+            got.iter().take(4).map(|e| (e.action, e.rel.clone())).collect::<Vec<_>>()
+        ),
     )
 }
 
@@ -1333,8 +1414,14 @@ pub fn env_info() -> String {
     let _ = writeln!(s, "架构：{}", std::env::consts::ARCH);
     let _ = writeln!(
         s,
-        "管理员权限线索（能否打开 \\\\.\\C:）：{}",
+        "管理员/root 权限线索（能否打开裸卷）：{}",
         core_io::util::is_elevated_hint()
+    );
+    let _ = writeln!(
+        s,
+        "增量后端：{}（MFT 直读：{}）",
+        core_io::watch_backend_name(),
+        if core_io::HAS_MFT_BACKEND { "可用" } else { "不可用（非 Windows）" }
     );
     let _ = writeln!(s, "Node 尺寸：{} 字节", core::mem::size_of::<Node>());
     let vols = core_io::list_volumes();

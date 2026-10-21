@@ -15,6 +15,8 @@
 //! | [`paths`] | 合成路径拼接 / 事件 → 可显示路径（CLI 与界面共用） | 显示与落盘一致性 |
 //! | [`dedup`] | 重复文件三级去重（体积 → 部分哈希 → 全哈希）+ 逐字节复核 | F12 |
 //! | [`snapshot`] | 扫描快照落盘 / 读取 + 两次快照的 diff | F11 |
+//! | [`attribution`] | 把 diff 的变化行重新聚合成「哪块地方在长」 | F11 / E1 |
+//! | [`report`] | 单文件离线 HTML 报告（概览 + 面积图 + Top 榜） | E3 |
 //! | [`incremental`] | USN 增量会话：拉页 → 归一化 → 回读大小 | M2 |
 //! | [`session`] | **统一入口**：选后端 → 全量 → 建增量 → 注册监控 | M1~M3 |
 //!
@@ -40,28 +42,39 @@
 //! 扫描完成再把游标对齐回「扫描开始前」。反过来的话，扫描过程中产生的
 //! 变更（尤其是扫描过该目录之后的写入）会被永久漏掉——见模块内注释。
 
+pub mod attribution;
 pub mod content;
 pub mod dedup;
 pub mod dirwatch;
 pub mod full_scan;
 pub mod incremental;
 pub mod paths;
+pub mod report;
 pub mod session;
 pub mod snapshot;
 pub mod traverse;
 pub mod watcher;
 
+pub use attribution::{
+    dir_of, AttrOptions, Attribution, Burst, DirDelta, ExtDelta, BURST_TOP,
+};
 pub use dedup::{
     collect_candidates, find_duplicates, groups_to_csv, CandidateSet, ContentSource, DupCandidate,
     DupGroup, DupOptions, DupProgress, DupReport, DupStage, FsSource,
 };
-pub use dirwatch::{parse_notifications, DirWatcher, FsEvent};
+pub use dirwatch::{normalize_root, DirWatcher, FsEvent};
+
+/// `FILE_NOTIFY_INFORMATION` 链解析器（Windows 专属：Linux 的 inotify 是
+/// 定长头 + 变长名字，解析逻辑在 `dirwatch/linux.rs` 里，不需要对外暴露）。
+#[cfg(windows)]
+pub use dirwatch::parse_notifications;
 pub use full_scan::{
     full_scan_mft, probe_volume, scan_physical_range, top_n_files_via_mft, ProbeReport, ScanOptions,
     ScanStats, AVG_NAME_BYTES,
 };
 pub use incremental::IncrementalSession;
 pub use paths::{event_path, join_path, raw_event_path};
+pub use report::{build_html, build_html_with, ReportOptions};
 pub use session::{ScanBackend, ScanPhase, Session, SessionConfig};
 pub use snapshot::{
     diff, rows_to_csv, signed_size, DiffKind, DiffOptions, DiffOrder, DiffReport, DiffRow,
@@ -91,7 +104,10 @@ mod tests {
         // `parse_notifications` 的第二参是 `impl FnMut(FsEvent)`（APIT，不是普通泛型参数），
         // 所以既不能裸取函数项（E0283 无法推断），也不能写 `::<T>`（E0107）。
         // 正确做法是给一个具体函数指针类型，让 APIT 由目标类型推导出来。
-        let _: fn(&[u8], fn(FsEvent)) -> usize = parse_notifications;
+        #[cfg(windows)]
+        {
+            let _: fn(&[u8], fn(FsEvent)) -> usize = parse_notifications;
+        }
         let _ = DirWatcher::start;
         let _: Option<WatcherSession> = None;
         let _ = probe_path;

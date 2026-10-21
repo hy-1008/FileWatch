@@ -74,7 +74,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         SessionConfig {
-            drive: "C:".to_string(),
+            drive: core_io::paths::DEFAULT_VOLUME.to_string(),
             allow_create_journal: false,
             allow_traverse_fallback: true,
             force_traverse: false,
@@ -121,12 +121,31 @@ impl Session {
             .into_iter()
             .find(|v| v.drive.eq_ignore_ascii_case(&cfg.drive));
 
-        // ── ⓪ 调用方要求强制降级 ────────────────────────────────────────
+        // ── ⓪ 没有快速路径的平台（Linux）：直接走目录遍历 ────────────────
+        //
+        // `$MFT` 直读本身在 Linux 上做得到（root + 块设备），但**增量来源**
+        // USN Journal 是 NTFS 的 Windows 实现特性，`ntfs3`/`ntfs-3g` 都不暴露。
+        // 没有增量的"快速路径"只能做一次性扫描 —— 那还不如直接走遍历，
+        // 功能完整（有 inotify 实时增量）、行为可预期。所以这里不做尝试，
+        // 也不假装失败后降级，而是明确说明原因。
+        //
+        // 用**常量判断**而不是 `#[cfg]`：这样整个 `open` 只有一份代码，
+        // Windows 的逻辑照旧编译、Linux 上只是永不进入 —— 比在每个分支上
+        // 挂 `#[cfg]` 少一半出错机会（少写一个，另一个平台就悄悄走了错分支）。
+        if !core_io::HAS_MFT_BACKEND {
+            warnings.push(format!(
+                "当前平台没有 USN Journal：$MFT 直读仅在 Windows 可用，本次使用目录遍历 + {}",
+                core_io::watch_backend_name()
+            ));
+            return Self::open_traverse(cfg, info, warnings, progress);
+        }
+
+        // ── ⓪' 调用方要求强制降级 ────────────────────────────────────────
         if cfg.force_traverse {
-            warnings.push(
-                "已按要求跳过 MFT 直读，直接使用目录遍历 + ReadDirectoryChangesW"
-                    .to_string(),
-            );
+            warnings.push(format!(
+                "已按要求跳过 MFT 直读，直接使用目录遍历 + {}",
+                core_io::watch_backend_name()
+            ));
             return Self::open_traverse(cfg, info, warnings, progress);
         }
 
@@ -229,7 +248,7 @@ impl Session {
         let root = cfg
             .scan_root
             .clone()
-            .unwrap_or_else(|| PathBuf::from(format!("{}\\", cfg.drive)));
+            .unwrap_or_else(|| PathBuf::from(core_io::paths::root_prefix(&cfg.drive)));
         warnings.push(format!("扫描后端：{}", ScanBackend::Traverse.label_cn()));
         warnings.push(format!(
             "降级模式说明：非 NTFS / 无管理员权限时无法直读 $MFT，速度慢 1~2 个数量级；\
@@ -271,7 +290,8 @@ impl Session {
                 ) {
                     Ok(w) => {
                         warnings.push(format!(
-                            "实时增量已启用：ReadDirectoryChangesW（{}，缓冲 {} KB，路径索引 {} 条，约 {}）",
+                            "实时增量已启用：{}（{}，缓冲 {} KB，路径索引 {} 条，约 {}）",
+                            core_io::watch_backend_name(),
                             if cfg.watch_subtree { "递归子树" } else { "仅本层" },
                             cfg.watch_buffer_bytes / 1024,
                             w.map_len(),
@@ -371,7 +391,7 @@ impl Session {
             let deeper = best.map(|(len, _)| p.len() > len).unwrap_or(true);
             if p.len() > 1
                 && target.len() > p.len()
-                && target.as_bytes()[p.len()] == b'\\'
+                && target.as_bytes()[p.len()] == core_io::paths::SEP as u8
                 && target.starts_with(p.as_str())
                 && deeper
             {
@@ -391,8 +411,11 @@ impl Session {
         if let Some(w) = self.watch.as_mut() {
             let code = w.watcher.exit_error();
             if code != 0 {
-                return Err(io::Error::new(io::ErrorKind::Other,
-                    format!("目录监视已中断（Windows 错误 {code}），请重新扫描后再开始监控")));
+                let msg = format!(
+                    "目录监视已中断（错误码 {}），请重新扫描后再开始监控",
+                    code
+                );
+                return Err(io::Error::new(io::ErrorKind::Other, msg));
             }
             return Ok(w.poll(&mut self.tree, &mut self.engine, now_ms));
         }
@@ -448,7 +471,7 @@ impl Session {
         if self.incremental.is_some() {
             "USN Journal"
         } else if self.watch.is_some() {
-            "ReadDirectoryChangesW（降级）"
+            core_io::watch_backend_name()
         } else {
             "无（仅一次性扫描）"
         }
@@ -516,12 +539,9 @@ fn build_engine(cfg: &SessionConfig) -> MonitorEngine {
 /// 只是一处发生在「定位父节点」、这里发生在「按路径查节点」。
 /// 注意 `C:\` 要归一到 `C:` 而不是 `""` —— 削成空串会让所有路径都以它开头。
 fn norm_lookup(s: &str) -> String {
-    let t = s.trim_end_matches('\\');
-    if t.is_empty() {
-        "\\".to_string()
-    } else {
-        t.to_ascii_lowercase()
-    }
+    // 唯一实现：去尾分隔符 + 小写，卷根不能削成空串。
+    // 必须与 `watcher::key_of`（写索引键）逐字节一致，否则查不到。
+    core_io::paths::lookup_key(s)
 }
 
 #[cfg(test)]
@@ -534,6 +554,19 @@ mod tests {
         assert!(ScanBackend::Traverse.label_cn().contains("降级"));
     }
 
+    /// Linux 版同一组契约：根恒为 `/`，去尾斜杠、小写，且**绝不**返回空串。
+    #[cfg(not(windows))]
+    #[test]
+    fn norm_lookup_unifies_root_forms() {
+        assert_eq!(norm_lookup("/"), "/");
+        assert_eq!(norm_lookup("/home/me/"), "/home/me");
+        assert_eq!(norm_lookup("/home/me"), "/home/me");
+        assert_eq!(norm_lookup("/Home/Me"), "/home/me");
+        // 退化输入不能归一成空串（空串是所有路径的前缀）
+        assert_eq!(norm_lookup(""), "/");
+    }
+
+    #[cfg(windows)]
     #[test]
     fn norm_lookup_unifies_drive_root_forms() {
         // `C:\` 与 `C:` 必须归一到同一个键 —— 否则「以盘根为扫描根时查 `C:\`」
@@ -744,7 +777,8 @@ mod tests {
             "删除后应回到初始体积"
         );
 
-        assert_eq!(s.incremental_source_cn(), "ReadDirectoryChangesW（降级）");
+        // 标签由平台后端给出（Windows ReadDirectoryChangesW / Linux inotify）
+        assert_eq!(s.incremental_source_cn(), core_io::watch_backend_name());
         assert!(s.status_line().contains("监视"));
 
         let _ = s.shutdown(30_000);

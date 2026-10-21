@@ -20,7 +20,7 @@
 //! ```
 
 use crate::bytes_u64;
-use core_io::ioctl;
+use core_io::consts::*;
 use core_io::volume::Volume;
 use core_io::winapi::{ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE};
 use std::io;
@@ -76,7 +76,7 @@ impl UsnJournalData {
 /// `FSCTL_QUERY_USN_JOURNAL`
 pub fn query(vol: &Volume) -> io::Result<UsnJournalData> {
     let mut out = vec![0u8; USN_JOURNAL_DATA_LEN];
-    let n = vol.device_io(ioctl::FSCTL_QUERY_USN_JOURNAL, &mut [], &mut out)?;
+    let n = vol.device_io(FSCTL_QUERY_USN_JOURNAL, &mut [], &mut out)?;
     if n < USN_JOURNAL_DATA_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -102,7 +102,7 @@ pub fn create(vol: &Volume, maximum_size: u64, allocation_delta: u64) -> io::Res
     input[0..8].copy_from_slice(&maximum_size.to_le_bytes());
     input[8..16].copy_from_slice(&allocation_delta.to_le_bytes());
     let mut out: [u8; 0] = [];
-    vol.device_io(ioctl::FSCTL_CREATE_USN_JOURNAL, &mut input, &mut out)?;
+    vol.device_io(FSCTL_CREATE_USN_JOURNAL, &mut input, &mut out)?;
     Ok(())
 }
 
@@ -111,7 +111,7 @@ pub fn delete(vol: &Volume, journal_id: u64) -> io::Result<()> {
     let mut input = vec![0u8; 8];
     input[0..8].copy_from_slice(&journal_id.to_le_bytes());
     let mut out: [u8; 0] = [];
-    vol.device_io(ioctl::FSCTL_DELETE_USN_JOURNAL, &mut input, &mut out)?;
+    vol.device_io(FSCTL_DELETE_USN_JOURNAL, &mut input, &mut out)?;
     Ok(())
 }
 
@@ -177,9 +177,8 @@ pub fn enum_page(
         *b = 0;
     }
 
-    let res = ioctl::device_io_control_allow(
-        vol.raw_handle(),
-        ioctl::FSCTL_ENUM_USN_DATA,
+    let res = vol.device_io_allow(
+        FSCTL_ENUM_USN_DATA,
         &mut input,
         buf,
         &[ERROR_HANDLE_EOF],
@@ -248,9 +247,8 @@ pub fn read_page(vol: &Volume, req: ReadRequest, buf: &mut [u8]) -> io::Result<(
     buf[0..8].copy_from_slice(&req.start_usn.to_le_bytes());
 
     let mut input = req.to_bytes();
-    let res = ioctl::device_io_control_allow(
-        vol.raw_handle(),
-        ioctl::FSCTL_READ_USN_JOURNAL,
+    let res = vol.device_io_allow(
+        FSCTL_READ_USN_JOURNAL,
         &mut input,
         buf,
         &[ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE],

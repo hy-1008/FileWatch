@@ -75,10 +75,43 @@ pub fn extension_of(name: &str) -> String {
     }
 }
 
+/// 把 `v` 向上对齐到 `a` 的整数倍。`a == 0` 时原样返回（不做除法）。
+///
+/// 遍历模式没有真实的"分配簇数"，只能按簇大小向上取整估算体积占用；
+/// 这个换算是**唯一实现**（遍历、重复文件、快照都可能用到）。
+pub fn align_up(v: u64, a: u64) -> u64 {
+    if a == 0 || v == 0 {
+        return v;
+    }
+    v.div_ceil(a) * a
+}
+
+/// `FILETIME` 计数（1601-01-01 起的 100 ns）→ Unix 秒。
+///
+/// 这是 NTFS / USN 与"人看得懂的时间"之间唯一的换算点：MFT 的
+/// `$STANDARD_INFORMATION`、`USN_RECORD::TimeStamp`、以及 Windows 的
+/// `Metadata::last_write_time` 都是这个口径。
+///
+/// `core-usn::record` 直接重导出本函数，不再自己写一份 —— 两个地方各写一遍
+/// 时曾经出现过 1 秒的偏差（`/10_000_000` 与 `/1e7` 的取整差别）。
+pub fn filetime_to_unix(ticks: i64) -> i64 {
+    if ticks <= 0 {
+        return 0;
+    }
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    ticks / 10_000_000 - EPOCH_DIFF_SECS
+}
+
 /// 冒泡出当前进程是否具备管理员权限的最可靠判据：
 /// 直接尝试打开卷设备。成功 = 有权限。
+///
+/// * Windows：能打开 `\\.\C:` 就说明令牌已提权；
+/// * Linux：`geteuid() == 0`（`/dev` 下的块设备只对 root 开放读）。
+///
+/// 判据本身放在平台实现里（[`crate::volume::probe_elevated`]），
+/// 因为"什么叫做有权限"两个平台问的不是同一件事。
 pub fn is_elevated_hint() -> bool {
-    crate::volume::Volume::open("C:").is_ok()
+    crate::volume::probe_elevated()
 }
 
 // ── 时间 ────────────────────────────────────────────────────────────────────
@@ -171,6 +204,92 @@ pub fn unix_stamp(secs: i64) -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+/// Unix 秒 → **本地** `2026-10-14 21:15:00`。非正数返回 `-`。
+///
+/// # 为什么需要另一个函数
+///
+/// `std` 里没有任何时区信息，[`unix_utc`] 只能给 UTC。但用户在资源管理器、
+/// 任务栏、手机照片里看到的都是**本地**时间 —— 差 8 小时就会被当成 bug
+/// （实测反馈：导出的报告写「生成于 15:09Z」，而系统时钟是 23:09）。
+///
+/// Windows 上走 `SystemTimeToTzSpecificLocalTime`，按**目标时刻**的夏令时
+/// 规则换算（不是简单加一个固定偏移）。其它平台没有这份能力，退回 UTC
+/// 文本（带 `Z` 后缀）—— 那是"明确没有"，不是"假装本地"。
+pub fn local_time(secs: i64) -> String {
+    if secs <= 0 {
+        return "-".to_string();
+    }
+    #[cfg(windows)]
+    {
+        if let Some(st) = local_systemtime(secs) {
+            return format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+            );
+        }
+        // Win32 调用失败（极少见）：退回 UTC，而不是给一个空串让人以为没时间
+        return unix_utc(secs);
+    }
+    #[cfg(not(windows))]
+    {
+        unix_utc(secs)
+    }
+}
+
+/// Unix 秒 → **本地** `20261014-211500`（文件名用）。
+///
+/// 与 [`local_time`] 同一份换算：快照正文里写的时间与文件名上的时间必须是
+/// 同一时区，否则"这一份是什么时候存的"会出现两个答案。
+pub fn local_stamp(secs: i64) -> String {
+    if secs <= 0 {
+        return "00000000-000000".to_string();
+    }
+    let t = local_time(secs);
+    // `YYYY-MM-DD HH:MM:SS` → `YYYYMMDD-HHMMSS`；取不到（UTC 回退也满足这个
+    // 形状）就退回 unix_stamp，绝不拼出一个半截的名字。
+    let b = t.as_bytes();
+    if b.len() < 19 || b[10] != b' ' {
+        return unix_stamp(secs);
+    }
+    format!(
+        "{}{}{}-{}{}{}",
+        &t[0..4],
+        &t[5..7],
+        &t[8..10],
+        &t[11..13],
+        &t[14..16],
+        &t[17..19]
+    )
+}
+
+/// UTC 的 Unix 秒 → 本地 `SYSTEMTIME`（仅 Windows）。失败返回 `None`。
+#[cfg(windows)]
+fn local_systemtime(secs: i64) -> Option<crate::winapi::SYSTEMTIME> {
+    use crate::winapi::{
+        FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime, FILETIME, SYSTEMTIME,
+    };
+    // 1601-01-01 → 1970-01-01 相差 11_644_473_600 秒；FILETIME 的单位是 100ns，
+    // 所以还要乘 10^7 —— 漏掉这一步会得到"1601-01-01"这种看起来能格式化、
+    // 但差了 10^7 倍的时间（第一版就是这么错的）。
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let since_1601 = secs.checked_add(EPOCH_DIFF_SECS)?;
+    let ticks = (since_1601 as u64).checked_mul(10_000_000)?;
+    let ft = FILETIME {
+        dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    if unsafe { FileTimeToSystemTime(&ft, &mut utc) } == 0 {
+        return None;
+    }
+    let mut local = SYSTEMTIME::default();
+    // 第一个参数传 NULL = 用当前系统时区（含目标时刻的夏令时）。
+    if unsafe { SystemTimeToTzSpecificLocalTime(core::ptr::null(), &utc, &mut local) } == 0 {
+        return None;
+    }
+    Some(local)
 }
 
 #[cfg(test)]
@@ -285,5 +404,52 @@ mod tests {
             assert_eq!(digits, stamp_digits, "{utc} 与 {stamp} 的日期时间不一致");
         }
         assert_eq!(unix_stamp(0), "00000000-000000");
+    }
+}
+
+#[cfg(test)]
+mod local_time_tests {
+    use super::*;
+
+    /// 本地时间与 UTC 的差必须是**整分钟**，且秒数一致。
+    ///
+    /// 时区偏移只会是 15 分钟的整数倍（印度 :30、尼泊尔 :45），永远不会带秒 ——
+    /// 所以这条不变量能挡住"把 FILETIME 的 100ns 当成秒"、"偏移算错一小时"
+    /// 这类错误，又不用把测试绑死在某台机器的时区上。
+    #[test]
+    fn local_time_is_a_whole_minute_away_from_utc() {
+        let t = 1_760_000_000i64; // 2025-10-09 08:53:20Z
+        let l = local_time(t);
+        let u = unix_utc(t);
+        assert_eq!(l.len(), 19, "本地时间格式应为 YYYY-MM-DD HH:MM:SS：{l}");
+        assert_eq!(&l[4..5], "-", "{l}");
+        assert_eq!(&l[10..11], " ", "{l}");
+        // 秒必须一致：时区不会偏移"秒"
+        assert_eq!(&l[17..19], &u[17..19], "本地 {l} / UTC {u}");
+        let mins = |s: &str| -> i32 {
+            s[11..13].parse::<i32>().unwrap() * 60 + s[14..16].parse::<i32>().unwrap()
+        };
+        let diff = (mins(&l) - mins(&u)).rem_euclid(1440);
+        assert_eq!(diff % 15, 0, "本地 {l} / UTC {u} 的偏移不是 15 分钟的整数倍");
+    }
+
+    #[test]
+    fn local_time_handles_zero_and_garbage() {
+        assert_eq!(local_time(0), "-");
+        assert_eq!(local_time(-1), "-");
+        // 极端值不能让 Win32 调用炸掉（返回什么都行，只要不 panic）
+        let _ = local_time(i64::MAX / 2);
+    }
+
+    #[test]
+    fn local_stamp_matches_local_time() {
+        let t = 1_760_000_000i64;
+        let out = local_stamp(t);
+        assert_eq!(out.len(), 15, "{out}");
+        assert_eq!(&out[8..9], "-", "{out}");
+        let time = local_time(t);
+        assert_eq!(&out[..8], format!("{}{}{}", &time[0..4], &time[5..7], &time[8..10]));
+        assert_eq!(&out[9..], format!("{}{}{}", &time[11..13], &time[14..16], &time[17..19]));
+        assert_eq!(local_stamp(0), "00000000-000000");
     }
 }

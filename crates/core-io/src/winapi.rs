@@ -58,16 +58,14 @@ pub const FILE_NOTIFY_CHANGE_ALL: DWORD = FILE_NOTIFY_CHANGE_FILE_NAME
     | FILE_NOTIFY_CHANGE_SECURITY;
 
 /// `FILE_NOTIFY_INFORMATION.Action`
-pub const FILE_ACTION_ADDED: DWORD = 0x0000_0001;
-pub const FILE_ACTION_REMOVED: DWORD = 0x0000_0002;
-pub const FILE_ACTION_MODIFIED: DWORD = 0x0000_0003;
-pub const FILE_ACTION_RENAMED_OLD_NAME: DWORD = 0x0000_0004;
-pub const FILE_ACTION_RENAMED_NEW_NAME: DWORD = 0x0000_0005;
+///
+/// 定义在 [`crate::consts`] 里 —— 这五个值 Linux 的 inotify 也要映射成同一套。
+pub use crate::consts::{
+    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_ACTION_REMOVED,
+};
 
-/// `ReadDirectoryChangesW` 被 `CancelIoEx` / 关闭句柄中断时返回的错误码。
-pub const ERROR_OPERATION_ABORTED: DWORD = 995;
-/// 异步 I/O 已受理但尚未完成。**不是错误**。
-pub const ERROR_IO_PENDING: DWORD = 997;
+pub use crate::consts::{ERROR_IO_PENDING, ERROR_OPERATION_ABORTED};
 
 /// 异步 I/O 的控制块。
 ///
@@ -104,32 +102,20 @@ impl OVERLAPPED {
     }
 }
 
-// ── 文件属性位 ──────────────────────────────────────────────────────────────
-pub const FILE_ATTRIBUTE_READONLY: DWORD = 0x0000_0001;
-pub const FILE_ATTRIBUTE_HIDDEN: DWORD = 0x0000_0002;
-pub const FILE_ATTRIBUTE_SYSTEM: DWORD = 0x0000_0004;
-pub const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x0000_0010;
-pub const FILE_ATTRIBUTE_ARCHIVE: DWORD = 0x0000_0020;
-pub const FILE_ATTRIBUTE_REPARSE_POINT: DWORD = 0x0000_0400;
-pub const INVALID_FILE_ATTRIBUTES: DWORD = 0xFFFF_FFFF;
-
-// ── GetDriveTypeW ───────────────────────────────────────────────────────────
-pub const DRIVE_UNKNOWN: u32 = 0;
-pub const DRIVE_NO_ROOT_DIR: u32 = 1;
-pub const DRIVE_REMOVABLE: u32 = 2;
-pub const DRIVE_FIXED: u32 = 3;
-pub const DRIVE_REMOTE: u32 = 4;
-pub const DRIVE_CDROM: u32 = 5;
-pub const DRIVE_RAMDISK: u32 = 6;
-
-// ── 错误码 ──────────────────────────────────────────────────────────────────
-pub const ERROR_ACCESS_DENIED: DWORD = 5;
-pub const ERROR_NO_MORE_FILES: DWORD = 18;
-pub const ERROR_HANDLE_EOF: DWORD = 38;
-pub const ERROR_MORE_DATA: DWORD = 234;
-pub const ERROR_JOURNAL_NOT_ACTIVE: DWORD = 1179;
-pub const ERROR_JOURNAL_DELETE_IN_PROGRESS: DWORD = 1178;
-pub const ERROR_INVALID_PARAMETER: DWORD = 87;
+// ── 文件属性位 / 卷类型 / 错误码 ────────────────────────────────────────────
+//
+// 这几组数字**不是** FFI：它们是 `USN_RECORD`、`$FILE_NAME`、快照格式里
+// 实际存的字节值，Linux 版也要用同一套（见 `crate::consts` 的说明）。
+// 所以统一定义在 `consts`，这里只做重导出，保证 `core_io::winapi::X`
+// 这条老路径继续可用。
+pub use crate::consts::{
+    DRIVE_CDROM, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+    DRIVE_UNKNOWN, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_INVALID_PARAMETER,
+    ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_NOT_ACTIVE, ERROR_MORE_DATA,
+    ERROR_NO_MORE_FILES, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
+    INVALID_FILE_ATTRIBUTES,
+};
 
 // ── 结构体 ──────────────────────────────────────────────────────────────────
 
@@ -153,6 +139,23 @@ impl FILETIME {
         const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
         (ticks / 10_000_000) as i64 - EPOCH_DIFF_SECS
     }
+}
+
+/// 时间结构（Win32 `SYSTEMTIME`）。
+///
+/// 字段顺序与 `WORD`（u16）宽度必须与系统头文件一致 —— 少一个字段、
+/// 多一个 `#[repr(Rust)]`，内核写进来的东西就会被读成乱码时间。
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SYSTEMTIME {
+    pub wYear: u16,
+    pub wMonth: u16,
+    pub wDayOfWeek: u16,
+    pub wDay: u16,
+    pub wHour: u16,
+    pub wMinute: u16,
+    pub wSecond: u16,
+    pub wMilliseconds: u16,
 }
 
 #[repr(C)]
@@ -348,6 +351,20 @@ extern "system" {
     ) -> BOOL;
 
     pub fn Sleep(dwMilliseconds: DWORD);
+
+    /// FILETIME（UTC）→ `SYSTEMTIME`。纯换算，不改时区。
+    pub fn FileTimeToSystemTime(lpFileTime: *const FILETIME, lpSystemTime: *mut SYSTEMTIME) -> BOOL;
+
+    /// UTC 的 `SYSTEMTIME` → **本地**时间。
+    ///
+    /// `lpTimeZoneInformation` 传 NULL = 用当前系统时区，且会按**目标时刻**的
+    /// 夏令时规则换算（不是简单加一个固定偏移）。这是 `std` 给不了的东西：
+    /// `std` 没有任何时区信息，`unix_utc` 只能产出 UTC。
+    pub fn SystemTimeToTzSpecificLocalTime(
+        lpTimeZoneInformation: *const c_void,
+        lpUniversalTime: *const SYSTEMTIME,
+        lpLocalTime: *mut SYSTEMTIME,
+    ) -> BOOL;
 }
 
 #[cfg(test)]

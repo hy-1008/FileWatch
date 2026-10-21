@@ -110,6 +110,43 @@ pub struct NodeInfo {
     pub files: u64,
     pub depth: u32,
     pub mtime: i64,
+    /// 完整文件引用号（`序列号 << 48 | 记录号`），**十六进制字符串**。
+    ///
+    /// 它是 NTFS 里唯一稳定的文件身份：改名、移动都不变，只有删除重建才变。
+    /// 排查"同一个文件在两次扫描里是不是同一个"时，看路径没用，看它才行。
+    ///
+    /// 用字符串而不是 `u64`：64 位整数过 JSON 到 JS 会掉精度
+    /// （超过 2^53 就不准了），而 FRN 的高 16 位正好在 2^48 以上 ——
+    /// 用数字传会显示成一个**看起来合理但错误**的值，比不显示更糟。
+    pub frn: String,
+    /// 序列号（FRN 的高 16 位）
+    pub seq: u16,
+    /// 索引里记下的属性位，见 `core_index::arena::NODE_*`。
+    ///
+    /// 这些位在 MFT 解析时就填好了，之前一直没往界面上透 —— 于是
+    /// 「这个 4 GB 的文件为什么只占 200 MB」（稀疏）这种问题只能靠猜。
+    pub flags: u16,
+    /// **点击时**现场问系统一次得到的元数据（`None` = 文件已不存在/无权限）。
+    ///
+    /// 为什么不在索引里存：多存 8 字节 ctime × 200 万节点 = 16 MB，
+    /// 而这几项只有用户点开某一个节点时才有人看。所以按需 stat。
+    pub disk: Option<DiskInfo>,
+}
+
+/// 详情面板里"来自系统查询"的那一半。与索引里的数字并排显示，
+/// 但口径来源不同 —— 索引是扫描那一刻的快照，这里是此刻的真实情况。
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskInfo {
+    /// 创建时间（Unix 秒）。0 = 取不到（Linux 没有真正的创建时间，见 `fsmeta`）
+    pub ctime: i64,
+    /// 硬链接数。> 1 表示这个文件有多个名字，删一个不会释放空间
+    pub nlink: u64,
+    /// 原始属性位（`FILE_ATTRIBUTE_*`），前端翻成「只读/隐藏/压缩/加密/稀疏…」
+    pub attributes: u32,
+    /// 现场问到的逻辑大小。与索引里的 `size` 不同 = 扫描之后它又被改过
+    pub size: u64,
+    /// 现场问到的修改时间
+    pub mtime: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -700,6 +737,234 @@ pub fn search_nodes(
     })
 }
 
+// ── 敏感文件盘点（E5）──────────────────────────────────────────────────────
+
+/// 一行命中。
+#[derive(Debug, Clone, Serialize)]
+pub struct SensitiveRow {
+    pub node: u32,
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub alloc: u64,
+    pub mtime: i64,
+    /// 归类名（"SSH / 代码签名私钥"）
+    pub category: String,
+    /// `high` / `medium` / `low`
+    pub severity: String,
+    pub severity_cn: String,
+    /// 为什么值得看一眼（规则表里写好的那句话）
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SensitiveView {
+    pub rows: Vec<SensitiveRow>,
+    /// 扫过的文件数
+    pub scanned: u64,
+    /// 全部命中数（不受 limit 截断）
+    pub matched: u64,
+    pub truncated: bool,
+    pub elapsed_ms: u64,
+    /// 规则表里有几条规则 —— 界面写「按 8 条规则」，让人知道"没找到"意味着什么
+    pub rules: usize,
+}
+
+/// 按规则表盘点当前索引里的敏感文件。
+///
+/// **纯内存**（零 IO）：只遍历索引与名字池，200 万条是几十毫秒。
+/// 所以同步做、不做进度条 —— 加个进度条反而让"立刻出结果"变成"等两秒"。
+#[tauri::command]
+pub fn sensitive_scan(
+    state: State<'_, Shared>,
+    // 参数名刻意用单词 `min`：Tauri 会把前端的 camelCase 转成 snake_case，
+    // 但仓库里其它命令都是单词参数，没有先例可对照。少一次这种推断就少一个
+    // 「输入框填了但不生效」的静默故障（转不过去时 Option 只会变成 None）。
+    min: Option<String>,
+    limit: Option<usize>,
+) -> Result<SensitiveView, String> {
+    let t0 = Instant::now();
+    let min = match min.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => core_monitor::parse_size(s)
+            .ok_or_else(|| format!("体积看不懂：「{s}」，示例 1M / 512K"))?,
+        None => 0,
+    };
+    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    if st.scanning {
+        return Err("正在扫描：扫描结束后再盘点（否则清单不完整）".into());
+    }
+    let l = st.loaded()?;
+    let tree = l.tree();
+    let rep = core_index::sensitive::scan(
+        tree,
+        &core_index::sensitive::Options {
+            max: limit.unwrap_or(500),
+            min_size: min,
+        },
+    );
+    // `path_remap()` 返回的是**拥有所有权**的 Option<PathRemap>（不是引用），
+    // 所以闭包里必须 `as_ref()`：`match remap { Some(r) => … }` 会把 map 从
+    // 被捕获的变量里移出去，而 FnMut 还要被调用第二次。
+    let remap = l.session.path_remap();
+    let path_of = |node: u32| match remap.as_ref() {
+        Some(r) => r.apply(&tree.path_of(node)),
+        None => tree.path_of(node),
+    };
+    Ok(SensitiveView {
+        rows: rep
+            .hits
+            .iter()
+            .map(|h| SensitiveRow {
+                node: h.node,
+                name: name_of(tree, h.node),
+                path: path_of(h.node),
+                size: h.size,
+                alloc: h.alloc,
+                mtime: h.mtime,
+                category: h.rule.category.to_string(),
+                severity: h.rule.severity.key().to_string(),
+                severity_cn: h.rule.severity.label_cn().to_string(),
+                why: h.rule.why.to_string(),
+            })
+            .collect(),
+        scanned: rep.files,
+        matched: rep.hits.len() as u64,
+        truncated: rep.truncated,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        rules: core_index::SENSITIVE_RULES.len(),
+    })
+}
+
+// ── 规则试算（E4）──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimRuleDto {
+    pub index: usize,
+    /// 用户写的那一行原文（界面在结论旁边回显它，避免"第几条"对不上）
+    pub text: String,
+    pub kind: String,
+    pub kind_cn: String,
+    pub threshold: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimVerdictDto {
+    pub rule_index: usize,
+    pub path: String,
+    pub kind: String,
+    pub threshold: u64,
+    pub observed: u64,
+    /// 正数=超了，负数=还差多少
+    pub gap: i64,
+    pub fires: bool,
+    pub judgeable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulateView {
+    pub rules: Vec<SimRuleDto>,
+    pub verdicts: Vec<SimVerdictDto>,
+    /// 参与试算的目标（成功在索引里找到的）
+    pub targets: Vec<String>,
+    /// 索引里找不到的路径（写错 / 还没扫过 / 已被删）
+    pub missing: Vec<String>,
+    /// 会立刻触发的条数
+    pub fires: usize,
+}
+
+/// 规则试算：以**当前索引**为准，判断这套规则会报几条、报在谁头上。
+///
+/// 为什么只信"当前索引"：增量与速率规则需要监控起点，而监控跑起来之后
+/// 起点在后台线程里、命令拿不到（也不该为了试算去翻它的状态）。所以这里
+/// 把基线设成"现在"，于是：
+///
+/// * **绝对阈值**——结论完全有效（它就是问"现在超没超"）；
+/// * **增量/速率**——必然算出 0 / 判不了，界面上如实标成「要跑起来才有意义」。
+///
+/// 装出一个"看起来有数"的结果比不给结果更糟：用户会据此把阈值调错。
+#[tauri::command]
+pub fn rules_simulate(
+    state: State<'_, Shared>,
+    paths: Vec<String>,
+    rules: String,
+) -> Result<SimulateView, String> {
+    let texts: Vec<String> = rules
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if texts.is_empty() {
+        return Err("先写一条规则，例如 abs=1G".into());
+    }
+    let parsed = core_monitor::parse_rules(&texts)?;
+    let wanted: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return Err("先指定要试算的目录（在监控目标里填，或直接对当前视图根试算）".into());
+    }
+
+    let st = state.lock().map_err(|_| "状态锁被污染".to_string())?;
+    if st.scanning {
+        return Err("正在扫描：等索引稳定后再试算".into());
+    }
+    let l = st.loaded()?;
+    let tree = l.tree();
+    let remap = l.session.path_remap();
+    let mut samples = Vec::new();
+    let mut missing = Vec::new();
+    let mut targets = Vec::new();
+    for p in &wanted {
+        let node = match find_directory(&l.session, p) {
+            Some(n) => n,
+            None => {
+                missing.push(p.clone());
+                continue;
+            }
+        };
+        let size = tree.node(node).map(|n| n.size).unwrap_or(0);
+        let shown = match remap.as_ref() {
+            Some(r) => r.apply(&tree.path_of(node)),
+            None => tree.path_of(node),
+        };
+        targets.push(shown.clone());
+        samples.push(core_monitor::Sample::instant(shown, size));
+    }
+    let verdicts = core_monitor::simulate(&parsed, &samples);
+    let fires = verdicts.iter().filter(|v| v.fires).count();
+    Ok(SimulateView {
+        rules: parsed
+            .iter()
+            .enumerate()
+            .map(|(i, r)| SimRuleDto {
+                index: i,
+                text: texts.get(i).cloned().unwrap_or_default(),
+                kind: r.kind.as_str().to_string(),
+                kind_cn: r.kind.label_cn().to_string(),
+                threshold: r.threshold,
+            })
+            .collect(),
+        verdicts: verdicts
+            .iter()
+            .map(|v| SimVerdictDto {
+                rule_index: v.rule_index,
+                path: v.path.clone(),
+                kind: v.kind.as_str().to_string(),
+                threshold: v.threshold,
+                observed: v.observed,
+                gap: v.gap,
+                fires: v.fires,
+                judgeable: v.judgeable,
+            })
+            .collect(),
+        targets,
+        missing,
+        fires,
+    })
+}
+
 // ── 详情面板 ────────────────────────────────────────────────────────────────
 
 /// 批量取名字 —— 面积图一次要几百到几千个。
@@ -749,10 +1014,24 @@ pub fn node_detail(state: State<'_, Shared>, node: u32) -> Result<NodeInfo, Stri
         .node(node)
         .filter(|n| n.in_use())
         .ok_or_else(|| format!("节点 {node} 不在索引里"))?;
+    let path = l.session.path_remap().map(|r| r.apply(&tree.path_of(node))).unwrap_or_else(|| tree.path_of(node));
+    // FRN 的构成：下标就是记录号（见 `arena` 的文件头），高 16 位是序列号。
+    // 走 `make_frn` 而不是自己移位 —— 位布局只能有一处定义。
+    let frn = format!("{:016x}", core_ntfs::filename::make_frn(node as u64, n.seq));
+    // 现场 stat 一次：几百微秒，换 ctime / 硬链接数 / 真实属性位。
+    // 文件可能已经被删了（差异列表里点开的行经常是这种），取不到就留 None，
+    // **不能**拿索引里的旧值顶替 —— 那会让人以为文件还在。
+    let disk = std::fs::metadata(&path).ok().map(|md| DiskInfo {
+        ctime: core_io::fsmeta::ctime_unix(&md).unwrap_or(0),
+        nlink: core_io::fsmeta::nlink(&md),
+        attributes: core_io::fsmeta::attributes(&md),
+        size: md.len(),
+        mtime: core_io::fsmeta::mtime_unix(&md),
+    });
     Ok(NodeInfo {
         node,
         name: name_of(tree, node),
-        path: l.session.path_remap().map(|r| r.apply(&tree.path_of(node))).unwrap_or_else(|| tree.path_of(node)),
+        path,
         is_dir: n.is_dir(),
         size: n.size,
         alloc: n.alloc,
@@ -764,6 +1043,10 @@ pub fn node_detail(state: State<'_, Shared>, node: u32) -> Result<NodeInfo, Stri
             .unwrap_or(0) as u64,
         depth: tree.depth_of(node),
         mtime: n.mtime,
+        frn,
+        seq: n.seq,
+        flags: n.flags,
+        disk,
     })
 }
 

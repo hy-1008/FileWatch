@@ -91,12 +91,22 @@ function fwMiddleEllipsis(name, max) {
  *
  * 用本地时间而不是 UTC：文件时间戳是"我这台机器上的什么时候"，
  * 用户在资源管理器里看到的也是本地时间，两边对不上就会被当成 bug。
- * 0 表示"不知道"（快照里没有 / 文件已删除），显示 `—`。
+ *
+ * 拿不准的值一律显示 `—`，**绝不**把 NaN 拼到界面上：
+ *
+ *   · `0` / 空 / 非数字 → 不知道（快照里没有 / 文件已删除）；
+ *   · 超出 NTFS 的时间范围（1601~2200）→ 数据是坏的。这一条不是洁癖：
+ *     `new Date(巨大负数 * 1000)` 是 Invalid Date，`getFullYear()` 会返回 NaN，
+ *     而 `String(NaN).padStart(2,'0')` 就是 `"NaN"` —— 界面上曾经真的出现过
+ *     `NaN-NaN-NaN NaN:NaN`（坏掉的 FILETIME 会被读成一个离谱的负数）。
  */
 function fwLocalTime(ts) {
-  if (!ts) return '—';
-  const d = new Date(ts * 1000);
+  const n = Number(ts);
+  if (!n || !Number.isFinite(n)) return '—';
+  const d = new Date(n * 1000);
   if (Number.isNaN(d.getTime())) return '—';
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const y = d.getFullYear();
+  if (y < 1601 || y > 2200) return '—';
+  const p = (v) => String(v).padStart(2, '0');
+  return `${y}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }

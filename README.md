@@ -1,11 +1,11 @@
-# FileWatch —— Windows 文件增量监控工具
+# FileWatch —— 文件增量监控工具（Windows / Linux）
 
-用 NTFS `$MFT` 直读 + USN Journal 做全盘扫描与实时监控，配 Squarified Treemap
-面积图看清楚"空间到底被谁吃了"。
+用 NTFS `$MFT` 直读 + USN Journal（Windows）或目录遍历 + `inotify`（Linux）
+做全盘扫描与实时监控，配 Squarified Treemap 面积图看清楚"空间到底被谁吃了"。
 
 **不装驱动、不常驻索引服务、不联网。** 扫一次把目录树（名字 / 大小 / 时间）
-装进内存，之后靠 USN 增量事件更新；200 万文件的盘通常几秒扫完，常驻内存
-控制在几百 MB 以内。
+装进内存，之后靠增量事件更新；200 万文件的盘通常几秒扫完（Windows MFT 路径），
+常驻内存控制在几百 MB 以内。
 
 ![面积图界面](artifacts/ui/main.png)
 
@@ -19,6 +19,11 @@
 | 阈值预警 | `abs=` / `grow=` / `rate=` 三种规则（与 CLI 同一套语法），带滞回与冷却；命中时**系统通知 + 托盘图标闪动 + 托盘菜单记一条**，窗口收起来也看得见 |
 | 重复文件 | 体积 → 首尾哈希 → 全哈希 → **逐字节复核**；只查找、不删除 |
 | 快照对比 | 存一份 `.tsv` 快照，过一段时间再比：谁新增 / 删除 / 变大 / 变小，六列表格 + CSV |
+| 增长归因 | 对比结果顺手回答"这一周 50 GB 长在**哪儿**"：目录（前 3 层）/ 类型 / 时段三个榜，与文件级明细互补 |
+| 详情面板 | 点任意节点看 FRN（引用号）、硬链接数、创建时间、稀疏 / 压缩 / 加密等属性。一半来自扫描时的 MFT，一半来自点击时的系统查询，界面上分开放、不混着说 |
+| 规则试算 | 写阈值规则之前先试算：对当前索引跑一遍，立刻知道会不会一上来就刷屏、离阈值还差多少（增量 / 速率规则要跑起来才有意义，界面会直说） |
+| 风险清单 | 按文件名与扩展名盘点私钥 / 密码库 / 云凭据 / 证件类文件。只看名字、**不读内容**，命中分级，只列不删 |
+| 离线报告 | 导出**单个 HTML**（概览 + 目录面积图 + 三张榜），无脚本无外链，断网能开、可直接转发 |
 | 文件搜索 | 在**内存索引**里搜名字（包含 / 模糊 / 正则），也可搜纯文本文件的内容（txt / 日志 / CSV / 源码） |
 | 常驻托盘 | 可设为「关闭窗口只收进托盘」，监控继续跑；可选开机自启 |
 
@@ -32,6 +37,89 @@
 * **不解析 Office 文档内容**（docx/xlsx/pptx 是压缩包，引擎层刻意零第三方依赖）。
 
 ---
+
+## Linux 支持（引擎 + CLI）
+
+同一份源码，两个平台各用自己最好的那条路。**引擎层仍然零第三方依赖**：
+Linux 的 `inotify` / `statvfs` / `signal` 也是手写 `extern "C"` 声明，
+不引 `libc` / `inotify` / `nix` 任何 crate。
+
+| 能力 | Windows | Linux |
+|---|---|---|
+| 卷/挂载点枚举 | `GetLogicalDriveStringsW` | `/proc/self/mounts` + `statvfs` |
+| 全量扫描 | `$MFT` 直读（管理员）／目录遍历 | 目录遍历（`read_dir` + `lstat`） |
+| 实时增量 | USN Journal ／ `ReadDirectoryChangesW` | `inotify` |
+| 占用空间 | 按簇对齐估算 | `st_blocks × 512`（**真实**分配，稀疏文件会小于逻辑大小） |
+| 路径分隔符 | `\` | `/`（`std::path::MAIN_SEPARATOR`，全项目只此一处口径） |
+| 硬链接去重 | 仅 MFT 直读路径 | `st_nlink` 可用（体积去重仍按 `(dev, inode)` 之外的规则保守处理） |
+| 快照 / 对比 / 重复文件 / 面积图 / 阈值预警 | ✅ | ✅ 完全相同 |
+| GUI（Tauri） | ✅ | ⏳ 未移植（见下） |
+
+### 构建与验收
+
+```bash
+# ① 在 Windows 上就能做的：Linux 目标的类型检查（不链接，挡住 90% 移植错误）
+bash tools/linux_check.sh
+
+# ② 在 Linux / WSL2 里做的：构建 + 单测 + 自检 + 端到端冒烟
+bash tools/linux_smoke.sh
+```
+
+`linux_smoke.sh` 会自己造夹具树，逐项断言：卷枚举、扫描的文件数/体积/后端、
+快照对比的四类变更、`inotify` 实机投递（含"新建子目录里的文件"这条最容易漏的
+路径）、重复文件分组。
+
+### WSL2 上测试的三个注意点
+
+1. **不要在 `/mnt/c` 上测实时监控。** 那是 Windows 盘经 9p 挂进来的，
+   Windows 侧程序做的改动**不会**产生 inotify 事件（Linux 侧自己写的才有）。
+   测事件请用主目录（`~/...`，ext4）。扫描 `/mnt/c` 没问题，只是慢。
+2. **`inotify` 的 watch 有上限**（`cat /proc/sys/fs/inotify/max_user_watches`，
+   默认 8192~65536）。大盘递归监控会挂不满，此时工具**不静默**：
+   `DirWatcher::failed_dirs()` 会计数，会话告警里写明"有 N 个目录没被监控"。
+   临时调大：`sudo sysctl fs.inotify.max_user_watches=524288`。
+3. `$MFT` / USN Journal 在 Linux 上没有对应物（`ntfs3` / `ntfs-3g` 都不暴露），
+   所以 `probe` 只对**磁盘镜像文件**有意义，`journal` 命令会直接说明不可用，
+   `top`（恒定内存扫描）也是 Windows 专属 —— 等价功能用 `scan <目录> --top=N`。
+   `scan` 会自动走目录遍历，不需要 `--force-traverse`。
+4. **路径用法不同**：Linux 直接给绝对路径（`filewatch scan /home/me/projects`），
+   不需要也不接受 `C:` 这种盘符；"整个卷"就是挂载点本身（`filewatch scan /home`）。
+5. 非 UTF-8 文件名在 Linux 上按 U+FFFD 显示（与 Windows 的 lossy 口径一致）——
+   引擎的名字存储是 UTF-8 字符串池，这是数据模型的既定边界。
+
+### 源码里平台分派在哪
+
+```text
+crates/core-io/src/
+  consts.rs            两平台共用的数字（属性位 / 动作码 / FSCTL / 错误码）
+  paths.rs             分隔符与「卷根前缀」的唯一口径
+  fsmeta.rs            Metadata → (属性位, 修改时间, 占用, 链接数)
+  volume.rs    ──┬─ volume/win.rs    \\.\C: + DeviceIoControl
+                 └─ volume/linux.rs  /dev/xxx 或镜像文件 + pread
+  volumes.rs           卷枚举（Windows / Linux 双实现，共享 VolumeInfo）
+  winapi.rs    ──┬─ winapi.rs（Windows，真 FFI）
+                 └─ winapi/linux.rs（只有类型与常量，一个函数都没有）
+
+crates/core-scan/src/
+  dirwatch.rs  ──┬─ dirwatch/win.rs    ReadDirectoryChangesW（OVERLAPPED 异步）
+                 └─ dirwatch/linux.rs  inotify（poll + 唤醒管道 + 递归补 watch）
+```
+
+`VolumeInfo` / `FsEvent` / `Tree` / 事件翻译层（`watcher.rs`）是**共用**的：
+Linux 走的就是原来那条"降级路径"，只是把 `ReadDirectoryChangesW` 换成
+`inotify` —— 这也是为什么两个平台的功能列表能一条条对上。
+
+### 为什么 GUI 还没移植
+
+GUI 是 Tauri 2，Linux 上要 `libwebkit2gtk-4.1-dev` / `libgtk-3-dev` 一整套系统库，
+而且现有代码里权限提升（`ShellExecuteW(runas)`）、托盘图标、原生右键菜单
+（`SHOpenWithDialog` / `SHOpenFolderAndSelectItems`）全是 Win32 实现。
+这些不是"加个 `#[cfg]`"能解决的，需要各自写一份 Linux 实现（polkit / GIO /
+`xdg-desktop-portal`）。所以本轮先把**引擎 + CLI 两个平台跑通、跑绿**，
+GUI 留作下一步。
+
+---
+
 
 ## 0. 只想打开软件看看
 
@@ -228,7 +316,7 @@ filewatch diff before.tsv after.tsv --by-abs --csv=changes.csv
 
 | 选项（snapshot） | 含义 |
 |---|---|
-| `--out=FILE` | 输出路径（默认 `snapshot-<UTC 时间戳>.tsv`） |
+| `--out=FILE` | 输出路径（默认 `snapshot-<本地时间戳>.tsv`） |
 | `--max-entries=N` | 最多记多少个文件（0 = 不限；截断会如实标注） |
 
 | 选项（diff） | 含义 |
@@ -243,6 +331,39 @@ filewatch diff before.tsv after.tsv --by-abs --csv=changes.csv
 版本号，`#count` 与实际条数不符即报错 —— 因为**截断的快照会让后半段全被判成
 "已删除"**，用户可能照着它去清理并不存在的垃圾。写入先落 `.part` 再改名，
 中途被杀不会留下一份"看起来正常、少了一半"的文件当基准。
+
+加 `--attrib` 会多打三个榜（目录 / 类型 / 时段）。归因必须在 diff 里顺带算：
+它要的是**全量**变化行，而 `--top` 之后明细只剩前几十行。
+
+```powershell
+filewatch diff before.tsv after.tsv --attrib
+```
+
+### report（离线 HTML 报告）
+
+```powershell
+filewatch report D:\projects --out=report.html --top=30
+```
+
+一个自包含文件：概览卡片 + 目录面积图（内联 SVG）+ 最大目录 / 最大文件 / 类型三张榜。
+没有脚本、没有外链、没有字体文件，断网双击就能看，也可以直接发给别人。
+界面里的「文件 → 导出 HTML 报告…」调的是同一份模板，所以两边数字必须一致。
+
+### sensitive（风险清单）
+
+```powershell
+filewatch sensitive C: --min-size=1K --max=200
+```
+
+按文件名与扩展名匹配私钥（`id_rsa` / `*.pem` / `*.p12`）、密码库（`*.kdbx`）、
+云凭据（`.git-credentials` / `credentials.json`）、环境变量文件（`.env*`）、
+钱包（`wallet.dat`）、证件扫描件等。**不读文件内容**，所以：
+
+* 零 IO、200 万条索引几十毫秒；
+* 必然有假阳性（一个叫 `key.pem` 的测试夹具也会命中），每条都带「为什么要看它」；
+* "没有命中" **不等于** "没有风险" —— 无扩展名的私钥、内容里写死的密钥它都看不见。
+
+命中按 高 / 中 分级，按体积降序 —— 先看大的那个。
 
 ---
 
@@ -492,8 +613,13 @@ filewatch monitor C: --rule=abs=50G --duration=5m
 
 ## 6. 已知限制
 
-* **仅 Windows**：核心依赖 NTFS 与 Win32；`core-io` 在非 Windows 上直接
-  `compile_error!`。
+* **Windows 才有 MFT 快路径**：Linux 版走目录遍历 + `inotify`（功能完整，
+  速度慢 1~2 个数量级）。Linux 侧的 `$MFT` 直读只对块设备/镜像文件开放
+  （root），且拿不到 USN 增量，所以 `scan` 默认不走它。
+* **Linux 上没有 `ReadDirectoryChangesW` 的"一次句柄覆盖整棵子树"**：
+  `inotify` 是每目录一个 watch，新建目录时必须补挂。补挂逻辑在
+  `dirwatch/linux.rs`，并且有专门的冒烟断言（`nested.txt` 那条）——
+  这条路径一旦漏掉，界面会"看起来在监控"但再也不更新，属于静默失效。
 * **USN 记录不带文件大小**，必须回读 `$MFT` 记录。若文件在两次读取之间被删，
   该次变更被记为 0 字节 —— 这是协议本身的限制，不是实现缺陷。
 * **降级模式无离线补偿**：进程不在时发生的变更不会被记录。需要断线续跑必须

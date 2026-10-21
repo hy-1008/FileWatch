@@ -452,6 +452,109 @@ pub(crate) fn build_message(
     }
 }
 
+// ── 规则试算（E4）──────────────────────────────────────────────────────────
+//
+// 写规则的门槛不在语法，在**判断**：`abs=1G` 到底会不会立刻刷屏、`grow=500M`
+// 是不是比这台机器一天的正常写入量还低。解析器只能告诉你"语法对不对"，
+// 试算才能告诉你"会不会报"。
+//
+// 与 `RuleEngine::evaluate` 的关系：**判据完全一致，但不带状态**。试算不读也不写
+// 触发状态（firing）与冷却期，所以它回答的是"以现在的数据，这条规则**会不会**
+// 触发"，而不是"此刻轮询到它会不会真的弹窗"（后者还要看抑制状态）。
+// 这个区别必须保留：带状态就变成"试算一次等于消耗一次冷却"，没人敢点第二下。
+
+/// 试算的一个目标样本。
+///
+/// 由调用方从真实运行状态里取（监控目标的基线、速率窗口起点），不要自己编 ——
+/// 编出来的数只能证明算术，证明不了规则好不好使。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sample {
+    pub path: String,
+    /// 当前总大小
+    pub size: u64,
+    /// 增量规则的基线（监控起点大小）
+    pub baseline: u64,
+    /// 速率窗口起点大小
+    pub window_size: u64,
+    /// 监控已经跑了多久（毫秒）。0 = 刚开始，速率规则还判断不了。
+    pub elapsed_ms: u64,
+}
+
+impl Sample {
+    /// "没有历史"的样本：基线与窗口都等于当前大小。
+    ///
+    /// 没开始监控时只能这样 —— 于是增量规则算出 0、速率规则判不了，这是**如实**的
+    /// 结果，而不是"没超阈值"。界面必须把这一点说出来，否则用户会以为规则设得太松。
+    pub fn instant(path: impl Into<String>, size: u64) -> Sample {
+        Sample {
+            path: path.into(),
+            size,
+            baseline: size,
+            window_size: size,
+            elapsed_ms: 0,
+        }
+    }
+}
+
+/// 单条规则的试算结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub path: String,
+    /// 在传入的 `rules` 里的下标（界面要能回指到用户写的那一行）
+    pub rule_index: usize,
+    pub kind: RuleKind,
+    pub threshold: u64,
+    /// 实际观测到的量：绝对=总量；增量=增量；速率=字节/秒
+    pub observed: u64,
+    /// 与阈值的差：正数=超出，负数=还差多少（取绝对值即"差多少"）
+    pub gap: i64,
+    /// 会不会立刻触发
+    pub fires: bool,
+    /// 这条规则在这个样本上能不能判断（速率规则没有时间跨度时为 false）
+    pub judgeable: bool,
+}
+
+/// 对一批样本试算一组规则。顺序与 `samples × rules` 的嵌套顺序一致，
+/// 界面按这个顺序渲染就行，不需要自己再配一遍。
+pub fn simulate(rules: &[Rule], samples: &[Sample]) -> Vec<Verdict> {
+    let mut out = Vec::with_capacity(rules.len() * samples.len());
+    for s in samples {
+        for (i, rule) in rules.iter().enumerate() {
+            if !rule.enabled {
+                continue;
+            }
+            let (observed, judgeable) = match rule.kind {
+                RuleKind::Absolute => (s.size, true),
+                RuleKind::Growth => (s.size.saturating_sub(s.baseline), true),
+                RuleKind::Rate => {
+                    if rule.window_ms == 0 || s.elapsed_ms == 0 {
+                        // 分母是**规则写的窗口长度**，与 `evaluate` 一致：
+                        // 试算若用实际经过时长，就会和运行时的判据不一致，
+                        // 那这个功能就没有意义了。
+                        (0, false)
+                    } else {
+                        let grew = s.size.saturating_sub(s.window_size);
+                        (grew.saturating_mul(1000) / rule.window_ms, true)
+                    }
+                }
+            };
+            let fires = judgeable && observed > rule.threshold;
+            let gap = observed as i64 - rule.threshold as i64;
+            out.push(Verdict {
+                path: s.path.clone(),
+                rule_index: i,
+                kind: rule.kind,
+                threshold: rule.threshold,
+                observed,
+                gap,
+                fires,
+                judgeable,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +564,93 @@ mod tests {
 
     fn engine() -> RuleEngine {
         RuleEngine::new(RuleConfig::default())
+    }
+
+    // ── 规则试算（E4）────────────────────────────────────────────────────
+
+    #[test]
+    fn simulate_mirrors_the_runtime_judgement() {
+        let rules = vec![Rule::absolute(10 * GB), Rule::growth(2 * GB)];
+        let s = Sample {
+            path: "C:\\logs".into(),
+            size: 12 * GB,
+            baseline: 9 * GB,
+            window_size: 9 * GB,
+            elapsed_ms: 60_000,
+        };
+        let v = simulate(&rules, &[s]);
+        assert_eq!(v.len(), 2);
+        // 绝对：12 > 10 → 立刻触发，超出 2 GB
+        assert!(v[0].fires);
+        assert_eq!(v[0].observed, 12 * GB);
+        assert_eq!(v[0].gap, 2 * GB as i64);
+        // 增量：只涨了 3 GB > 2 GB → 也触发
+        assert!(v[1].fires);
+        assert_eq!(v[1].observed, 3 * GB);
+    }
+
+    #[test]
+    fn simulate_reports_how_far_off_a_rule_is() {
+        let v = simulate(
+            &[Rule::absolute(10 * GB)],
+            &[Sample {
+                path: "C:\\a".into(),
+                size: 4 * GB,
+                baseline: 4 * GB,
+                window_size: 4 * GB,
+                elapsed_ms: 0,
+            }],
+        );
+        assert!(!v[0].fires);
+        assert_eq!(v[0].gap, -(6 * GB as i64), "还差 6 GB 才到阈值");
+    }
+
+    #[test]
+    fn rate_rule_needs_a_window_to_be_judged() {
+        let rule = Rule::rate(10 * MB, 60_000);
+        // 没有时间跨度（刚点开始监控）→ 不能判断，而不是"不触发"
+        let v = simulate(
+            &[rule],
+            &[Sample {
+                path: "C:\\a".into(),
+                size: 5 * GB,
+                baseline: 5 * GB,
+                window_size: 5 * GB,
+                elapsed_ms: 0,
+            }],
+        );
+        assert!(!v[0].judgeable);
+        assert!(!v[0].fires);
+
+        // 60 秒里涨了 1.2 GB → 20 MB/s > 10 MB/s
+        let v = simulate(
+            &[rule],
+            &[Sample {
+                path: "C:\\a".into(),
+                size: 5 * GB + 1_200 * MB,
+                baseline: 5 * GB,
+                window_size: 5 * GB,
+                elapsed_ms: 60_000,
+            }],
+        );
+        assert!(v[0].judgeable);
+        assert!(v[0].fires);
+        assert_eq!(v[0].observed, 20 * MB);
+    }
+
+    #[test]
+    fn simulate_keeps_rule_order_and_target_order() {
+        let rules = vec![Rule::absolute(1), Rule::growth(1), Rule::rate(1, 60_000)];
+        let samples = vec![
+            Sample { path: "a".into(), size: 9, baseline: 0, window_size: 0, elapsed_ms: 60_000 },
+            Sample { path: "b".into(), size: 9, baseline: 0, window_size: 0, elapsed_ms: 60_000 },
+        ];
+        let v = simulate(&rules, &samples);
+        assert_eq!(v.len(), 6, "每个目标 × 每条规则各一条结论");
+        assert_eq!(v[0].path, "a");
+        assert_eq!(v[3].path, "b");
+        assert_eq!(v[0].rule_index, 0);
+        assert_eq!(v[2].rule_index, 2);
     }
 
     #[test]

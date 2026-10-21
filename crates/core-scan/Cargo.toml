@@ -12,6 +12,7 @@ core-ntfs = { path = "../core-ntfs" }
 core-usn = { path = "../core-usn" }
 core-index = { path = "../core-index" }
 core-monitor = { path = "../core-monitor" }
+core-viz = { path = "../core-viz" }
 
 [lib]
 name = "core_scan"

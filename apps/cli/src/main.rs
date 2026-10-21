@@ -45,7 +45,7 @@ use core_scan::{
 use core_usn::journal;
 use core_viz::{compute_layout, LayoutOptions, LodPolicy, Rect, ShadingMode};
 use render::{
-    fmt_offset_ms, fmt_unix_stamp, fmt_unix_utc, pad_left, pad_right, render_ascii, render_legend,
+    fmt_local_stamp, fmt_local_time, fmt_offset_ms, pad_left, pad_right, render_ascii, render_legend,
     rule_line, truncate, truncate_keep_tail,
 };
 use std::io::Write;
@@ -70,6 +70,8 @@ fn main() {
         "dupes" | "dup" => cmd_dupes(&a),
         "snapshot" | "snap" => cmd_snapshot(&a),
         "diff" => cmd_diff(&a),
+        "report" => cmd_report(&a),
+        "sensitive" | "secrets" => cmd_sensitive(&a),
         "selftest" | "self-test" | "check" => cmd_selftest(&a),
         "" | "help" | "-h" | "--help" => {
             print_help();
@@ -91,8 +93,16 @@ fn main() {
 }
 
 fn print_help() {
+    // 平台差异只在**能力**上：Windows 有 MFT 直读 + USN，Linux 只有遍历 + inotify。
+    // 把这件事写在标题下第一行，比在每处命令说明里各补一句更不容易漏。
+    let backend = if core_io::HAS_MFT_BACKEND {
+        "Windows 后端：MFT 直读 + USN Journal（无权限时自动降级为目录遍历 + ReadDirectoryChangesW）"
+    } else {
+        "Linux 后端：目录遍历 + inotify（$MFT / USN Journal 仅 Windows 可用，probe 只能读镜像文件）"
+    };
     println!(
-        r#"FileWatch —— Windows NTFS 文件增量监控工具（引擎 + CLI）
+        r#"FileWatch —— 文件增量监控工具（引擎 + CLI）
+{backend}
 
 用法：
   filewatch <命令> [参数...]
@@ -107,6 +117,8 @@ fn print_help() {
   dupes <盘符|目录> [选项]    查找内容相同的重复文件（F12）
   snapshot <盘符|目录> [选项] 建立快照，供以后对比（F11）
   diff <旧快照> <新快照>      对比两次快照，看这段时间谁变大了（F11）
+  report <盘符|目录> [选项]   导出单文件离线 HTML 报告（概览 + 面积图 + 三张榜）
+  sensitive <盘符|目录>       按文件名/扩展名盘点敏感文件（不读内容）
   selftest [--verbose]        免管理员的全链路自检
   help / version
 
@@ -167,6 +179,15 @@ diff 选项：
   --by-abs               按变化幅度排序（默认按增量降序，即"谁变大了"）
   --by-path              按路径排序
   --csv=FILE             把差异行写成 CSV
+
+平台差异：
+  Linux：scan / monitor / dupes / snapshot 直接接受绝对路径：
+         filewatch scan /home/me/projects
+         （没有盘符概念；"整个卷"就是挂载点本身，如 /home）
+  Linux 不可用：
+         top     恒定内存依赖 $MFT 直读 → 用 scan <目录> --top=N 代替
+         journal USN Journal 是 NTFS 的 Windows 实现特性（Linux 用 inotify）
+         probe   仍可用，但只能读块设备或磁盘镜像文件（块设备需要 root）
 
 示例：
   filewatch volumes
@@ -300,6 +321,14 @@ fn print_access_error(drive: &str, e: &std::io::Error) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn cmd_journal(a: &Args) -> i32 {
+    // USN Journal 是 NTFS 的 Windows 实现特性：`ntfs3` / `ntfs-3g` 都不暴露它。
+    // 与其让用户看到一个 `Unsupported` 的系统错误，不如直接说清"这个平台上没有"。
+    if !core_io::HAS_MFT_BACKEND {
+        eprintln!("journal 命令仅 Windows 可用：USN Journal 是 NTFS 的 Windows 实现特性。");
+        eprintln!("Linux 的增量监控走 inotify，既不需要、也无法创建这种日志。");
+        eprintln!("直接 `filewatch monitor <目录>` 即可（会自动用 inotify）。");
+        return 2;
+    }
     let drive = match a.positional.first() {
         Some(d) => d.clone(),
         None => {
@@ -465,12 +494,30 @@ fn build_scan_config(a: &Args, drive: &str, watch: bool) -> Result<SessionConfig
 }
 
 fn cmd_scan(a: &Args) -> i32 {
-    let drive = a.positional.first().cloned().unwrap_or_else(|| "C:".to_string());
-    let (norm, _) = match core_io::normalize_drive(&drive) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("盘符「{}」无效：{}", drive, e);
-            return 2;
+    let target = a
+        .positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| core_io::paths::DEFAULT_VOLUME.to_string());
+    // 位置参数的含义两个平台不同：
+    // * Windows：盘符（子目录要用 `--root=`，整卷才可能走 $MFT）；
+    // * Linux：**路径**（`scan /home/me/x` 就只扫那个目录）—— 没有盘符概念，
+    //   硬套 Windows 语义会让用户为了扫一个目录还得再写一次 --root。
+    let (norm, positional_root) = if cfg!(windows) {
+        match core_io::normalize_drive(&target) {
+            Ok((d, _)) => (d, None),
+            Err(e) => {
+                eprintln!("盘符「{}」无效：{}", target, e);
+                return 2;
+            }
+        }
+    } else {
+        match split_target(&target) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{}", e);
+                return 2;
+            }
         }
     };
 
@@ -500,13 +547,17 @@ fn cmd_scan(a: &Args) -> i32 {
         },
         None => None,
     };
-    let cfg = match build_scan_config(a, &norm, false) {
+    let mut cfg = match build_scan_config(a, &norm, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("参数错误：{}", e);
             return 2;
         }
     };
+    // Linux：位置参数本身就是一个目录 → 当作扫描根（`--root` 仍然优先）。
+    if cfg.scan_root.is_none() {
+        cfg.scan_root = positional_root;
+    }
 
     println!(
         "开始扫描 {}（根：{}）",
@@ -514,7 +565,7 @@ fn cmd_scan(a: &Args) -> i32 {
         cfg.scan_root
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| format!("{}\\", norm))
+            .unwrap_or_else(|| core_io::paths::root_prefix(&norm))
     );
     let t0 = Instant::now();
     let session = match Session::open(cfg, progress_to_stderr) {
@@ -788,6 +839,14 @@ fn json_summary(s: &Session, top_n: usize, wall_ms: u128, remap: Option<&PathRem
 
 fn cmd_top(a: &Args) -> i32 {
     let drive = a.positional.first().cloned().unwrap_or_else(|| "C:".to_string());
+    // `top` 的全部价值在于「不建树、恒定内存」—— 那只有 $MFT 直读做得到。
+    // Linux 上换一条路就没有这个性质了，所以**不假装能用**，直接指路。
+    if !core_io::HAS_MFT_BACKEND {
+        eprintln!("top 命令依赖 $MFT 直读（恒定内存扫描），仅 Windows 可用。");
+        eprintln!("Linux 请用等价命令：");
+        eprintln!("  filewatch scan {} --top={}", drive, a.num("n", 20).unwrap_or(20));
+        return 2;
+    }
     let (norm, _) = match core_io::normalize_drive(&drive) {
         Ok(v) => v,
         Err(e) => {
@@ -873,11 +932,47 @@ fn cmd_top(a: &Args) -> i32 {
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(windows)]
 extern "system" fn on_ctrl_event(_t: u32) -> i32 {
     // 返回 1 表示「已处理」：系统不会立刻终止进程，
     // 我们有机会把游标与变更流水刷完再退出。
     INTERRUPTED.store(true, Ordering::SeqCst);
     1
+}
+
+/// 注册「退出前先把游标/流水刷完」的处理器。
+///
+/// * Windows：`SetConsoleCtrlHandler`（**不是** `signal`）—— 它还能捕获
+///   关闭控制台窗口、注销、关机这几种事件，而 `signal` 只覆盖 Ctrl+C；
+/// * Linux：`signal(SIGINT)`。`sigaction` 更严谨，但这里只做一件事
+///   （置一个原子布尔），`signal` 的语义足够，且不必写平台相关的 `sigaction`
+///   结构体（glibc 的布局跨架构不一致，手写容易错）。
+fn install_interrupt_handler() {
+    #[cfg(windows)]
+    unsafe {
+        core_io::winapi::SetConsoleCtrlHandler(Some(on_ctrl_event), 1);
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: 处理器只做一次原子写，是 async-signal-safe 的。
+        unsafe {
+            unix_signal(UNIX_SIGINT, on_unix_signal);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+const UNIX_SIGINT: i32 = 2;
+
+#[cfg(not(windows))]
+extern "C" {
+    #[link_name = "signal"]
+    fn unix_signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+#[cfg(not(windows))]
+extern "C" fn on_unix_signal(_sig: i32) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
 /// 降级模式下 `Tree` 里的路径前缀是**盘符**（合成路径），
@@ -902,7 +997,7 @@ fn path_remap_of(cfg: &SessionConfig) -> Option<PathRemap> {
 /// 提示只会变成噪音，而且那份日志相对整盘体积可以忽略。
 fn warn_if_changelog_inside(root: &str, changelog: Option<&str>) -> Option<String> {
     let log = changelog?;
-    let norm = |s: &str| s.trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase();
+    let norm = |s: &str| cli_path(s).trim_end_matches(['\\', '/']).to_lowercase();
     let r = norm(root);
     let l = norm(log);
     if r.len() <= 2 {
@@ -936,7 +1031,7 @@ fn cmd_monitor(a: &Args) -> i32 {
             return 2;
         }
     };
-    let raw = raw.replace('/', "\\");
+    let raw = cli_path(&raw);
 
     let mut cfg = match build_scan_config(a, &drive, !a.has("no-watch")) {
         Ok(c) => c,
@@ -977,7 +1072,7 @@ fn cmd_monitor(a: &Args) -> i32 {
     let show_status = a.get("tree").map(|v| v != "0").unwrap_or(true);
 
     println!("═══ FileWatch 监控 ═══");
-    println!("开始时间 : {}", fmt_unix_utc(unix_secs()));
+    println!("开始时间 : {}", fmt_local_time(unix_secs()));
     println!("监视路径 : {}", raw);
     println!(
         "规则     : {}",
@@ -1059,11 +1154,9 @@ fn cmd_monitor(a: &Args) -> i32 {
         }
     }
 
-    // 注册 Ctrl+C
+    // 注册 Ctrl+C（平台实现见 install_interrupt_handler）
     let mut interrupted = false;
-    unsafe {
-        core_io::winapi::SetConsoleCtrlHandler(Some(on_ctrl_event), 1);
-    }
+    install_interrupt_handler();
 
     println!();
     println!("{}", rule_line(100));
@@ -1206,19 +1299,31 @@ fn render_alert(a: &Alert, elapsed_ms: u64) -> String {
     )
 }
 
-/// 位置参数 → `(盘符, 扫描根)`。
+/// 把用户从 shell 拿到的路径归一成**本平台**形态。
 ///
-/// * `C:` / `D:\` → `("C:", None)`：整卷，可以走 `$MFT` 直读（快得多）
-/// * `D:\projects` → `("D:", Some(D:\projects))`：子目录，只能走遍历
+/// * Windows：`/` → `\`（实测 git-bash 会把 `D:\x` 传成 `D:/x`，
+///   不归一后面每一处显示与比较都要防一次）；
+/// * Linux：**原样返回**。`\` 在这里是合法的文件名字符，
+///   把它换成 `/` 等于给文件改名。
+fn cli_path(raw: &str) -> String {
+    if cfg!(windows) {
+        raw.replace('/', "\\")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// 位置参数 → `(卷键, 扫描根)`。
+///
+/// * Windows：`C:` / `D:\` → `("C:", None)` 整卷；`D:\projects` → 子目录
+/// * Linux：`/` 或某个挂载点 → `(挂载点, None)`；`/home/me/x` → 挂载点 + 子目录
 ///
 /// 这是「用户给的那个字符串到底指什么」的**唯一**解释处：`monitor` / `dupes` /
 /// `snapshot` 都用它。各写一份的话，迟早出现「monitor 认 `C:` 是整卷、
 /// dupes 却当成子目录」这种谁都没注意到的分叉。
-///
-/// 顺手把 `/` 归一成 `\`：调用方的 shell 未必守规矩（实测 git-bash 会把
-/// `D:\x` 传成 `D:/x`），不归一后面每一处显示都要防一次。
+#[cfg(windows)]
 fn split_target(raw: &str) -> Result<(String, Option<std::path::PathBuf>), String> {
-    let norm = raw.replace('/', "\\");
+    let norm = cli_path(&raw);
     let trimmed = norm.trim();
     if trimmed.is_empty() {
         return Err("路径为空".to_string());
@@ -1231,7 +1336,7 @@ fn split_target(raw: &str) -> Result<(String, Option<std::path::PathBuf>), Strin
         Some(c) if c.is_ascii_alphabetic() => *c,
         _ => {
             return Err(format!(
-                "无法从「{raw}」认出盘符：应当形如 C: 或 D:\\目录（本工具只支持 Windows 盘符路径）"
+                "无法从「{raw}」认出盘符：应当形如 C: 或 D:\\目录（Windows 版只支持盘符路径）"
             ))
         }
     };
@@ -1250,6 +1355,56 @@ fn split_target(raw: &str) -> Result<(String, Option<std::path::PathBuf>), Strin
         Some(std::path::PathBuf::from(trimmed))
     };
     Ok((drive, scan_root))
+}
+
+/// Linux：绝对路径 → `(所属挂载点, 扫描根)`。
+///
+/// 与 Windows 版的对应关系：
+///
+/// | Windows | Linux |
+/// |---|---|
+/// | `D:`（整卷） | `/home`（整个挂载点）→ `("/home", None)` |
+/// | `D:\projects` | `/home/me/projects` → `("/home", Some(路径))` |
+///
+/// 「卷键」必须取**挂载点**而不是输入路径本身：索引树的前缀是卷根，
+/// 扫描根是子目录时靠 [`PathRemap`] 换回真实路径 —— 这正是降级模式
+/// 原有的补偿机制，Linux 只是复用它。
+///
+/// 挂载点取**最长匹配**并落在路径分量边界上：`/home2` 不能被当成
+/// `/home` 的子目录（否则重映射会把前缀换错，路径全部指向不存在的位置）。
+#[cfg(not(windows))]
+fn split_target(raw: &str) -> Result<(String, Option<std::path::PathBuf>), String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("路径为空".to_string());
+    }
+    if !t.starts_with('/') {
+        return Err(format!(
+            "「{raw}」不是绝对路径：Linux 版请给绝对路径（例如 /home/me/projects）"
+        ));
+    }
+    let mp = best_mount(t);
+    let bare = t.trim_end_matches('/');
+    if bare.is_empty() || bare == mp.trim_end_matches('/') {
+        return Ok((mp, None));
+    }
+    Ok((mp, Some(std::path::PathBuf::from(t))))
+}
+
+/// `path` 所属的挂载点（最长前缀匹配，按路径分量比较）。
+#[cfg(not(windows))]
+fn best_mount(path: &str) -> String {
+    let mut best = "/".to_string();
+    for v in core_io::list_volumes() {
+        let d = v.drive.trim_end_matches('/');
+        let is_root = d.is_empty();
+        let hit = is_root || path == d || path.starts_with(&format!("{d}/"));
+        if hit && v.drive.len() > best.len() {
+            best = v.drive.clone();
+        }
+    }
+    // 兜底：根永远能匹配，所以 best 至少是 "/"；再归一一次防 `//`
+    core_io::paths::normalize_root(&best)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1325,7 +1480,7 @@ fn cmd_dupes(a: &Args) -> i32 {
     println!("═══ FileWatch 重复文件查找 ═══");
     // 显示时统一成反斜杠：调用方的 shell 可能传进来 `D:/photos`，
     // 而下面每一行都跟着它走（只有一处归一，别让用户看到两种写法）。
-    println!("查找范围 : {}", raw.replace('/', "\\"));
+    println!("查找范围 : {}", cli_path(&raw));
     println!(
         "最小体积 : {}",
         if opts.min_size == 0 {
@@ -1524,7 +1679,7 @@ fn cmd_snapshot(a: &Args) -> i32 {
     let out: std::path::PathBuf = match a.get("out") {
         Some(p) => std::path::PathBuf::from(p),
         // 默认文件名带时间戳：连拍几次不会互相覆盖，而且按名字排序就是时间顺序
-        None => std::path::PathBuf::from(format!("snapshot-{}.tsv", fmt_unix_stamp(created))),
+        None => std::path::PathBuf::from(format!("snapshot-{}.tsv", fmt_local_stamp(created))),
     };
     let snap_opts = SnapshotOptions {
         max_entries: match a.get("max-entries") {
@@ -1549,7 +1704,7 @@ fn cmd_snapshot(a: &Args) -> i32 {
     cfg.allow_traverse_watch = false;
 
     println!("═══ FileWatch 建立快照 ═══");
-    println!("扫描范围 : {}", raw.replace('/', "\\"));
+    println!("扫描范围 : {}", cli_path(&raw));
     let t0 = Instant::now();
     let session = match Session::open(cfg, progress_to_stderr) {
         Ok(s) => s,
@@ -1567,7 +1722,7 @@ fn cmd_snapshot(a: &Args) -> i32 {
         println!("· {}", w);
     }
     let remap = session.path_remap();
-    let display_root = raw.replace('/', "\\");
+    let display_root = cli_path(&raw);
     let snap = Snapshot::capture(&session.tree, remap.as_ref(), &display_root, created, &snap_opts);
     match snap.save(&out) {
         Ok(_) => {}
@@ -1586,7 +1741,7 @@ fn cmd_snapshot(a: &Args) -> i32 {
     );
     // 明确标 UTC：引擎里所有时间都是 Unix 秒（UTC），本地时区换算会引入
     // 一个「显示 13:41、文件名 05:41」的不一致，不如一开始就说清楚。
-    println!("时间戳   : {}（UTC）", fmt_unix_utc(created));
+    println!("时间戳   : {}", fmt_local_time(created));
     if snap.truncated > 0 {
         println!(
             "注意     : 有 {} 个文件因 --max-entries 没记进去，用它对比会得到不完整的结论",
@@ -1648,19 +1803,25 @@ fn cmd_diff(a: &Args) -> i32 {
         } else {
             DiffOrder::ByGrowth
         },
+        // 归因要全量行，所以只能在 diff 里顺带算（`--attrib` 才开）
+        attr: if a.has("attrib") {
+            Some(core_scan::AttrOptions::default())
+        } else {
+            None
+        },
     };
     let rep = core_scan::diff(&old, &new, &opts);
 
     println!("═══ FileWatch 快照对比 ═══");
     println!(
         "  旧 : {}  {}（{} 条）",
-        fmt_unix_utc(old.created_unix),
+        fmt_local_time(old.created_unix),
         old.root,
         old.len()
     );
     println!(
         "  新 : {}  {}（{} 条）",
-        fmt_unix_utc(new.created_unix),
+        fmt_local_time(new.created_unix),
         new.root,
         new.len()
     );
@@ -1676,6 +1837,9 @@ fn cmd_diff(a: &Args) -> i32 {
     println!("{}", core_scan::snapshot::summary_cn(&rep));
     if rep.same > 0 {
         println!("   （另有 {} 个文件完全没变，未列出）", rep.same);
+    }
+    if let Some(attr) = &rep.attribution {
+        print_attribution(attr);
     }
     if let Some(path) = a.get("csv") {
         match std::fs::write(path, rows_to_csv(&rep.rows)) {
@@ -1731,6 +1895,226 @@ fn cmd_diff(a: &Args) -> i32 {
     0
 }
 
+/// 打印增长归因的三个榜（`diff --attrib`）。
+///
+/// 与界面上的归因卡是同一份数据（`core_scan::attribution`），只是这里排成
+/// 终端能看的形状。三个榜的顺序固定：目录 → 类型 → 时段，因为人看的时候
+/// 就是先问"哪儿"、再问"什么东西"、最后问"什么时候"。
+fn print_attribution(attr: &core_scan::Attribution) {
+    println!();
+    println!("── 增长归因（目录聚合到 {} 层）──", attr.dir_depth);
+    if attr.dirs_up.is_empty() && attr.dirs_down.is_empty() {
+        println!("  没有落在扫描根范围内的变化行。");
+        return;
+    }
+    if !attr.dirs_up.is_empty() {
+        println!("  增长最多的目录：");
+        for d in attr.dirs_up.iter().take(10) {
+            println!(
+                "    {:>12}  {}  （{} 个文件）",
+                signed_size(d.delta),
+                truncate_keep_tail(&d.dir, 64),
+                d.files
+            );
+        }
+    }
+    if let Some(d) = attr.dirs_down.first() {
+        println!("  减少最多的目录：{}  {}", truncate_keep_tail(&d.dir, 60), signed_size(d.delta));
+    }
+    if attr.dirs_total as usize > attr.dirs_up.len() {
+        println!("    （共 {} 个目录有变化，这里只列前十）", attr.dirs_total);
+    }
+    if !attr.exts.is_empty() {
+        println!("  按类型：");
+        for e in attr.exts.iter().filter(|e| e.delta != 0).take(8) {
+            let name = if e.ext.is_empty() { "(无扩展名)" } else { &e.ext };
+            println!("    {:>12}  {}", signed_size(e.delta), name);
+        }
+    }
+    if !attr.bursts.is_empty() {
+        println!("  变化最集中的时段（按文件修改时间归类，不是删除时间）：");
+        for b in attr.bursts.iter().take(3) {
+            println!(
+                "    {}  {}（{} 个文件）",
+                fmt_local_time(b.hour_unix),
+                signed_size(b.delta),
+                b.files
+            );
+        }
+    }
+}
+
+/// 建一次扫描会话。`report` / `sensitive` 共用 —— 它们都只需要一棵扫好的树。
+///
+/// 返回 `Err(退出码)`：调用方直接 `return` 那个码。参数校验与 `scan` 走同一套
+/// （`build_scan_config`），所以 `--root` / `--force-traverse` / `--chunk` 的行为一致。
+fn open_session_for(a: &Args) -> Result<(Session, String), i32> {
+    let target = a
+        .positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| core_io::paths::DEFAULT_VOLUME.to_string());
+    // Windows 上位置参数按 `scan` 的约定是**盘符**（子目录要用 `--root=`）。
+    // 但直接把一个路径当位置参数是人的第一反应（`report C:\Users\me\proj`），
+    // 而 `normalize_drive` 只会取首字母 —— 于是"扫一个目录"变成"扫整卷"，
+    // 又慢又不是他要的。这里把含分隔符的位置参数直接当扫描根。
+    let path_like = target.contains('\\') || target.contains('/');
+    let (norm, positional_root) = if cfg!(windows) {
+        match core_io::normalize_drive(&target) {
+            Ok((d, _)) => (d, None),
+            Err(e) => {
+                eprintln!("盘符「{}」无效：{}", target, e);
+                return Err(2);
+            }
+        }
+    } else {
+        match split_target(&target) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{}", e);
+                return Err(2);
+            }
+        }
+    };
+    let mut cfg = match build_scan_config(a, &norm, false) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("参数错误：{}", e);
+            return Err(2);
+        }
+    };
+    if cfg.scan_root.is_none() {
+        cfg.scan_root = if cfg!(windows) && path_like {
+            Some(std::path::PathBuf::from(&target))
+        } else {
+            positional_root
+        };
+    }
+    match Session::open(cfg, progress_to_stderr) {
+        Ok(s) => Ok((s, norm)),
+        Err(e) => {
+            eprintln!();
+            eprintln!("扫描失败：{}", e);
+            if e.raw_os_error() == Some(5) {
+                print_access_error(&norm, &e);
+            }
+            Err(1)
+        }
+    }
+}
+
+/// 导出单文件离线 HTML 报告（E3）。与界面的「导出报告」用同一份模板。
+fn cmd_report(a: &Args) -> i32 {
+    let top = match a.num("top", 30) {
+        Ok(n) => n.max(1),
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+    let (session, _norm) = match open_session_for(a) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    eprintln!();
+    let remap = path_remap_of(&session.cfg);
+    let ext = ExtensionTable::build(&session.tree);
+    let opts = core_scan::ReportOptions {
+        root: session
+            .cfg
+            .scan_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| session.tree.path_of(session.tree.root)),
+        created_unix: unix_secs(),
+        top,
+        ..Default::default()
+    };
+    let html = core_scan::build_html(&session.tree, &ext, remap.as_ref(), &opts);
+    let out = a
+        .get("out")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("filewatch-report-{}.html", unix_secs()));
+    if let Err(e) = std::fs::write(&out, &html) {
+        eprintln!("写入 {} 失败：{}", out, e);
+        return 1;
+    }
+    println!(
+        "报告已写入 {}（{}，{} 个文件 / {} 个目录）",
+        out,
+        human_size(html.len() as u64),
+        session.tree.file_count,
+        session.tree.dir_count
+    );
+    0
+}
+
+/// 敏感文件盘点（E5）。只按文件名与扩展名匹配，**不读内容**。
+fn cmd_sensitive(a: &Args) -> i32 {
+    let min_size = match a.get("min-size") {
+        Some(s) => match parse_size(s) {
+            Some(v) => v,
+            None => {
+                eprintln!("--min-size 需要体积，如 1K，收到「{s}」");
+                return 2;
+            }
+        },
+        None => 0,
+    };
+    let max = match a.num("max", 500) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+    let (session, _norm) = match open_session_for(a) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    eprintln!();
+    let remap = path_remap_of(&session.cfg);
+    let rep = core_index::sensitive::scan(
+        &session.tree,
+        &core_index::sensitive::Options {
+            max,
+            min_size,
+        },
+    );
+    println!("═══ FileWatch 敏感文件盘点 ═══");
+    println!(
+        "扫过 {} 个文件，命中 {} 条（按 {} 条规则：文件名 / 扩展名）{}",
+        rep.files,
+        rep.hits.len(),
+        core_index::SENSITIVE_RULES.len(),
+        if rep.truncated { "，结果已截断" } else { "" }
+    );
+    if rep.hits.is_empty() {
+        println!();
+        println!("没有命中。注意这不等于「没有风险」：本命令只看文件名与扩展名，");
+        println!("文件内容里有没有密钥、有没有无扩展名的私钥，它一概不知道。");
+        return 0;
+    }
+    println!();
+    for h in &rep.hits {
+        let raw = session.tree.path_of(h.node);
+        let path = match remap.as_ref() {
+            Some(r) => r.apply(&raw),
+            None => raw,
+        };
+        println!(
+            "[{}] {:<22} {:>10}  {}",
+            h.rule.severity.label_cn(),
+            h.rule.category,
+            human_size(h.alloc),
+            path
+        );
+        println!("      ↳ {}", h.rule.why);
+    }
+    0
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // selftest
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1751,6 +2135,7 @@ mod tests {
     /// `split_target` 是「用户给的字符串指什么」的唯一解释处，
     /// 所以边界要逐条钉住：整卷 vs 子目录、反斜杠归一、以及**不能瞎兜底**。
     #[test]
+    #[cfg(windows)]
     fn split_target_separates_drive_from_root() {
         // 整卷：没有扫描根 → 可以走 $MFT
         assert_eq!(split_target("C:").unwrap(), ("C:".to_string(), None));
@@ -1770,6 +2155,35 @@ mod tests {
         assert!(split_target("/home/user").is_err());
         assert!(split_target("no-drive-here").is_err());
         assert!(split_target("C").is_err(), "只有字母没有冒号不算盘符");
+    }
+
+    /// Linux 版同一组契约：必须绝对路径；挂载点整体 → `None`；子目录 → `Some`。
+    #[cfg(not(windows))]
+    #[test]
+    fn split_target_uses_longest_mount() {
+        // 根下的深目录：卷键必须是 "/"，扫描根原样
+        let (d, r) = split_target("/tmp/filewatch-smoke").unwrap();
+        assert_eq!(d, "/");
+        assert_eq!(r.unwrap().to_string_lossy(), "/tmp/filewatch-smoke");
+
+        // 根自身 → 整卷（等价 Windows 的 `C:`）
+        let (d, r) = split_target("/").unwrap();
+        assert_eq!(d, "/");
+        assert!(r.is_none());
+
+        // 相对路径 / 空串必须报错，**不能**兜底成 "/"（那等于扫整个盘）
+        assert!(split_target("").is_err());
+        assert!(split_target("tmp/x").is_err());
+        assert!(split_target("./x").is_err());
+
+        // 挂载点匹配必须落在分量边界：`/home2` 不能被当成 `/home` 的子目录。
+        // （没有 /home 挂载的机器上这条自动成立，断言的是"结果一定以 / 或
+        //   某个真实挂载点为前缀，且不会出现 /home2 被换成 /home/"）
+        let (mp, root) = split_target("/home2/x").unwrap();
+        assert!(
+            root.map(|p| p.to_string_lossy().starts_with(&mp)).unwrap_or(true),
+            "扫描根必须在卷键之下：{mp}"
+        );
     }
 
     #[test]

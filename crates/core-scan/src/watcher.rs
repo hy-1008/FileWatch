@@ -50,7 +50,6 @@ use core_usn::normalize::{
 };
 use core_index::RECNO_MASK;
 use std::collections::HashMap;
-use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 
 /// 占位目录「多久之后回查磁盘」。取 2 倍默认 debounce 窗口（400 ms），
@@ -285,7 +284,11 @@ impl WatcherSession {
 
         let abs = self.abs_of(&ev.rel);
         let md = std::fs::symlink_metadata(&abs).ok();
-        if md.as_ref().map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0).unwrap_or(false) {
+        if md
+            .as_ref()
+            .map(|m| core_io::fsmeta::is_reparse(m))
+            .unwrap_or(false)
+        {
             self.stats.skipped += 1;
             return;
         }
@@ -294,7 +297,7 @@ impl WatcherSession {
         let idx = self.alloc_idx(tree);
         let mtime = md
             .as_ref()
-            .map(|m| core_usn::record::filetime_to_unix(m.last_write_time() as i64))
+            .map(core_io::fsmeta::mtime_unix)
             .unwrap_or(0);
 
         if is_dir {
@@ -347,7 +350,7 @@ impl WatcherSession {
         // 目录被删 → 整棵子树的键同时失效，一并摘掉
         let is_dir = tree.node(idx).map(|n| n.is_dir()).unwrap_or(false);
         if is_dir {
-            let prefix = format!("{}\\", key);
+            let prefix = format!("{}{}", key, core_io::paths::SEP);
             self.map.retain(|k, _| !k.starts_with(prefix.as_str()));
         }
         // 占位目录仍交给对账：创建+删除可能被防抖抵消，树节点需另行清理。
@@ -532,23 +535,19 @@ impl WatcherSession {
     // ── 路径工具 ───────────────────────────────────────────────────────────
 
     /// 相对路径 → 小写绝对路径键。
+    ///
+    /// 拼接口径交给 [`core_io::paths::join`]：它保证卷根不会被拼出双分隔符
+    /// （`C:////a` / `//a`），而这份键必须与遍历时收集的键**逐字节一致**，
+    /// 否则查表失败会表现为"事件未解析"（不报错）。
     fn key_of(&self, rel: &str) -> String {
-        let rel = rel.trim_start_matches('\\').replace('/', "\\");
-        if self.root_lower.ends_with('\\') {
-            format!("{}{}", self.root_lower, rel.to_lowercase())
-        } else {
-            format!("{}\\{}", self.root_lower, rel.to_lowercase())
-        }
+        let rel = clean_rel(rel);
+        core_io::paths::join(&self.root_lower, &rel.to_lowercase())
     }
 
     /// 小写键 → 真实可访问的绝对路径（大小写按监视根还原）。
     fn abs_of(&self, rel: &str) -> String {
-        let rel = rel.trim_start_matches('\\').replace('/', "\\");
-        if self.root_abs.ends_with('\\') {
-            format!("{}{}", self.root_abs, rel)
-        } else {
-            format!("{}\\{}", self.root_abs, rel)
-        }
+        let rel = clean_rel(rel);
+        core_io::paths::join(&self.root_abs, &rel)
     }
 
     /// 路径索引精确查找：**小写绝对路径** → 节点下标。
@@ -623,7 +622,7 @@ fn remap_directory_paths(
     new_abs: &str,
     now_ms: u64,
 ) -> u64 {
-    let prefix = format!("{}\\", old_key);
+    let prefix = format!("{}{}", old_key, core_io::paths::SEP);
     let moved: Vec<(Box<str>, u32)> = map
         .iter()
         .filter(|(key, _)| key.as_ref() == old_key || key.starts_with(&prefix))
@@ -647,33 +646,44 @@ fn remap_directory_paths(
     moved.len() as u64
 }
 
-/// `c:\a\b\c.txt` → `c:\a\b`
+/// `C:\a\b\c.txt` → `C:\a\b`（Linux `"/a/b/c.txt"` → `"/a/b"`）
+///
+/// 卷根**没有父目录**（返回 `None`）。子项的父必须返回**带尾分隔符的卷根**
+/// （`C:\` / `/`），因为索引里的卷根是 `normalize_root` 存进去的形态；
+/// 少了那个分隔符，`C:\a` 的父会查成 `C:`，在索引里永远找不到 ——
+/// 表现为「以卷根为扫描根时，第一层子项全部变成未解析路径」。
 pub fn parent_key(key: &str) -> Option<&str> {
-    // 盘根（`c:\`）没有父目录
-    if key.len() <= 3 {
-        return None;
-    }
-    let p = key.rfind('\\')?;
-    // 最后一个分隔符正落在 `X:\` 的位置 → 父节点就是盘根本身，且必须**带上
-    // 反斜杠**返回 `X:\`。因为索引里的盘根是 `normalize_root` 存进去的形态
-    // （盘根保留尾部反斜杠），少了这个反斜杠，`c:\a` 的父会查成 `c:`，
-    // 在索引里永远找不到 —— 表现为「以盘根为扫描根时，第一层子项全部
-    // 变成未解析路径」。
-    if p == 2 {
-        return Some(&key[..3]);
-    }
-    if p < 2 {
-        return None;
+    let sep = core_io::paths::SEP;
+    // 先去尾分隔符再找：`C:\a\` 与 `C:\a` 的父应当一致
+    let trimmed = key.trim_end_matches(sep);
+    let p = trimmed.rfind(sep)?;
+    // 父本身就是卷根时，返回**带尾分隔符**的那一段
+    if core_io::paths::is_volume_root(&trimmed[..p]) {
+        return Some(&key[..p + sep.len_utf8()]);
     }
     Some(&key[..p])
 }
 
 /// `sub\a.txt` → `a.txt`；`sub` → `sub`
 pub fn last_component(rel: &str) -> &str {
-    let rel = rel.trim_end_matches('\\');
-    match rel.rfind('\\') {
-        Some(p) if p + 1 < rel.len() => &rel[p + 1..],
+    let sep = core_io::paths::SEP;
+    let rel = rel.trim_end_matches(sep);
+    match rel.rfind(sep) {
+        Some(p) if p + sep.len_utf8() < rel.len() => &rel[p + sep.len_utf8()..],
         _ => rel,
+    }
+}
+
+/// 通知里的相对路径 → 干净的相对路径（去头部分隔符，统一成本平台分隔符）。
+///
+/// Windows 的 `ReadDirectoryChangesW` 恒给 `\`，Linux 的 inotify 恒给 `/`；
+/// 而这里的入参可能来自旧索引、手工构造的测试或跨平台日志，所以两边都认。
+fn clean_rel(rel: &str) -> String {
+    let t = rel.trim_start_matches(['\\', '/']);
+    if cfg!(windows) {
+        t.replace('/', "\\")
+    } else {
+        t.replace('\\', "/")
     }
 }
 
@@ -692,16 +702,12 @@ fn probe_ttl_ms(window_ms: u64) -> u64 {
 /// 目录返回 `None`：目录的体积是聚合值，绝不能由外向内覆写。
 pub fn probe_path(abs: &str, cluster: u64) -> Option<(u64, u64, i64)> {
     let md = std::fs::symlink_metadata(abs).ok()?;
-    if md.is_dir() || md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    if md.is_dir() || core_io::fsmeta::is_reparse(&md) {
         return None;
     }
     let len = md.len();
-    let alloc = if cluster == 0 {
-        len
-    } else {
-        len.div_ceil(cluster) * cluster
-    };
-    let mtime = core_usn::record::filetime_to_unix(md.last_write_time() as i64);
+    let alloc = core_io::fsmeta::allocated(&md, len, cluster);
+    let mtime = core_io::fsmeta::mtime_unix(&md);
     Some((len, alloc, mtime))
 }
 
@@ -721,62 +727,91 @@ mod tests {
     // 下根本不参与编译，顶部导入会变成 dead import 并触发 unused_imports 警告。
     use crate::dirwatch::normalize_root;
 
-    #[test]
-    fn directory_rename_updates_all_path_registries_on_component_boundaries() {
-        let mut map: HashMap<Box<str>, u32> = [
-            (r"c:\root\old".into(), 10),
-            (r"c:\root\old\child.bin".into(), 11),
-            (r"c:\root\older\keep.bin".into(), 12),
-        ].into_iter().collect();
-        let mut placeholders = vec![Placeholder {
-            idx: 10,
-            key: r"c:\root\old".into(),
-            at_ms: 1000,
-        }];
-        let mut probes = HashMap::from([
-            (11, ProbeEntry { abs: r"C:\root\old\child.bin".into(), at_ms: 1000 }),
-            (12, ProbeEntry { abs: r"C:\root\older\keep.bin".into(), at_ms: 1000 }),
-        ]);
-        let count = remap_directory_paths(&mut map, &mut placeholders, &mut probes,
-            r"c:\root\old", r"c:\root\new", r"C:\root\New", 2000);
-        assert_eq!(count, 2);
-        assert!(!map.contains_key(r"c:\root\old"));
-        assert_eq!(map.get(r"c:\root\new"), Some(&10));
-        assert_eq!(map.get(r"c:\root\new\child.bin"), Some(&11));
-        assert_eq!(map.get(r"c:\root\older\keep.bin"), Some(&12));
-        assert_eq!(placeholders[0].key.as_ref(), r"c:\root\new");
-        assert_eq!(probes[&11].abs, r"C:\root\New\child.bin");
-        assert_eq!(probes[&11].at_ms, 2000);
-        assert_eq!(probes[&12].abs, r"C:\root\older\keep.bin");
+    /// 用本平台分隔符拼路径 —— 同一组断言两个平台都能跑。
+    fn p(parts: &[&str]) -> String {
+        parts.join(core_io::paths::SEP_STR)
     }
 
     #[test]
-    fn parent_key_handles_drive_root() {
-        assert_eq!(parent_key("c:\\a\\b\\c.txt"), Some("c:\\a\\b"));
-        assert_eq!(parent_key("c:\\a"), Some("c:\\"));
-        assert_eq!(parent_key("c:\\"), None);
+    fn directory_rename_updates_all_path_registries_on_component_boundaries() {
+        let root = p(&["c:", "root"]);
+        let old = p(&["c:", "root", "old"]);
+        let new = p(&["c:", "root", "new"]);
+        let old_child = p(&["c:", "root", "old", "child.bin"]);
+        let older = p(&["c:", "root", "older", "keep.bin"]);
+
+        let mut map: HashMap<Box<str>, u32> = [
+            (old.clone().into_boxed_str(), 10),
+            (old_child.clone().into_boxed_str(), 11),
+            (older.clone().into_boxed_str(), 12),
+        ]
+        .into_iter()
+        .collect();
+        let mut placeholders = vec![Placeholder {
+            idx: 10,
+            key: old.clone().into_boxed_str(),
+            at_ms: 1000,
+        }];
+        let mut probes = HashMap::from([
+            (
+                11,
+                ProbeEntry {
+                    abs: old_child.clone(),
+                    at_ms: 1000,
+                },
+            ),
+            (
+                12,
+                ProbeEntry {
+                    abs: older.clone(),
+                    at_ms: 1000,
+                },
+            ),
+        ]);
+        let count = remap_directory_paths(
+            &mut map,
+            &mut placeholders,
+            &mut probes,
+            &old,
+            &new,
+            &p(&["c:", "root", "New"]),
+            2000,
+        );
+        assert_eq!(count, 2);
+        assert!(!map.contains_key(old.as_str()));
+        assert_eq!(map.get(new.as_str()), Some(&10));
+        assert_eq!(map.get(p(&[&new, "child.bin"]).as_str()), Some(&11));
+        // 「older」不能被当成「old」的子项 —— 分量边界
+        assert_eq!(map.get(older.as_str()), Some(&12));
+        assert_eq!(placeholders[0].key.as_ref(), new);
+        assert_eq!(probes[&11].abs, p(&["c:", "root", "New", "child.bin"]));
+        assert_eq!(probes[&11].at_ms, 2000);
+        assert_eq!(probes[&12].abs, older);
+        let _ = root;
+    }
+
+    /// 父节点必须是**带尾分隔符的卷根**，否则第一层子项全部查不到。
+    #[test]
+    fn parent_key_handles_volume_root() {
+        let r = core_io::paths::root_prefix("c:");
+        let a = core_io::paths::join(&r, "a");
+        let b = core_io::paths::join(&a, "b");
+        let c = core_io::paths::join(&b, "c.txt");
+        assert_eq!(parent_key(&c), Some(b.as_str()));
+        assert_eq!(parent_key(&a), Some(r.as_str()));
+        // 卷根没有父
+        assert_eq!(parent_key(&r), None);
         assert_eq!(parent_key("c:"), None);
+        // 尾分隔符不影响
+        assert_eq!(parent_key(&format!("{a}{}", core_io::paths::SEP)), Some(r.as_str()));
     }
 
     #[test]
     fn last_component_splits_correctly() {
         assert_eq!(last_component("a.txt"), "a.txt");
-        assert_eq!(last_component(r"sub\a.txt"), "a.txt");
-        assert_eq!(last_component(r"a\b\c"), "c");
-        assert_eq!(last_component(r"sub\"), "sub");
-    }
-
-    #[test]
-    fn key_and_abs_join_without_double_separator() {
-        let build = |root: &str, rel: &str| {
-            if root.ends_with('\\') {
-                format!("{}{}", root, rel)
-            } else {
-                format!("{}\\{}", root, rel)
-            }
-        };
-        assert_eq!(build("c:\\users\\x", r"sub\a.txt"), r"c:\users\x\sub\a.txt");
-        assert_eq!(build("c:\\", r"sub\a.txt"), r"c:\sub\a.txt");
+        assert_eq!(last_component(&p(&["sub", "a.txt"])), "a.txt");
+        assert_eq!(last_component(&p(&["a", "b", "c"])), "c");
+        assert_eq!(last_component(&format!("sub{}", core_io::paths::SEP)), "sub");
     }
 
     #[test]
@@ -788,21 +823,28 @@ mod tests {
 
         let (len, alloc, _m) = probe_path(&f.to_string_lossy(), 4096).unwrap();
         assert_eq!(len, 100);
-        assert_eq!(alloc, 4096, "按簇对齐");
+        assert!(alloc >= 4096, "占用至少一个簇，实际 {alloc}");
+        assert_eq!(alloc % 4096, 0, "占用按簇对齐");
 
         // 目录必须被拒绝——它的体积是聚合值
         assert!(probe_path(&dir.to_string_lossy(), 4096).is_none());
         // 不存在的路径
-        assert!(probe_path(r"C:\definitely\not\here_zzz", 4096).is_none());
-
+        let bogus = core_io::paths::join(
+            &core_io::paths::root_prefix(core_io::paths::DEFAULT_VOLUME),
+            "definitely/not/here_zzz",
+        );
+        assert!(probe_path(&bogus, 4096).is_none());
     }
 
     #[test]
     fn normalize_root_is_shared_contract() {
         // 键的拼接必须与 traverse 里收集路径时完全一致，
         // 否则降级模式的实时增量会一条都对不上
-        assert_eq!(normalize_root("C:\\Users\\x\\"), "C:\\Users\\x");
-        assert_eq!(normalize_root("C:\\"), "C:\\");
-        assert_eq!(normalize_root("C:\\Users\\x").to_lowercase(), "c:\\users\\x");
+        let r = core_io::paths::root_prefix("C:");
+        let sub = core_io::paths::join(&r, "Users");
+        assert_eq!(normalize_root(&sub), sub);
+        assert_eq!(normalize_root(&r), r);
+        // 相对路径里混入正斜杠时也要统一（git-bash 会把 C:/x 传成 C:/x）
+        assert!(clean_rel("a/b").contains(core_io::paths::SEP) || !cfg!(windows));
     }
 }

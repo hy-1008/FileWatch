@@ -1,6 +1,6 @@
 [package]
 name = "filewatch-gui"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.77"
 license = "GPL-3.0-or-later"
@@ -32,6 +32,8 @@ core-io = { path = "../../../crates/core-io" }
 core-index = { path = "../../../crates/core-index" }
 core-monitor = { path = "../../../crates/core-monitor" }
 core-scan = { path = "../../../crates/core-scan" }
+# 详情面板要显示 FRN：位布局由 `filename::make_frn` 定义，不能在这里自己移位
+core-ntfs = { path = "../../../crates/core-ntfs" }
 # 只为测试里构造引擎事件（PendingEvent 带 EventKind 字段）
 core-usn = { path = "../../../crates/core-usn" }
 core-viz = { path = "../../../crates/core-viz" }

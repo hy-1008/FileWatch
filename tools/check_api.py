@@ -147,6 +147,30 @@ def module_level_pub_items(src_raw):
         for m in rx.finditer(clean):
             if dep[m.start()] == 0:
                 found.add(m.group(1))
+    # `pub use` 重导出必须算作本模块的符号。
+    #
+    # 为什么现在需要：`volume.rs` / `dirwatch.rs` / `winapi.rs` 都改成了
+    # 「一个文件做平台分派，真正的实现放进同名子目录」的形态（见各文件头注释），
+    # 于是这些模块里一个 `pub fn` 都没有，只有 `pub use win::*` 之类。
+    # 不认 `pub use` 的话，D/E/F 三类会把全项目所有引用判成"符号不存在" ——
+    # 检查器自己成了假警报源，比不检查更糟。
+    #
+    # 通配重导出（`pub use x::*`）无法静态枚举，这里**故意跳过**：
+    # 猜错会掩盖真错误，漏掉只会少报（由编译器兜底）。
+    for m in re.finditer(r'\bpub\s+use\s+([^;]+);', clean):
+        if dep[m.start()] != 0:
+            continue
+        for kind, segs in use_tree_paths(m.group(1)):
+            if kind == 'glob':
+                continue
+            # `foo::bar` -> bar；`foo::{a, b}` 已被展开成两条 path
+            if segs:
+                found.add(segs[-1])
+        # 别名（`pub use x::y as z;`）在上面按 segs[-1] 会得到 y，需要补 z
+        for part in split_top_level(m.group(1), ','):
+            al = re.match(r'^\s*\S+\s+as\s+([A-Za-z_]\w*)\s*$', part.strip())
+            if al:
+                found.add(al.group(1))
     return found
 
 # ────────────────────────────────────────────── use 树解析

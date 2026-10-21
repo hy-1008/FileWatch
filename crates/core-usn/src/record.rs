@@ -140,14 +140,10 @@ fn parse_one(rec: &[u8], base: usize) -> Option<UsnRecord> {
 }
 
 /// FILETIME 计数 → Unix 秒。
-#[inline]
-pub fn filetime_to_unix(ticks: i64) -> i64 {
-    if ticks <= 0 {
-        return 0;
-    }
-    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
-    ticks / 10_000_000 - EPOCH_DIFF_SECS
-}
+///
+/// 实现在 [`core_io::util::filetime_to_unix`]：遍历模式读 `Metadata` 的
+/// 修改时间走的是同一个换算，两处各写一份时曾经出现过 1 秒偏差。
+pub use core_io::util::filetime_to_unix;
 
 #[cfg(test)]
 mod tests {
